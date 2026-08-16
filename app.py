@@ -44,11 +44,11 @@ AI_MODEL_FILE = "ai_learned_models.json"
 
 DEFAULT_AI_PROFILES = {
     "lamp": {"avg_w": 1.2, "peak_w": 2.0, "variance": 0.1, "count": 1},
-    "phone": {"avg_w": 12.0, "peak_w": 18.0, "variance": 4.5, "count": 1},
-    "laptop": {"avg_w": 45.0, "peak_w": 65.0, "variance": 12.0, "count": 1},
-    "ebike_std": {"avg_w": 140.0, "peak_w": 170.0, "variance": 8.0, "count": 1},
-    "ebike_fast": {"avg_w": 350.0, "peak_w": 420.0, "variance": 15.0, "count": 1},
-    "appliance": {"avg_w": 850.0, "peak_w": 1200.0, "variance": 50.0, "count": 1}
+    "phone": {"name": "📱 Smartphone / Tablet", "avg_w": 12.0, "peak_w": 18.0, "variance": 4.5, "count": 1},
+    "laptop": {"name": "💻 Laptop / Monitor", "avg_w": 45.0, "peak_w": 65.0, "variance": 12.0, "count": 1},
+    "ebike_std": {"name": "🚲 E-Bike Akku Standard", "avg_w": 140.0, "peak_w": 170.0, "variance": 8.0, "count": 1},
+    "ebike_fast": {"name": "⚡ E-Bike Schnelllader / PC", "avg_w": 350.0, "peak_w": 420.0, "variance": 15.0, "count": 1},
+    "appliance": {"name": "🍳 Großgerät / Dauerbetrieb", "avg_w": 850.0, "peak_w": 1200.0, "variance": 50.0, "count": 1}
 }
 
 DEVICE_PROFILES = {
@@ -372,9 +372,11 @@ HTML_PAGE = """
         }
         .status-on { background: #ecfdf5; color: #065f46; }
         .status-off { background: #f1f5f9; color: var(--text-muted); }
+        .status-unplug { background: #fef3c7; color: #92400e; }
         .status-dot { width: 8px; height: 8px; border-radius: 50%; }
         .status-on .status-dot { background: var(--accent-green); box-shadow: 0 0 8px rgba(16,185,129,0.6); }
         .status-off .status-dot { background: #94a3b8; }
+        .status-unplug .status-dot { background: var(--accent-amber); }
 
         .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
         .stat-card {
@@ -481,8 +483,6 @@ HTML_PAGE = """
         }
 
         .busy-card { display: none; text-align: center; }
-
-        /* NEUE WARTE-KARTE BEI PAUSIERUNG */
         .pause-wait-card { display: none; text-align: center; }
     </style>
 </head>
@@ -549,7 +549,7 @@ HTML_PAGE = """
             <button class="btn-finish" onclick="finalizeTermination()">🛑 Jetzt doch endgültig beenden & abrechnen</button>
         </div>
 
-        <!-- HAUPTKARTE (NUR AKTIV BEIM ECHTEN BESITZER) -->
+        <!-- HAUPTKARTE -->
         <div class="card" id="mainCard">
             <div class="header">
                 <span class="title">⚡ Smart Power Hub</span>
@@ -666,7 +666,6 @@ HTML_PAGE = """
                 <div id="emailFeedback" style="display:none; font-size:12px; font-weight:600; margin-top:8px;"></div>
             </div>
 
-            <!-- WAHLMÖGLICHKEIT BEIM NUTZERWECHSEL -->
             <div style="margin-top: 16px; display: flex; flex-direction: column; gap: 8px;">
                 <button class="btn-stop" style="background: #e0f2fe; color: #0369a1; border-color: #bae6fd;" onclick="setWaitingMode()">⏳ Sitzung pausieren (Warten bis anderer Nutzer fertig ist)</button>
                 <button class="btn-finish" style="font-size: 14px;" onclick="finalizeTermination()">🛑 Endgültig beenden & Finales PDF</button>
@@ -772,7 +771,6 @@ HTML_PAGE = """
                 document.getElementById('rKwh').innerText = report.kwh.toFixed(6) + " kWh";
                 document.getElementById('rCost').innerText = report.cost.toFixed(5) + " €";
                 
-                // HAUPTKARTE KOMPLETT ABSCHALTEN
                 document.getElementById('mainCard').style.display = 'none';
                 document.getElementById('busyCard').style.display = 'none';
                 document.getElementById('pauseWaitCard').style.display = 'none';
@@ -840,7 +838,6 @@ HTML_PAGE = """
             window.open('/download_invoice', '_blank');
         }
 
-        // 1-SEKUNDEN STATUSABGLEICH
         async function fetchSyncData() {
             if (isTerminated) return;
             try {
@@ -855,7 +852,6 @@ HTML_PAGE = """
                     return;
                 }
 
-                // WENN NUTZER 2 DIE STECKDOSE ÜBERNOMMEN HAT: HAUPTBILDSCHIRM FÜR NUTZER 1 VOLLSTÄNDIG DEAKTIVIEREN
                 if (data.is_paused_by_transfer && !isWaitingForResume && document.getElementById('receiptCard').style.display !== 'block') {
                     await logout(false);
                     return;
@@ -863,7 +859,6 @@ HTML_PAGE = """
 
                 if (isWaitingForResume) {
                     if (!data.is_busy_for_other) {
-                        // Steckdose wieder frei -> Nutzer 1 kann fortsetzen
                         isWaitingForResume = false;
                         document.getElementById('pauseWaitCard').style.display = 'none';
                         document.getElementById('mainCard').style.display = 'block';
@@ -927,13 +922,26 @@ HTML_PAGE = """
                     document.getElementById('batteryTimeRemaining').innerText = `Restzeit: ${data.remaining_time_str}`;
                 }
 
-                if (data.active) {
-                    document.getElementById('statusBadge').className = "status-pill status-on";
-                    document.getElementById('statusText').innerText = "Aktiv / Strom fließt";
+                let badge = document.getElementById('statusBadge');
+                let statusText = document.getElementById('statusText');
+                let startBtn = document.getElementById('mainStartBtn');
+
+                // KABEL-AUSGESTECKT STATUS
+                if (data.unplugged_detected) {
+                    badge.className = "status-pill status-unplug";
+                    statusText.innerText = "🔌 Kabel ausgesteckt – Pausiert";
+                    document.getElementById('wattSub').innerText = "Kein Stromfluss gemessen";
+                    startBtn.innerText = "▶️ Kabel wieder drin? Fortsetzen";
+                } else if (data.active) {
+                    badge.className = "status-pill status-on";
+                    statusText.innerText = "Aktiv / Strom fließt";
                     document.getElementById('wattSub').innerText = currentW > 0.1 ? "Fließt stabil" : "Bereit / Standby";
+                    startBtn.innerText = "▶️ Läuft bereits";
                 } else {
-                    document.getElementById('statusBadge').className = "status-pill status-off";
-                    document.getElementById('statusText').innerText = "Pausiert / Bereit";
+                    badge.className = "status-pill status-off";
+                    statusText.innerText = "Pausiert / Bereit";
+                    document.getElementById('wattSub').innerText = "Bereit zum Start";
+                    startBtn.innerText = "▶️ Start / Fortsetzen";
                 }
 
             } catch(e) {}
@@ -955,6 +963,9 @@ def get_user_data():
             "active": False,
             "terminated": False,
             "paused_by_transfer": False,
+            "unplugged_detected": False,
+            "had_power_draw": False,
+            "zero_power_counter": 0,
             "total_kwh": 0.0,
             "total_seconds": 0.0,
             "start_timestamp": None,
@@ -1019,7 +1030,6 @@ def start():
         if other_user.get("active", False) and not other_user.get("terminated", False):
             return jsonify({"status": "busy"})
         
-    # Wenn ein neuer Nutzer übernimmt: Vorherigen Nutzer hart pausieren
     if active_uid and active_uid != uid:
         prev_user = user_sessions.get(active_uid)
         if prev_user:
@@ -1033,6 +1043,8 @@ def start():
     global_state["transfer_requested"] = False
     global_state["transfer_requester_id"] = None
     u["active"] = True
+    u["unplugged_detected"] = False
+    u["zero_power_counter"] = 0
     u["paused_by_transfer"] = False
     u["start_timestamp"] = time.time() - u["total_seconds"]
     async_cloud_control(turn_on=True)
@@ -1223,7 +1235,7 @@ def status():
             is_busy = True
             global_w = global_state["last_watt"]
 
-    # LIVE-MESSUNG NUR BEIM ECHTEN BESITZER
+    # LIVE-MESSUNG & ECHTE UNPLUG-ERKENNUNG
     if u["active"] and active_uid == uid:
         now = time.time()
         w, a, v = fetch_live_cloud_metrics()
@@ -1232,17 +1244,37 @@ def status():
         u["current_ampere"] = a
         u["current_voltage"] = v
 
-        if u.get("start_timestamp"):
-            u["total_seconds"] = now - u["start_timestamp"]
+        if w > 1.2 or a > 0.015:
+            u["had_power_draw"] = True
 
-        u["total_kwh"] += (w * 1.0) / 3600000.0
+        # KABEL AUSGESTECKT: Wenn nach vorheriger Last die Leistung auf 0 fällt
+        if u["had_power_draw"] and w < 0.4 and a < 0.006:
+            u["zero_power_counter"] += 1
+            if u["zero_power_counter"] >= 2:  # Reagiert blitzschnell nach 2 Sekunden
+                # ZEIT & STROM SOFORT STOPPEN
+                if u.get("start_timestamp"):
+                    u["total_seconds"] = now - u["start_timestamp"]
+                u["active"] = False
+                u["start_timestamp"] = None
+                u["unplugged_detected"] = True
+                u["zero_power_counter"] = 0
+                async_cloud_control(turn_on=False)
+        else:
+            u["zero_power_counter"] = 0
+            if u.get("start_timestamp"):
+                u["total_seconds"] = now - u["start_timestamp"]
 
-        if u["total_seconds"] < 30 and not u.get("manually_selected"):
-            if w > 0.5:
-                u["analysis_samples"].append(w)
-        elif u["total_seconds"] >= 30 and not u.get("analysis_completed") and not u.get("manually_selected"):
-            u["device_key"] = ai_classify_samples(u["analysis_samples"])
-            u["analysis_completed"] = True
+            # Nur hochzählen wenn tatsächlich Strom fließt
+            if w > 0.4:
+                u["total_kwh"] += (w * 1.0) / 3600000.0
+
+            # AI-Analyse in den ersten 30s
+            if u["total_seconds"] < 30 and not u.get("manually_selected"):
+                if w > 0.5:
+                    u["analysis_samples"].append(w)
+            elif u["total_seconds"] >= 30 and not u.get("analysis_completed") and not u.get("manually_selected"):
+                u["device_key"] = ai_classify_samples(u["analysis_samples"])
+                u["analysis_completed"] = True
     else:
         u["current_watt"] = 0.0
         u["current_ampere"] = 0.0
@@ -1271,6 +1303,7 @@ def status():
 
     return jsonify({
         "active": u["active"] and (active_uid == uid),
+        "unplugged_detected": u.get("unplugged_detected", False),
         "watt": u.get("current_watt", 0.0),
         "current_ampere": u.get("current_ampere", 0.0),
         "voltage": u.get("current_voltage", 230.0),
