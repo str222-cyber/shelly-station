@@ -10,7 +10,7 @@ from email.mime.application import MIMEApplication
 from weasyprint import HTML
 
 app = Flask(__name__)
-app.secret_key = "shelly_smart_hub_direct_live_metrics_v6"
+app.secret_key = "shelly_smart_hub_stable_10s_smooth_2026"
 
 # --- SHELLY CLOUD KONFIGURATION ---
 SHELLY_CLOUD_URL = "https://shelly-274-eu.shelly.cloud"
@@ -32,8 +32,7 @@ global_state = {
     "last_device_key": "lamp",
     "last_watt": 0.0,
     "last_amp": 0.0,
-    "last_volt": 230.0,
-    "last_fetch_time": 0
+    "last_volt": 230.0
 }
 
 user_sessions = {}
@@ -58,7 +57,7 @@ def cloud_control(turn_on=True):
     turn_str = "on" if turn_on else "off"
     payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID, "turn": turn_str, "channel": 0}
     try:
-        requests.post(f"{SHELLY_CLOUD_URL}/device/relay/control", data=payload, timeout=2.5)
+        requests.post(f"{SHELLY_CLOUD_URL}/device/relay/control", data=payload, timeout=3.0)
     except:
         pass
 
@@ -69,32 +68,25 @@ def cloud_control(turn_on=True):
         "params": {"id": 0, "on": turn_on}
     }
     try:
-        requests.post(f"{SHELLY_CLOUD_URL}/device/rpc", json=rpc_payload, timeout=2.5)
+        requests.post(f"{SHELLY_CLOUD_URL}/device/rpc", json=rpc_payload, timeout=3.0)
     except:
         pass
 
 def fetch_live_cloud_metrics():
-    now = time.time()
-    # Maximal alle 1.0s aktualisieren, um API-Ratenbegrenzungen zu schonen
-    if now - global_state["last_fetch_time"] < 1.0:
-        return global_state["last_watt"], global_state["last_amp"], global_state["last_volt"]
-
     payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID}
     try:
-        res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=2.5).json()
+        res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=3.0).json()
         if res.get("isok"):
             status = res.get("data", {}).get("device_status", {})
             watt = 0.0
             amp = 0.0
             volt = 230.0
 
-            # Gen 2 / Plus / Gen 3
             if "switch:0" in status:
                 sw = status["switch:0"]
                 watt = float(sw.get("apower", 0.0))
                 amp = float(sw.get("current", 0.0))
                 volt = float(sw.get("voltage", 230.0))
-            # Gen 1 Geräte
             elif "meters" in status and len(status["meters"]) > 0:
                 m = status["meters"][0]
                 watt = float(m.get("power", 0.0))
@@ -107,11 +99,9 @@ def fetch_live_cloud_metrics():
             global_state["last_watt"] = watt
             global_state["last_amp"] = amp
             global_state["last_volt"] = volt
-            global_state["last_fetch_time"] = now
             return watt, amp, volt
-    except Exception as e:
+    except:
         pass
-
     return global_state["last_watt"], global_state["last_amp"], global_state["last_volt"]
 
 def generate_pdf_invoice(report_data):
@@ -230,11 +220,9 @@ HTML_PAGE = """
         }
         .status-on { background: #ecfdf5; color: #065f46; }
         .status-off { background: #f1f5f9; color: var(--text-muted); }
-        .status-unplug { background: #fef3c7; color: #92400e; }
         .status-dot { width: 8px; height: 8px; border-radius: 50%; }
         .status-on .status-dot { background: var(--accent-green); box-shadow: 0 0 8px rgba(16,185,129,0.6); }
         .status-off .status-dot { background: #94a3b8; }
-        .status-unplug .status-dot { background: var(--accent-amber); }
 
         .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
         .stat-card {
@@ -243,7 +231,7 @@ HTML_PAGE = """
             border-radius: 16px;
             padding: 12px;
             text-align: left;
-            min-height: 84px;
+            min-height: 82px;
         }
         .stat-label { font-size: 11px; font-weight: 600; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.4px; }
         .stat-val {
@@ -261,11 +249,6 @@ HTML_PAGE = """
         .stat-cost .stat-val { color: var(--accent-green); }
         .stat-volt .stat-val { color: var(--accent-amber); }
         .stat-amp .stat-val { color: var(--accent-cyan); }
-
-        .bar-wrap { margin-top: 6px; width: 100%; height: 5px; background: #e2e8f0; border-radius: 3px; overflow: hidden; }
-        .bar-fill { height: 100%; width: 0%; border-radius: 3px; transition: width 0.3s ease; }
-        .bar-blue { background: var(--accent-primary); }
-        .bar-green { background: var(--accent-green); }
 
         .btn-group { display: flex; flex-direction: column; gap: 8px; margin-top: 14px; }
         button {
@@ -349,11 +332,10 @@ HTML_PAGE = """
     </style>
 </head>
 <body>
-    <!-- MODAL 1: GERTÄT AUSWÄHLEN -->
     <div id="deviceModal" class="modal-overlay">
         <div class="modal-box">
             <h3 style="margin-bottom: 6px;">Gerät festlegen</h3>
-            <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">Wähle dein Gerät. Die Station merkt sich diese Auswahl dauerhaft.</p>
+            <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">Wähle dein Gerät. Die Station merkt sich diese Auswahl.</p>
             <button class="device-option-btn" onclick="saveDeviceProfile('lamp')">💡 Lampe / Beleuchtung (Dauerbetrieb)</button>
             <button class="device-option-btn" onclick="saveDeviceProfile('phone')">📱 Smartphone / Tablet (Akku)</button>
             <button class="device-option-btn" onclick="saveDeviceProfile('laptop')">💻 Laptop / Monitor (Akku)</button>
@@ -364,7 +346,6 @@ HTML_PAGE = """
         </div>
     </div>
 
-    <!-- MODAL 2: FREIGABE-ANFRAGE -->
     <div id="transferModal" class="modal-overlay">
         <div class="modal-box" style="border: 2px solid var(--accent-amber);">
             <div style="font-size: 40px; margin-bottom: 6px;">👋🔔</div>
@@ -377,19 +358,6 @@ HTML_PAGE = """
         </div>
     </div>
 
-    <!-- MODAL 3: 100% VOLL ALARM -->
-    <div id="fullModal" class="modal-overlay">
-        <div class="modal-box" style="border: 2px solid var(--accent-green);">
-            <div style="font-size: 48px; margin-bottom: 8px;">🔋✨</div>
-            <h2 style="font-size: 20px; color: var(--accent-green); margin-bottom: 6px;">Akku 100% Vollgeladen!</h2>
-            <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 12px;">Der Stromfluss wurde automatisch gestoppt.</p>
-            <div style="background: #fef3c7; border: 1px solid #fde68a; color: #92400e; font-size: 13px; font-weight: 600; padding: 10px; border-radius: 12px; margin-bottom: 16px;">
-                ⚠️ Bitte trenne jetzt dein Ladekabel, damit andere die Station nutzen können!
-            </div>
-            <button class="btn-start" style="background: var(--accent-green);" onclick="dismissFullAlarm()">🔕 Alarm Stoppen & Quittung</button>
-        </div>
-    </div>
-
     <div class="container">
         <!-- BESETZT-KARTE -->
         <div class="card busy-card" id="busyCard">
@@ -399,8 +367,7 @@ HTML_PAGE = """
                 Ein anderer Nutzer verwendet die Steckdose gerade aktiv.
             </p>
             <div style="background: #f1f5f9; padding: 12px; border-radius: 14px; margin-bottom: 16px; text-align: left; font-size: 13px;">
-                Aktuelle Leistung: <b id="busyWatt">0.000 W</b><br>
-                Laufzeit: <b id="busyTimer">00:00:00</b>
+                Aktuelle Leistung: <b id="busyWatt">0.000 W</b>
             </div>
             <button class="btn-start" id="btnRequestSlot" style="background: var(--accent-primary);" onclick="requestSlot()">🔔 Nutzer anfragen (Bescheid geben)</button>
             <div id="requestSentText" style="display:none; color: var(--accent-green); font-size: 12px; font-weight: 600; margin-top: 10px;">
@@ -460,7 +427,7 @@ HTML_PAGE = """
                 <div class="stat-card">
                     <div class="stat-label">Laufzeit</div>
                     <div class="stat-val" id="timer">00:00:00</div>
-                    <div class="stat-sub">Sekundengenau</div>
+                    <div class="stat-sub">Läuft sekundengenau</div>
                 </div>
             </div>
 
@@ -470,13 +437,11 @@ HTML_PAGE = """
                     <div class="stat-label">Verbrauch</div>
                     <div class="stat-val" style="color:var(--accent-primary); font-family:monospace; font-size:17px;"><span id="wh">0.0000</span> Wh</div>
                     <div class="stat-sub"><span id="mwh">0.0</span> mWh</div>
-                    <div class="bar-wrap"><div class="bar-fill bar-blue" id="whBar"></div></div>
                 </div>
                 <div class="stat-card stat-cost">
                     <div class="stat-label">Kosten (€)</div>
                     <div class="stat-val"><span id="cost">0.00000</span> €</div>
                     <div class="stat-sub"><span id="microCost">0.00</span> Cent</div>
-                    <div class="bar-wrap"><div class="bar-fill bar-green" id="costBar"></div></div>
                 </div>
             </div>
 
@@ -487,7 +452,7 @@ HTML_PAGE = """
             </div>
         </div>
 
-        <!-- QUITTUNG MIT PDF- & EMAIL-VERSAND -->
+        <!-- QUITTUNG -->
         <div class="card receipt-card" id="receiptCard">
             <div class="receipt-header">
                 <div style="font-size: 40px; margin-bottom: 4px;">🧾</div>
@@ -502,7 +467,6 @@ HTML_PAGE = """
             <div class="receipt-row"><span>Verbrauch (kWh):</span> <b id="rKwh">0.000000 kWh</b></div>
             <div class="receipt-row receipt-total"><span>Gesamtbetrag:</span> <span id="rCost" style="color: var(--accent-green);">0.00000 €</span></div>
 
-            <!-- PDF PER E-MAIL SENDEN -->
             <div class="email-box">
                 <div style="font-size:12px; font-weight:700; margin-bottom:6px; color:var(--text-main);">📧 Rechnung als PDF zusenden:</div>
                 <input type="email" id="emailInput" class="email-input" placeholder="deine-email@beispiel.de">
@@ -518,53 +482,38 @@ HTML_PAGE = """
     <script>
         let isTerminated = false;
         let lastReport = null;
-        let alarmInterval = null;
         let transferModalOpen = false;
-        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-
-        let hadHeavyPowerPhase = false;
-        let isBatteryDevice = false;
-        let zeroPowerStreak = 0;
-        let isUnplugged = false;
+        
+        let startTimeMs = null;
+        let totalElapsedSeconds = 0;
+        let timerInterval = null;
+        let isActive = false;
         let currentProfileKey = "lamp";
 
-        let localSeconds = 0;
-        let isActive = false;
-
-        function playContinuousTone() {
-            try {
-                if (audioCtx.state === 'suspended') { audioCtx.resume(); }
-                let osc = audioCtx.createOscillator();
-                let gain = audioCtx.createGain();
-                osc.type = 'sine';
-                osc.frequency.value = 880;
-                gain.gain.value = 0.25;
-                osc.connect(gain);
-                gain.connect(audioCtx.destination);
-                osc.start();
-                setTimeout(() => osc.stop(), 350);
-            } catch(e) {}
+        function updateTimerUI(sec) {
+            let h = Math.floor(sec / 3600).toString().padStart(2, '0');
+            let m = Math.floor((sec % 3600) / 60).toString().padStart(2, '0');
+            let s = Math.floor(sec % 60).toString().padStart(2, '0');
+            document.getElementById('timer').innerText = `${h}:${m}:${s}`;
         }
 
-        function startAudioAlert() {
-            if (alarmInterval) return;
-            playContinuousTone();
-            alarmInterval = setInterval(playContinuousTone, 700);
+        // 1. VOLLKOMMEN FLÜSSIGER SEKUNDEN-TIMER (Rein Clientseitig, springt nie zurück)
+        function startLocalTimer() {
+            if (timerInterval) clearInterval(timerInterval);
+            startTimeMs = Date.now() - (totalElapsedSeconds * 1000);
+            timerInterval = setInterval(() => {
+                if (isActive && !isTerminated) {
+                    totalElapsedSeconds = Math.floor((Date.now() - startTimeMs) / 1000);
+                    updateTimerUI(totalElapsedSeconds);
+                }
+            }, 500);
         }
 
-        function stopAudioAlert() {
-            if (alarmInterval) {
-                clearInterval(alarmInterval);
-                alarmInterval = null;
+        function stopLocalTimer() {
+            if (timerInterval) {
+                clearInterval(timerInterval);
+                timerInterval = null;
             }
-        }
-
-        function startSession() {
-            if (audioCtx.state === 'suspended') { audioCtx.resume(); }
-            isUnplugged = false;
-            zeroPowerStreak = 0;
-            isActive = true;
-            sendAction('/start');
         }
 
         async function sendAction(url, data={}) {
@@ -578,6 +527,15 @@ HTML_PAGE = """
             } catch(e) { return {}; }
         }
 
+        function startSession() {
+            isActive = true;
+            document.getElementById('statusBadge').className = "status-pill status-on";
+            document.getElementById('statusText').innerText = "Aktiv / Strom fließt";
+            startLocalTimer();
+            sendAction('/start');
+            setTimeout(fetch10sData, 300); // Schneller erster Messwert
+        }
+
         async function saveDeviceProfile(key) {
             document.getElementById('deviceModal').style.display = 'none';
             let res = await sendAction('/save_device', { key: key });
@@ -586,10 +544,9 @@ HTML_PAGE = """
 
         function applyProfile(key, prof) {
             currentProfileKey = key;
-            isBatteryDevice = prof.is_battery;
             document.getElementById('devIcon').innerText = prof.icon;
             document.getElementById('detectedName').innerText = prof.name;
-            document.getElementById('detectedMode').innerText = isBatteryDevice ? "🔋 Akku (Auto-Stop bei 100%)" : "💡 Dauerbetrieb (Kein Auto-Stop)";
+            document.getElementById('detectedMode').innerText = prof.is_battery ? "🔋 Akku (Auto-Stop)" : "💡 Dauerbetrieb (Kein Auto-Stop)";
         }
 
         async function requestSlot() {
@@ -611,21 +568,16 @@ HTML_PAGE = """
             await sendAction('/reject_transfer');
         }
 
-        async function dismissFullAlarm() {
-            stopAudioAlert();
-            document.getElementById('fullModal').style.display = 'none';
-            await logout();
-        }
-
         async function logout() {
             isTerminated = true;
             isActive = false;
+            stopLocalTimer();
             try {
                 let report = await sendAction('/logout');
                 lastReport = report;
                 
                 document.getElementById('rDevice').innerText = document.getElementById('detectedName').innerText;
-                document.getElementById('rMode').innerText = isBatteryDevice ? "Akku-Ladeüberwachung" : "Dauerbetrieb";
+                document.getElementById('rMode').innerText = currentProfileKey === 'lamp' ? 'Dauerbetrieb' : 'Akku-Ladeüberwachung';
                 document.getElementById('rTime').innerText = report.time_formatted;
                 document.getElementById('rWh').innerText = report.wh.toFixed(4) + " Wh";
                 document.getElementById('rKwh').innerText = report.kwh.toFixed(6) + " kWh";
@@ -672,39 +624,21 @@ HTML_PAGE = """
             window.open('/download_invoice', '_blank');
         }
 
-        setInterval(() => {
-            if (isActive && !isTerminated) {
-                localSeconds++;
-                let h = Math.floor(localSeconds / 3600).toString().padStart(2, '0');
-                let m = Math.floor((localSeconds % 3600) / 60).toString().padStart(2, '0');
-                let s = Math.floor(localSeconds % 60).toString().padStart(2, '0');
-                document.getElementById('timer').innerText = `${h}:${m}:${s}`;
-            }
-        }, 1000);
-
-        setInterval(async () => {
+        // 2. ENTSPANNTES 10-SEKUNDEN POLLING FÜR WATT, AMPERE, VOLT & KOSTEN
+        async function fetch10sData() {
             if (isTerminated) return;
             try {
                 let res = await fetch('/status', { cache: 'no-store' });
                 let data = await res.json();
-                
+
                 if (data.is_busy_for_other) {
                     document.getElementById('mainCard').style.display = 'none';
                     document.getElementById('busyCard').style.display = 'block';
                     document.getElementById('busyWatt').innerText = data.global_watt.toFixed(3) + " W";
-                    let sec = data.elapsed_seconds;
-                    let h = Math.floor(sec / 3600).toString().padStart(2, '0');
-                    let m = Math.floor((sec % 3600) / 60).toString().padStart(2, '0');
-                    let s = Math.floor(sec % 60).toString().padStart(2, '0');
-                    document.getElementById('busyTimer').innerText = `${h}:${m}:${s}`;
                     return;
                 } else {
                     document.getElementById('busyCard').style.display = 'none';
                     document.getElementById('mainCard').style.display = 'block';
-                }
-
-                if (data.current_profile && currentProfileKey !== data.current_profile_key) {
-                    applyProfile(data.current_profile_key, data.current_profile);
                 }
 
                 if (data.transfer_requested && !transferModalOpen) {
@@ -712,11 +646,11 @@ HTML_PAGE = """
                     document.getElementById('transferModal').style.display = 'flex';
                 }
 
-                isActive = data.active;
-                if (Math.abs(localSeconds - data.elapsed_seconds) > 2) {
-                    localSeconds = data.elapsed_seconds;
+                if (data.current_profile && currentProfileKey !== data.current_profile_key) {
+                    applyProfile(data.current_profile_key, data.current_profile);
                 }
 
+                // Messwerte setzen
                 let currentW = data.watt;
                 let currentA = data.current_ampere || 0.0;
                 let currentV = data.voltage || 230.0;
@@ -731,73 +665,24 @@ HTML_PAGE = """
                 document.getElementById('cost').innerText = data.cost.toFixed(5);
                 document.getElementById('microCost').innerText = (data.cost * 100.0).toFixed(3);
 
-                let badge = document.getElementById('statusBadge');
-                let text = document.getElementById('statusText');
-                let startBtn = document.getElementById('mainStartBtn');
-                
                 if (data.active) {
-                    if (currentW > 1.0) {
-                        hadHeavyPowerPhase = true;
-                    }
-
-                    // --- UNPLUG-ERKENNUNG NUR BEI AKKU-GERÄTEN ---
-                    if (isBatteryDevice && hadHeavyPowerPhase && currentW < 0.1 && currentA < 0.005) {
-                        zeroPowerStreak++;
-                        document.getElementById('wattSub').innerText = `Keine Last (${zeroPowerStreak}/15s)...`;
-                        
-                        if (zeroPowerStreak >= 15) {
-                            isUnplugged = true;
-                            zeroPowerStreak = 0;
-                            await sendAction('/stop');
-                            badge.className = "status-pill status-unplug";
-                            text.innerText = "🔌 Kabel ausgesteckt – Pausiert";
-                            document.getElementById('wattSub').innerText = "Warte auf Start";
-                            startBtn.innerText = "▶️ Fortsetzen";
-                            return;
-                        }
-                    } else {
-                        zeroPowerStreak = 0;
-                        document.getElementById('wattSub').innerText = currentW > 0.1 ? "Fließt stabil" : "Bereit / Leerlauf";
-                    }
-
-                    badge.className = "status-pill status-on";
-                    text.innerText = "Aktiv / Strom fließt";
-                    startBtn.innerText = "▶️ Läuft bereits";
-
-                    // 100% VOLLGELADEN BEI AKKUS
-                    if (isBatteryDevice && hadHeavyPowerPhase && currentW >= 0.4 && currentW < 1.8 && data.wh > 2.0) {
-                        await sendAction('/stop');
-                        document.getElementById('fullModal').style.display = 'flex';
-                        startAudioAlert();
-                    }
-
+                    isActive = true;
+                    document.getElementById('statusBadge').className = "status-pill status-on";
+                    document.getElementById('statusText').innerText = "Aktiv / Strom fließt";
+                    document.getElementById('wattSub').innerText = currentW > 0.1 ? "Fließt stabil" : "Bereit / Standby";
                 } else {
-                    zeroPowerStreak = 0;
-                    if (isUnplugged) {
-                        badge.className = "status-pill status-unplug";
-                        text.innerText = "🔌 Kabel ausgesteckt – Pausiert";
-                        startBtn.innerText = "▶️ Fortsetzen";
-                    } else {
-                        badge.className = "status-pill status-off";
-                        text.innerText = "Pausiert / Bereit";
-                        startBtn.innerText = "▶️ Start / Fortsetzen";
-                    }
-                    
-                    if (data.elapsed_seconds === 0) {
-                        hadHeavyPowerPhase = false;
-                        zeroPowerStreak = 0;
-                        localSeconds = 0;
-                    }
+                    isActive = false;
+                    document.getElementById('statusBadge').className = "status-pill status-off";
+                    document.getElementById('statusText').innerText = "Pausiert / Bereit";
                 }
 
-                let whP = Math.min(100, (data.wh / 500.0) * 100);
-                document.getElementById('whBar').style.width = whP + '%';
-
-                let costP = Math.min(100, (data.cost / 2.0) * 100);
-                document.getElementById('costBar').style.width = costP + '%';
-
             } catch(e) {}
-        }, 1000);
+        }
+
+        // Starte das 10-Sekunden-Intervall
+        setInterval(fetch10sData, 10000);
+        // Initialer Aufruf beim Laden
+        fetch10sData();
     </script>
 </body>
 </html>
