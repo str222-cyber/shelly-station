@@ -120,57 +120,33 @@ def async_cloud_control(turn_on=True):
         except: pass
     threading.Thread(target=_worker, daemon=True).start()
 
-def extract_advanced_features(samples):
-    if not samples: return 0.0, 0.0, 0.0, 0.0, 0.0
+def estimate_current_soc(profile_key, samples):
+    if not samples: return 0.0
     avg_w = sum(samples) / len(samples)
-    peak_w = max(samples)
-    min_w = min(samples)
-    var_w = math.sqrt(sum((x - avg_w) ** 2 for x in samples) / len(samples))
-    
     mid = len(samples) // 2
     trend = 0.0
     if mid > 0:
         trend = (sum(samples[mid:]) / (len(samples) - mid)) - (sum(samples[:mid]) / mid)
         
-    return avg_w, peak_w, min_w, var_w, trend
-
-def ai_classify_samples(samples):
-    if not samples: return "phone" 
-    avg_w, peak_w, min_w, var_w, trend = extract_advanced_features(samples)
-    delta_w = peak_w - min_w
-    
-    if delta_w <= 0.8 and var_w <= 0.4:
-        if avg_w < 40.0: return "lamp"
-        else: return "appliance"
-        
-    if peak_w > 250.0: return "ebike_fast"
-    elif peak_w > 90.0: return "ebike_std"
-    # VERBESSERUNG: Präzisere Laptop Erkennung
-    elif peak_w >= 28.0 or avg_w >= 25.0: return "laptop"
-    else: return "phone"
-
-def estimate_initial_soc(profile_key, samples):
-    if not samples: return 0.0
-    avg_w, peak_w, min_w, var_w, trend = extract_advanced_features(samples)
-    
-    is_cv_phase = trend < -0.3
+    is_cv_phase = trend < -0.2
     
     if profile_key == "phone":
-        if is_cv_phase and avg_w < 10.0: return 85.0
-        if avg_w >= 15.0: return 30.0
-        elif avg_w >= 10.0: return 50.0
-        elif avg_w >= 6.0: return 75.0
+        if is_cv_phase and avg_w < 8.0: return 88.0
+        if avg_w >= 15.0: return 20.0
+        elif avg_w >= 10.0: return 40.0
+        elif avg_w >= 6.0: return 70.0
         elif avg_w >= 3.0: return 85.0
         elif avg_w >= 1.0: return 95.0
         else: return 99.0
         
     elif profile_key == "laptop":
         if is_cv_phase and avg_w < 35.0: return 85.0
-        if avg_w >= 60.0: return 20.0
-        elif avg_w >= 40.0: return 50.0
-        elif avg_w >= 25.0: return 75.0
+        if avg_w >= 50.0: return 20.0
+        elif avg_w >= 35.0: return 50.0
+        elif avg_w >= 20.0: return 75.0
         elif avg_w >= 10.0: return 88.0
-        else: return 96.0
+        elif avg_w >= 5.0: return 96.0
+        else: return 99.0
         
     return 0.0
 
@@ -210,6 +186,16 @@ def background_meter_worker():
                 if uid == active_uid:
                     global_state["last_watt"], global_state["last_amp"], global_state["last_volt"] = watt, amp, volt
 
+                # --- LIVE KONTINUIERLICHES FENSTER (Immer die letzten 40 Sekunden) ---
+                if "recent_samples" not in u: u["recent_samples"] = []
+                if watt > 0.1 or len(u["recent_samples"]) > 0:
+                    u["recent_samples"].append(watt)
+                    if len(u["recent_samples"]) > 40:
+                        u["recent_samples"].pop(0)
+
+                # Speichere die absolute Höchstleistung der gesamten Sitzung für Upgrades
+                u["session_peak_watt"] = max(u.get("session_peak_watt", 0.0), watt)
+
                 # --- 1. DETECTION MODE (WARTEN AUF KABEL) ---
                 if not u["active"] and u.get("detection_mode", False):
                     if time.time() - u.get("last_seen", time.time()) > 15.0:
@@ -228,31 +214,58 @@ def background_meter_worker():
                     if watt > 0.05:
                         u["total_kwh"] += (watt * dt) / 3600000.0
 
-                    threshold = 45.0
+                    # --- KONTINUIERLICHE KI LIVE-ÜBERWACHUNG ---
+                    # Sobald wir mind. 5 Werte haben, analysieren wir in Echtzeit weiter!
+                    if len(u["recent_samples"]) >= 5 and not u.get("manually_selected"):
+                        peak = u["session_peak_watt"]
+                        tiers = {"lamp": 0, "phone": 1, "laptop": 2, "ebike_std": 3, "ebike_fast": 4, "appliance": 0}
+                        curr_tier = tiers.get(u.get("device_key", "phone"), 0)
+                        
+                        # Gerätetyp-Upgrade-Logik
+                        new_key = u.get("device_key", "phone")
+                        if peak > 250.0: new_key = "ebike_fast"
+                        elif peak > 90.0: new_key = "ebike_std"
+                        elif peak >= 26.0: new_key = "laptop"  # Zieht der Akku EINMAL >26W = Laptop!
+                        elif peak >= 0.1: new_key = "phone"
+                        else: new_key = "lamp"
+                        
+                        # Upgrade durchführen
+                        if tiers.get(new_key, 0) > curr_tier:
+                            u["device_key"] = new_key
+                            
+                        # Dynamische SOC Korrektur
+                        est_soc = estimate_current_soc(u["device_key"], u["recent_samples"])
+                        cap = DEVICE_PROFILES.get(u["device_key"], {}).get("capacity_wh", 20.0)
+                        
+                        current_calc_soc = u.get("estimated_soc_0", 0.0) + (((u.get("total_kwh", 0.0) * 1000.0) / cap) * 100.0)
+                        
+                        if u["total_seconds"] <= 40.0:
+                            # In den ersten 40s darf der Wert flüssig justiert werden
+                            u["estimated_soc_0"] = est_soc - (((u.get("total_kwh", 0.0) * 1000.0) / cap) * 100.0)
+                        else:
+                            # Danach springen wir nur noch HOCH, falls die KI merkt, der Akku ist voller als gedacht
+                            if est_soc > current_calc_soc + 5.0:
+                                u["estimated_soc_0"] = est_soc - (((u.get("total_kwh", 0.0) * 1000.0) / cap) * 100.0)
 
-                    if u["total_seconds"] < threshold and not u["manually_selected"]:
-                        if watt > 0.1:
-                            u["analysis_samples"].append(watt)
-                    elif u["total_seconds"] >= threshold and not u["analysis_completed"] and not u["manually_selected"]:
-                        u["device_key"] = ai_classify_samples(u["analysis_samples"])
-                        u["estimated_soc_0"] = estimate_initial_soc(u["device_key"], u["analysis_samples"])
-                        u["analysis_completed"] = True
+                        if u["total_seconds"] >= 40.0:
+                            u["analysis_completed"] = True
 
-                    # VERBESSERUNG: Striktes > 65 Sekunden Timeout für Kabel-Ausstecken
+                    # 65 SEKUNDEN STRIKTES AUSSTECK-TIMEOUT
                     if watt > 0.5:
                         u["had_power_draw"] = True
                         u["zero_power_counter"] = 0.0
                         
                     if u.get("had_power_draw") and watt <= 0.15:
                         u["zero_power_counter"] += dt
-                        if u["zero_power_counter"] >= 65.0:  # Zählt wirklich > 60s
+                        if u["zero_power_counter"] >= 65.0:  # Zählt wirklich sicher > 60s
                             u["active"], u["unplugged_detected"], u["had_power_draw"] = False, True, False
                             async_cloud_control(turn_on=False)
                     elif watt > 0.15:
                         u["zero_power_counter"] = 0.0
 
+                    # 80% & 100% Erkennung
                     prof = DEVICE_PROFILES.get(u.get("device_key"), {})
-                    if prof.get("is_battery", False) and u["total_seconds"] > threshold:
+                    if prof.get("is_battery", False) and u["total_seconds"] > 40.0:
                         cap = prof.get("capacity_wh", 20.0)
                         current_pct = u.get("estimated_soc_0", 0.0) + (((u["total_kwh"] * 1000.0) / cap) * 100.0)
 
@@ -503,22 +516,22 @@ HTML_PAGE = """
                 </div>
             </div>
 
-            <!-- GERÄTE ERKENNUNG -->
+            <!-- GERÄTE ERKENNUNG (KONTINUIERLICH) -->
             <div class="ai-banner">
                 <div class="ai-header">
-                    <span class="ai-title" id="aiStatusTitle">AI Erkennung</span>
-                    <button class="btn-edit" onclick="document.getElementById('deviceModal').style.display='flex'">✏️ Ändern (AI lernt)</button>
+                    <span class="ai-title" id="aiStatusTitle">AI Live-Überwachung</span>
+                    <button class="btn-edit" onclick="document.getElementById('deviceModal').style.display='flex'">✏️ Ändern</button>
                 </div>
                 <div class="ai-body">
                     <div class="ai-icon" id="devIcon">📱</div>
                     <div>
                         <div class="ai-detected" id="detectedName">Smartphone (Standard)</div>
-                        <div class="ai-mode" id="detectedMode">AI Lastanalyse (45s)...</div>
+                        <div class="ai-mode" id="detectedMode">AI Lastanalyse (40s)...</div>
                     </div>
                 </div>
             </div>
 
-            <!-- AKKU LADESTAND NEU: Vorhersage für die fehlenden Wattstunden (Königsdisziplin) -->
+            <!-- AKKU LADESTAND NEU: Vorhersage für fehlende Wattstunden (Königsdisziplin) -->
             <div class="battery-card" id="batteryCard">
                 <div class="battery-header">
                     <span style="font-weight: 600;">🔋 Phase: <span id="batteryPhaseText" style="color: var(--text-main);">Analysiere...</span></span>
@@ -904,7 +917,7 @@ HTML_PAGE = """
                 document.getElementById('cost').innerText = data.cost.toFixed(5);
                 document.getElementById('microCost').innerText = (data.cost * 100.0).toFixed(3);
 
-                // KÖNIGSDISZIPLIN: Vorhersage für Wh und Kosten (nur wenn Akku/Analyse abgeschlossen)
+                // KÖNIGSDISZIPLIN: Vorhersage für fehlende Wh und totale Kosten
                 if (data.current_profile && data.current_profile.is_battery && (data.elapsed_seconds >= data.analysis_threshold || data.manually_selected)) {
                     document.getElementById('batteryRemWh').innerText = data.rem_wh.toFixed(1);
                     document.getElementById('batteryRemWhBox').style.display = 'inline';
@@ -918,25 +931,25 @@ HTML_PAGE = """
                     document.getElementById('microCostBox').style.display = 'block';
                 }
 
-                // ANTI-RUCKEL UI LOGIK FÜR DIE ERSTEN 45 SEKUNDEN
+                // ANTI-RUCKEL UI & LIVE-MONITORING ANZEIGE
                 if (data.active && data.elapsed_seconds < data.analysis_threshold && !data.manually_selected) {
                     let remain = Math.max(0, Math.floor(data.analysis_threshold - data.elapsed_seconds));
-                    document.getElementById('aiStatusTitle').innerText = `AI Analyse (${data.analysis_threshold}s)`;
+                    document.getElementById('aiStatusTitle').innerText = `AI Erst-Analyse (${data.analysis_threshold}s)`;
                     document.getElementById('detectedName').innerText = `Ladekurve... (${remain}s)`;
                     
                     if (data.current_profile && data.current_profile.is_battery) {
-                        document.getElementById('batteryPhaseText').innerText = "KI misst Schwankung...";
+                        document.getElementById('batteryPhaseText').innerText = "KI misst Profil...";
                         document.getElementById('batteryPercentText').innerText = "---%";
                         document.getElementById('batteryTimeRemaining').innerText = "Restzeit: wird berechnet";
                         document.getElementById('batteryWhLoaded').innerText = "---";
                     }
-                } else if (data.analysis_completed && !data.manually_selected) {
-                    document.getElementById('aiStatusTitle').innerText = `🤖 AI Erkannt`;
+                } else if (data.active && !data.manually_selected) {
+                    document.getElementById('aiStatusTitle').innerText = `🤖 AI Live-Überwachung`;
                 } else if (data.manually_selected) {
                     document.getElementById('aiStatusTitle').innerText = `Vom Nutzer angelernt`;
                 }
 
-                // WENN ANALYSE FERTIG IST -> WERTE ANZEIGEN
+                // WENN ERSTANALYSE FERTIG IST -> WERTE ANZEIGEN
                 if (data.current_profile && data.current_profile.is_battery && (data.elapsed_seconds >= data.analysis_threshold || data.manually_selected)) {
                     let pct = data.battery_pct;
                     document.getElementById('batteryPhaseText').innerText = data.charge_phase;
@@ -994,7 +1007,8 @@ def get_user_data():
             "current_watt": 0.0, "smoothed_watt": 0.0, "current_ampere": 0.0, "current_voltage": 230.0,
             "device_key": "phone", "analysis_samples": [], "analysis_completed": False, "manually_selected": False,
             "estimated_soc_0": 0.0, "battery_full_triggered": False, "eighty_percent_triggered": False, "last_report": None,
-            "detection_mode": False, "show_start_prompt": False, "last_seen": time.time()
+            "detection_mode": False, "show_start_prompt": False, "last_seen": time.time(), "session_peak_watt": 0.0,
+            "recent_samples": []
         }
     return user_sessions[uid], uid
 
@@ -1057,9 +1071,9 @@ def save_device():
     key = (request.get_json() or {}).get("key", "lamp")
     if key in DEVICE_PROFILES:
         u.update({"device_key": key, "manually_selected": True, "analysis_completed": True})
-        if u.get("analysis_samples"):
+        if u.get("recent_samples"):
             save_ai_models(load_ai_models()) 
-            u["estimated_soc_0"] = estimate_initial_soc(key, u["analysis_samples"])
+            u["estimated_soc_0"] = estimate_current_soc(key, u["recent_samples"])
     return jsonify({"status": "saved", "profile": DEVICE_PROFILES.get(u["device_key"])})
 
 @app.route('/request_transfer', methods=['POST'])
@@ -1122,7 +1136,7 @@ def finalize():
 @require_physical_auth
 def new_session():
     u, uid = get_user_data()
-    u.update({"terminated": False, "active": False, "total_kwh": 0.0, "total_seconds": 0.0, "analysis_samples": [], "analysis_completed": False, "manually_selected": False, "battery_full_triggered": False, "eighty_percent_triggered": False})
+    u.update({"terminated": False, "active": False, "total_kwh": 0.0, "total_seconds": 0.0, "analysis_samples": [], "recent_samples": [], "session_peak_watt": 0.0, "analysis_completed": False, "manually_selected": False, "battery_full_triggered": False, "eighty_percent_triggered": False})
     return jsonify({"status": "ok"})
 
 @app.route('/download_invoice', methods=['GET'])
@@ -1182,7 +1196,6 @@ def status():
     predicted_cost = 0.0
     
     if prof.get("is_battery"):
-        # Ladephase berechnen
         if battery_pct >= 95.0: charge_phase = "Erhaltungsladung"
         elif battery_pct >= 80.0: charge_phase = "Sättigung (CV)"
         elif battery_pct >= 30.0: charge_phase = "Normalladung (CC)"
@@ -1216,7 +1229,7 @@ def status():
         "predicted_cost": predicted_cost,
         "battery_full_triggered": u.get("battery_full_triggered", False),
         "analysis_completed": u.get("analysis_completed", False),
-        "analysis_threshold": 45.0,
+        "analysis_threshold": 40.0,
         "manually_selected": u.get("manually_selected", False),
         "session_terminated": False,
         "show_start_prompt": u.get("show_start_prompt", False)
