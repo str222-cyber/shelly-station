@@ -178,6 +178,8 @@ def ai_classify_samples(samples):
     best_key = "lamp"
     min_dist = float("inf")
     for key, model in current_models.items():
+        if "avg_w" not in model or "peak_w" not in model or "variance" not in model:
+            continue
         d_avg = (avg_w - model["avg_w"]) / (model["avg_w"] + 5.0)
         d_peak = (peak_w - model["peak_w"]) / (model["peak_w"] + 5.0)
         d_var = (var_w - model["variance"]) / (model["variance"] + 2.0)
@@ -198,9 +200,9 @@ def ai_learn_from_feedback(correct_key, samples):
     n = m.get("count", 1)
     
     learning_rate = 1.0 / min(n + 1, 10)
-    m["avg_w"] = (1.0 - learning_rate) * m["avg_w"] + learning_rate * avg_w
-    m["peak_w"] = (1.0 - learning_rate) * m["peak_w"] + learning_rate * peak_w
-    m["variance"] = (1.0 - learning_rate) * m["variance"] + learning_rate * var_w
+    m["avg_w"] = (1.0 - learning_rate) * m.get("avg_w", avg_w) + learning_rate * avg_w
+    m["peak_w"] = (1.0 - learning_rate) * m.get("peak_w", peak_w) + learning_rate * peak_w
+    m["variance"] = (1.0 - learning_rate) * m.get("variance", var_w) + learning_rate * var_w
     m["count"] = n + 1
     
     save_ai_models(current_models)
@@ -313,7 +315,7 @@ def background_meter_worker():
                         if watt > 5.0:
                             u["had_charging_phase"] = True
                         
-                        if u["had_charging_phase"] and 0.2 <= watt < 1.5 and (u["total_kwh"] * 1000.0) > 1.0:
+                        if u.get("had_charging_phase", False) and 0.2 <= watt < 1.5 and (u["total_kwh"] * 1000.0) > 1.0:
                             u["battery_full_counter"] += dt
                             if u["battery_full_counter"] >= 20.0:
                                 u["battery_full_triggered"] = True
@@ -361,14 +363,14 @@ def generate_pdf_invoice(report_data):
             <tr><td><strong>Angeschlossenes Gerät</strong></td><td>{report_data.get('device')}</td><td>-</td></tr>
             <tr><td><strong>Betriebsmodus</strong></td><td>{report_data.get('mode')}</td><td>-</td></tr>
             <tr><td><strong>Gesamte Nutzungsdauer</strong></td><td>{report_data.get('time_formatted')}</td><td>hh:mm:ss</td></tr>
-            <tr><td><strong>Verbrauchte Energie (Wh)</strong></td><td>{report_data.get('wh'):.4f}</td><td>Wh</td></tr>
-            <tr><td><strong>Verbrauchte Energie (kWh)</strong></td><td>{report_data.get('kwh'):.6f}</td><td>kWh</td></tr>
+            <tr><td><strong>Verbrauchte Energie (Wh)</strong></td><td>{report_data.get('wh', 0.0):.4f}</td><td>Wh</td></tr>
+            <tr><td><strong>Verbrauchte Energie (kWh)</strong></td><td>{report_data.get('kwh', 0.0):.6f}</td><td>kWh</td></tr>
             <tr><td><strong>Arbeitspreis</strong></td><td>{STROMPREIS_PER_KWH:.3f}</td><td>€ / kWh</td></tr>
         </tbody>
     </table>
     <div class="total">
         <div class="total-title">Gesamtbetrag</div>
-        <div class="total-val">{report_data.get('cost'):.5f} €</div>
+        <div class="total-val">{report_data.get('cost', 0.0):.5f} €</div>
     </div>
     <div class="footer">Vielen Dank für die Nutzung der Smart Power Station!</div>
     </body>
@@ -1234,7 +1236,7 @@ def start():
 def stop():
     ensure_worker()
     u, uid = get_user_data()
-    if u.get("terminated", False) or global_state.get("active_user_id"] != uid:
+    if u.get("terminated", False) or global_state.get("active_user_id") != uid:
         return jsonify({"status": "forbidden"}), 403
 
     u["active"] = False
