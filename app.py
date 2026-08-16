@@ -1,17 +1,31 @@
-from flask import Flask, render_template_string, jsonify, session, request, send_file
+from flask import Flask, render_template_string, jsonify, session, request, send_file, redirect
 import requests
 import time
 import threading
 import uuid
+import secrets
 import smtplib
 import io
+from functools import wraps
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
 from weasyprint import HTML
 
 app = Flask(__name__)
-app.secret_key = "shelly_smart_hub_strict_user_isolation_2026"
+
+# --- SICHERHEITS- & KRYPTOGRAFIE-KONFIGURATION ---
+# Zufälliger Secret-Key für manipulationssichere Session-Cookies
+app.secret_key = secrets.token_hex(32)
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_SAMESITE="Strict",
+    PERMANENT_SESSION_LIFETIME=14400 # 4 Stunden maximale Gültigkeit
+)
+
+# GEHEIMER PHYSISCHER STATIONSTOKEN (Nur im QR-Code vor Ort enthalten!)
+STATION_PHYSICAL_TOKEN = "SEC-STATION-2026-X99Q-ALPHA-77"
 
 # --- SHELLY CLOUD KONFIGURATION ---
 SHELLY_CLOUD_URL = "https://shelly-274-eu.shelly.cloud"
@@ -25,7 +39,6 @@ SMTP_PORT = 587
 SMTP_USER = ""
 SMTP_PASSWORD = ""
 
-# Globaler Zustand mit strenger Besitz-Trennung
 global_state = {
     "active_user_id": None,
     "active_since": 0,
@@ -38,7 +51,6 @@ global_state = {
     "last_fetch_time": 0
 }
 
-# Speichert alle Nutzersitzungen getrennt
 user_sessions = {}
 
 DEVICE_PROFILES = {
@@ -51,11 +63,23 @@ DEVICE_PROFILES = {
 }
 
 @app.after_request
-def add_universal_headers(response):
+def add_security_headers(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, private, max-age=0"
     response.headers["Pragma"] = "no-cache"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
     return response
+
+# SICHERHEITS-DEKORATOR: Blockiert jeden Zugriff ohne physischen Scan
+def require_physical_auth(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not session.get("authenticated_on_site") or session.get("station_token") != STATION_PHYSICAL_TOKEN:
+            return jsonify({"status": "unauthorized", "message": "Zugriff verweigert. Bitte QR-Code vor Ort scannen."}), 401
+        return f(*args, **kwargs)
+    return decorated_function
 
 def async_cloud_control(turn_on=True):
     def _worker():
@@ -167,12 +191,38 @@ def generate_pdf_invoice(report_data):
     pdf_buffer.seek(0)
     return pdf_buffer
 
+HTML_ACCESS_DENIED = """
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="utf-8">
+    <title>Zugriff Verweigert</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: white; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; text-align: center; padding: 20px; }
+        .box { background: #1e293b; padding: 30px; border-radius: 20px; border: 1px solid #334155; max-width: 360px; }
+        .icon { font-size: 50px; margin-bottom: 15px; }
+        h2 { font-size: 20px; margin-bottom: 10px; color: #f87171; }
+        p { font-size: 14px; color: #94a3b8; line-height: 1.5; }
+    </style>
+</head>
+<body>
+    <div class="box">
+        <div class="icon">🔒🚫</div>
+        <h2>Sicherheits-Sperre</h2>
+        <p>Ein direkter Zugriff über das Internet ist aus Sicherheitsgründen untersagt.</p>
+        <p style="margin-top: 12px; color: #e2e8f0; font-weight: 600;">Bitte scanne den offiziellen QR-Code direkt an der Ladestation vor Ort.</p>
+    </div>
+</body>
+</html>
+"""
+
 HTML_PAGE = """
 <!DOCTYPE html>
 <html lang="de">
 <head>
     <meta charset="utf-8">
-    <title>Smart Power Hub</title>
+    <title>Smart Power Hub • Authentifiziert</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <style>
         :root {
@@ -198,6 +248,20 @@ HTML_PAGE = """
         .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
         .title { font-size: 18px; font-weight: 700; color: var(--text-main); letter-spacing: -0.3px; }
         .rate-badge { background: #f1f5f9; color: var(--text-muted); font-size: 12px; padding: 4px 10px; border-radius: 20px; font-weight: 600; }
+
+        .security-banner {
+            background: #ecfdf5;
+            border: 1px solid #a7f3d0;
+            border-radius: 12px;
+            padding: 6px 10px;
+            font-size: 11px;
+            color: #065f46;
+            font-weight: 600;
+            margin-bottom: 12px;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
 
         .ai-banner {
             background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
@@ -230,7 +294,6 @@ HTML_PAGE = """
         }
         .status-on { background: #ecfdf5; color: #065f46; }
         .status-off { background: #f1f5f9; color: var(--text-muted); }
-        .status-unplug { background: #fef3c7; color: #92400e; }
         .status-dot { width: 8px; height: 8px; border-radius: 50%; }
         .status-on .status-dot { background: var(--accent-green); box-shadow: 0 0 8px rgba(16,185,129,0.6); }
         .status-off .status-dot { background: #94a3b8; }
@@ -343,7 +406,6 @@ HTML_PAGE = """
     </style>
 </head>
 <body>
-    <!-- MODAL: GERTÄT AUSWÄHLEN -->
     <div id="deviceModal" class="modal-overlay">
         <div class="modal-box">
             <h3 style="margin-bottom: 6px;">Gerät festlegen</h3>
@@ -358,13 +420,13 @@ HTML_PAGE = """
         </div>
     </div>
 
-    <!-- ANFRAGE-POPUP BEI NUTZER 1 -->
+    <!-- ANFRAGE MODAL BEI NUTZER 1 -->
     <div id="transferModal" class="modal-overlay">
         <div class="modal-box" style="border: 2px solid var(--accent-amber);">
             <div style="font-size: 40px; margin-bottom: 6px;">👋🔔</div>
             <h3 style="color: var(--accent-amber); margin-bottom: 6px;">Freigabe-Anfrage</h3>
             <p style="font-size: 13px; color: var(--text-main); margin-bottom: 14px;">
-                Ein anderer Nutzer hat den QR-Code gescannt und möchte laden. Möchtest du die Steckdose jetzt überlassen?
+                Ein anderer Nutzer hat den QR-Code vor Ort gescannt und möchte laden. Möchtest du die Steckdose jetzt überlassen?
             </p>
             <button class="btn-start" style="background: var(--accent-green); margin-bottom: 8px;" onclick="acceptTransfer()">✅ Ja, beenden & freigeben</button>
             <button class="btn-stop" onclick="rejectTransfer()">Nein, ich nutze weiter</button>
@@ -377,7 +439,7 @@ HTML_PAGE = """
             <div style="font-size: 48px; margin-bottom: 10px;">⏳🔒</div>
             <div class="title" style="margin-bottom: 6px;">Steckdose aktuell belegt</div>
             <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 16px;">
-                Ein anderer Nutzer verwendet die Steckdose gerade aktiv.
+                Ein anderer authentifizierter Nutzer lädt gerade aktiv an dieser Station.
             </p>
             <div style="background: #f1f5f9; padding: 12px; border-radius: 14px; margin-bottom: 16px; text-align: left; font-size: 13px;">
                 Aktuelle Leistung: <b id="busyWatt">0.000 W</b>
@@ -396,6 +458,7 @@ HTML_PAGE = """
             </div>
 
             <div>
+                <span class="security-banner">🛡️ Gesicherte Vor-Ort Sitzung</span><br>
                 <div id="statusBadge" class="status-pill status-off">
                     <span class="status-dot"></span>
                     <span id="statusText">Bereit / Aus</span>
@@ -465,7 +528,7 @@ HTML_PAGE = """
             </div>
         </div>
 
-        <!-- QUITTUNG (FINALER ZUSTAND NACH DEM BEENDEN) -->
+        <!-- QUITTUNG (FINALER ZUSTAND) -->
         <div class="card receipt-card" id="receiptCard">
             <div class="receipt-header">
                 <div style="font-size: 40px; margin-bottom: 4px;">🧾</div>
@@ -489,7 +552,7 @@ HTML_PAGE = """
             </div>
 
             <div style="margin-top: 20px; font-size: 12px; color: var(--text-muted);">
-                ℹ️ Um die Steckdose erneut zu nutzen, scanne bitte den QR-Code an der Station neu.
+                ℹ️ Um die Steckdose erneut zu nutzen, scanne bitte den QR-Code an der Station vor Ort neu.
             </div>
         </div>
     </div>
@@ -581,7 +644,6 @@ HTML_PAGE = """
             document.getElementById('btnRequestSlot').style.opacity = '0.6';
         }
 
-        // NUTZER 1 BESTÄTIGT ÜBERGABE -> SOFORTIGER HARD-FREEZE & QUITTUNG
         async function acceptTransfer() {
             transferModalOpen = false;
             document.getElementById('transferModal').style.display = 'none';
@@ -609,7 +671,6 @@ HTML_PAGE = """
                 document.getElementById('rKwh').innerText = report.kwh.toFixed(6) + " kWh";
                 document.getElementById('rCost').innerText = report.cost.toFixed(5) + " €";
                 
-                // HAUPTKARTE VOLLSTÄNDIG ENTFERNEN
                 document.getElementById('mainCard').style.display = 'none';
                 document.getElementById('busyCard').style.display = 'none';
                 document.getElementById('receiptCard').style.display = 'block';
@@ -649,20 +710,17 @@ HTML_PAGE = """
             window.open('/download_invoice', '_blank');
         }
 
-        // STATUS-POLLING: Stoppt sofort, wenn Nutzer 1 abgemeldet ist!
         async function fetchSyncData() {
             if (isTerminated) return;
             try {
                 let res = await fetch('/status', { cache: 'no-store' });
                 let data = await res.json();
 
-                // Falls die Session serverseitig abgelaufen oder übergeben wurde
                 if (data.session_terminated) {
                     await logout();
                     return;
                 }
 
-                // BESETZT-ANSICHT FÜR NUTZER 2
                 if (data.is_busy_for_other) {
                     document.getElementById('mainCard').style.display = 'none';
                     document.getElementById('busyCard').style.display = 'block';
@@ -673,7 +731,6 @@ HTML_PAGE = """
                     document.getElementById('mainCard').style.display = 'block';
                 }
 
-                // ANFRAGE BEI NUTZER 1
                 if (data.transfer_requested && !transferModalOpen) {
                     transferModalOpen = true;
                     document.getElementById('transferModal').style.display = 'flex';
@@ -736,18 +793,40 @@ def get_user_data():
         }
     return user_sessions[uid], uid
 
+# --- AUTH-ROUTEN ---
+
+# 1. Öffentlicher Root-Zugriff: WIRD BLOCKIERT (Verhindert Internet-Angriffe)
 @app.route('/')
 def home():
-    # Bei jedem Neuladen oder frischem QR-Scan wird eine neue, saubere Session erzeugt
+    if not session.get("authenticated_on_site") or session.get("station_token") != STATION_PHYSICAL_TOKEN:
+        return render_template_string(HTML_ACCESS_DENIED), 403
+    
+    # Falls die alte Session beendet war, Session-Cookie erneuern
     if "user_id" in session:
         old_uid = session["user_id"]
-        # Falls die alte Session bereits beendet war, Session-Cookie erneuern
         if user_sessions.get(old_uid, {}).get("terminated", False):
-            session.clear()
+            session.pop("user_id", None)
+            
     get_user_data()
     return render_template_string(HTML_PAGE)
 
+# 2. Authentifizierungs-Einstiegspunkt: NUR ÜBER PHYSISCHEN QR-CODE ERREICHBAR!
+@app.route('/scan/<token>')
+def scan_qr_entry(token):
+    if token != STATION_PHYSICAL_TOKEN:
+        return render_template_string(HTML_ACCESS_DENIED), 403
+
+    # Authentifiziere den Nutzer vor Ort
+    session["authenticated_on_site"] = True
+    session["station_token"] = STATION_PHYSICAL_TOKEN
+    session["user_id"] = str(uuid.uuid4()) # Immer frische, isolierte Session bei neuem Scan
+    
+    return redirect('/')
+
+# --- GESCHÜTZTE API-ENDPUNKTE ---
+
 @app.route('/start', methods=['POST', 'GET'])
+@require_physical_auth
 def start():
     u, uid = get_user_data()
     if u.get("terminated", False):
@@ -769,6 +848,7 @@ def start():
     return jsonify({"status": "ok"})
 
 @app.route('/stop', methods=['POST', 'GET'])
+@require_physical_auth
 def stop():
     u, uid = get_user_data()
     if u.get("terminated", False) or global_state.get("active_user_id") != uid:
@@ -782,6 +862,7 @@ def stop():
     return jsonify({"status": "ok"})
 
 @app.route('/save_device', methods=['POST'])
+@require_physical_auth
 def save_device():
     u, uid = get_user_data()
     if u.get("terminated", False) or global_state.get("active_user_id") != uid:
@@ -797,6 +878,7 @@ def save_device():
     })
 
 @app.route('/request_transfer', methods=['POST'])
+@require_physical_auth
 def request_transfer():
     _, uid = get_user_data()
     if global_state["active_user_id"] and global_state["active_user_id"] != uid:
@@ -805,19 +887,20 @@ def request_transfer():
     return jsonify({"status": "requested"})
 
 @app.route('/reject_transfer', methods=['POST'])
+@require_physical_auth
 def reject_transfer():
     global_state["transfer_requested"] = False
     global_state["transfer_requester_id"] = None
     return jsonify({"status": "rejected"})
 
 @app.route('/logout', methods=['POST', 'GET'])
+@require_physical_auth
 def logout():
     u, uid = get_user_data()
     u["active"] = False
-    u["terminated"] = True  # Session für immer sperren
+    u["terminated"] = True
     async_cloud_control(turn_on=False)
 
-    # Steckdose sofort freigeben
     if global_state["active_user_id"] == uid:
         global_state["active_user_id"] = None
         global_state["transfer_requested"] = False
@@ -842,6 +925,7 @@ def logout():
     return jsonify(report)
 
 @app.route('/download_invoice', methods=['GET'])
+@require_physical_auth
 def download_invoice():
     u, _ = get_user_data()
     report = u.get("last_report") or {
@@ -857,6 +941,7 @@ def download_invoice():
     return send_file(pdf_buffer, mimetype="application/pdf", as_attachment=True, download_name=f"{report.get('invoice_id', 'Rechnung')}.pdf")
 
 @app.route('/send_email_invoice', methods=['POST'])
+@require_physical_auth
 def send_email_invoice():
     data = request.get_json() or {}
     recipient = data.get("email")
@@ -902,11 +987,11 @@ def send_email_invoice():
         })
 
 @app.route('/status')
+@require_physical_auth
 def status():
     u, uid = get_user_data()
     active_uid = global_state.get("active_user_id")
 
-    # Falls diese Session beendet wurde
     if u.get("terminated", False):
         return jsonify({"session_terminated": True, "is_busy_for_other": False})
     
