@@ -80,8 +80,6 @@ def get_total_learned_count():
     return sum(m.get("count", 1) for m in load_ai_models().values())
 
 def get_analysis_threshold(user_session):
-    # Dynamische Analyse-Erweiterung: Wenn der Strom sehr niedrig ist, warten wir bis
-    # zu 45 Sekunden, damit das Handy das Display ausschalten und sich stabilisieren kann.
     samples = user_session.get("analysis_samples", [])
     if len(samples) > 10:
         avg = sum(samples) / len(samples)
@@ -145,7 +143,6 @@ def extract_advanced_features(samples):
     min_w = min(samples)
     var_w = math.sqrt(sum((x - avg_w) ** 2 for x in samples) / len(samples))
     
-    # Trendberechnung: Fällt der Strom ab? (Display geht aus -> typisch Handy)
     mid = len(samples) // 2
     trend = 0.0
     if mid > 0:
@@ -158,18 +155,13 @@ def ai_classify_samples(samples):
     avg_w, peak_w, min_w, var_w, trend = extract_advanced_features(samples)
     delta_w = peak_w - min_w
 
-    # 1. Erkennung durch USB-Handshake oder Display-Abschaltung
-    # Handys verhandeln oft 0W -> 5W -> 1W -> 9W. Lampen sind konstant.
     if var_w > 0.8 or delta_w > 1.5:
         if avg_w < 35.0: return "phone"
         elif avg_w < 90.0: return "laptop"
         else: return "ebike_fast"
             
-    # 2. Konstante, geringe Last (Die Krux: 80% Handy vs. kleine Lampe)
     if delta_w <= 0.6:
         if avg_w < 5.0:
-            # Lampen springen im ersten Moment sofort auf ihren Zielwert (Harter Start)
-            # Netzteile von Handys laden zuerst Kondensatoren (Sanfter Start, samples[0] ist niedrig)
             if len(samples) > 5 and samples[0] < (avg_w - 0.2):
                 return "phone" 
             else:
@@ -177,7 +169,6 @@ def ai_classify_samples(samples):
         elif 5.0 <= avg_w < 35.0:
             return "phone"
 
-    # 3. Klassischer Watt-Fallback
     if 0.5 <= avg_w < 35.0: return "phone"
     elif 35.0 <= avg_w < 90.0: return "laptop"
     elif 90.0 <= avg_w < 250.0: return "ebike_std"
@@ -190,16 +181,15 @@ def estimate_initial_soc(profile_key, samples):
     avg_w, peak_w, min_w, var_w, trend = extract_advanced_features(samples)
     
     if profile_key == "phone":
-        # Wenn der Strom im Verlauf der 45s fällt, sind wir sicher in der Endladephase (>80%)
         if trend < -0.3 and avg_w < 6.0: return 90.0
         
-        # Schätzung CC-Phase
+        # Besser kalibriert für die typischen 80% Watt-Werte
         if avg_w >= 18.0: return 10.0
         elif avg_w >= 12.0: return 40.0
-        elif avg_w >= 7.0: return 70.0
-        elif avg_w >= 4.0: return 85.0
-        elif avg_w >= 1.0: return 95.0
-        else: return 98.0
+        elif avg_w >= 7.0: return 80.0
+        elif avg_w >= 4.0: return 90.0
+        elif avg_w >= 1.0: return 96.0
+        else: return 99.0
         
     elif profile_key == "laptop":
         if avg_w >= 45.0: return 15.0
@@ -248,27 +238,25 @@ def background_meter_worker():
 
                     threshold = get_analysis_threshold(u)
 
-                    # Analysieren
                     if u["total_seconds"] < threshold and not u["manually_selected"]:
-                        if watt > 0.1: # Sehr niedriger Schwellenwert für volle Handys
+                        if watt > 0.1:
                             u["analysis_samples"].append(watt)
                     elif u["total_seconds"] >= threshold and not u["analysis_completed"] and not u["manually_selected"]:
                         u["device_key"] = ai_classify_samples(u["analysis_samples"])
                         u["estimated_soc_0"] = estimate_initial_soc(u["device_key"], u["analysis_samples"])
                         u["analysis_completed"] = True
 
-                    # Aussteck-Erkennung
+                    # EXTREM VERBESSERTE AUSSTECK-ERKENNUNG (60s Toleranz für Handshakes)
                     if watt > 0.5:
                         u["had_power_draw"], u["zero_power_counter"] = True, 0.0
-                    if u.get("had_power_draw") and watt <= 0.05:
+                    if u.get("had_power_draw") and watt <= 0.15:
                         u["zero_power_counter"] += dt
-                        if u["zero_power_counter"] >= 15.0:
+                        if u["zero_power_counter"] >= 60.0:  # Erhöht auf sichere 60 Sekunden!
                             u["active"], u["unplugged_detected"], u["had_power_draw"] = False, True, False
                             async_cloud_control(turn_on=False)
-                    elif watt > 0.05:
+                    elif watt > 0.15:
                         u["zero_power_counter"] = 0.0
 
-                    # 80% & 100% Erkennung
                     prof = DEVICE_PROFILES.get(u.get("device_key"), {})
                     if prof.get("is_battery", False) and u["total_seconds"] > threshold:
                         cap = prof.get("capacity_wh", 20.0)
@@ -607,6 +595,9 @@ HTML_PAGE = """
                 <button class="btn-start" id="mainStartBtn" onclick="startSession()">▶️ Start / Fortsetzen</button>
                 <button class="btn-stop" onclick="pauseSession()">⏸️ Pause</button>
                 <button class="btn-finish" onclick="logout(true)">🧾 Beenden & Abrechnen</button>
+                
+                <!-- NEUER BUTTON ZUM KOMPLETTEN SCHLIESSEN OHNE STROM -->
+                <button class="btn-stop" style="background: #fef2f2; color: var(--accent-red); border-color: #fecaca; margin-top: 8px;" onclick="closeAppEarly()">❌ Fenster komplett schließen</button>
             </div>
         </div>
 
@@ -633,7 +624,6 @@ HTML_PAGE = """
                 <div id="emailFeedback" style="display:none; font-size:12px; font-weight:600; margin-top:8px;"></div>
             </div>
 
-            <!-- NEUER SCHLIESSEN BEREICH -->
             <div style="margin-top: 24px; display: flex; flex-direction: column; gap: 10px;">
                 <button onclick="closeApp()" style="background: #ef4444; color: white; font-size: 16px; padding: 16px; font-weight: bold; border-radius: 14px; box-shadow: 0 4px 6px -1px rgba(239,68,68,0.3);">
                     ❌ App komplett schließen
@@ -663,13 +653,23 @@ HTML_PAGE = """
             localStorage.setItem('hub_user_id', userId);
         }
 
-        // --- INTELLIGENTES SCHLIESSEN DES TABS ---
+        // --- SCHLIESSEN VON DER HAUPTSEITE OHNE STARTEN ---
+        function closeAppEarly() {
+            try { window.open('','_self').close(); } catch (e) {}
+            document.body.innerHTML = `
+                <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; text-align:center; background:#0f172a; color:#f8fafc; margin: -18px -12px;">
+                    <div style="font-size: 60px; margin-bottom:20px;">🚪</div>
+                    <h2 style="margin-bottom: 10px; color: #38bdf8;">Abgebrochen</h2>
+                    <p style="color: #94a3b8; max-width:280px; font-size: 15px; line-height: 1.5;">Kein Stromfluss gestartet. Bitte scanne den QR-Code erneut, falls du doch laden möchtest.<br><br>Du kannst dieses Fenster nun schließen.</p>
+                </div>
+            `;
+            document.body.style.background = '#0f172a';
+            sendAction('/new_session');
+        }
+
+        // --- SCHLIESSEN NACH DER ABRECHNUNG ---
         function closeApp() {
-            try {
-                window.open('','_self').close();
-            } catch (e) {}
-            
-            // Fallback: Zerstört die aktuelle Ansicht und blendet "Sicher Beendet" Fullscreen ein
+            try { window.open('','_self').close(); } catch (e) {}
             document.body.innerHTML = `
                 <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; text-align:center; background:#0f172a; color:#f8fafc; margin: -18px -12px;">
                     <div style="font-size: 60px; margin-bottom:20px;">🔒</div>
