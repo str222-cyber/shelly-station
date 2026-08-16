@@ -1,7 +1,6 @@
 from flask import Flask, render_template_string, jsonify, session, request, send_file
 import requests
 import time
-import threading
 import uuid
 import smtplib
 import io
@@ -11,7 +10,7 @@ from email.mime.application import MIMEApplication
 from weasyprint import HTML
 
 app = Flask(__name__)
-app.secret_key = "shelly_smart_hub_zero_offset_calibrated_2026"
+app.secret_key = "shelly_smart_hub_direct_live_metrics_v6"
 
 # --- SHELLY CLOUD KONFIGURATION ---
 SHELLY_CLOUD_URL = "https://shelly-274-eu.shelly.cloud"
@@ -20,11 +19,6 @@ DEVICE_ID = "08927249a904"
 
 STROMPREIS_PER_KWH = 0.35  # 0,35 € pro kWh
 
-# EIGENVERBRAUCHS- & NOISE-OFFSET (WLAN-Modul, Relais, LED-Ring)
-SHELLY_IDLE_NOISE_THRESHOLD_WATT = 0.75  # Alles darunter ist Leerlauf / Eigenrauschen
-SHELLY_IDLE_NOISE_THRESHOLD_AMP = 0.015  # 15 mA Schwellwert
-
-# OPTIONALE SMTP-DATEN
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 SMTP_USER = ""
@@ -36,9 +30,10 @@ global_state = {
     "transfer_requested": False,
     "transfer_requester_id": None,
     "last_device_key": "lamp",
-    "cached_watt": 0.0,
-    "cached_current": 0.0,
-    "cached_voltage": 230.0
+    "last_watt": 0.0,
+    "last_amp": 0.0,
+    "last_volt": 230.0,
+    "last_fetch_time": 0
 }
 
 user_sessions = {}
@@ -78,50 +73,46 @@ def cloud_control(turn_on=True):
     except:
         pass
 
-def background_sensor_poller():
-    while True:
-        try:
-            active_uid = global_state.get("active_user_id")
-            if active_uid and user_sessions.get(active_uid, {}).get("active", False):
-                payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID}
-                res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=2.0).json()
-                if res.get("isok"):
-                    status = res.get("data", {}).get("device_status", {})
-                    raw_watt = 0.0
-                    raw_amp = 0.0
-                    volt = 230.0
-                    
-                    if "switch:0" in status:
-                        sw = status["switch:0"]
-                        raw_watt = float(sw.get("apower", 0.0))
-                        raw_amp = float(sw.get("current", 0.0))
-                        volt = float(sw.get("voltage", 230.0))
-                    elif "meters" in status and len(status["meters"]) > 0:
-                        m = status["meters"][0]
-                        raw_watt = float(m.get("power", 0.0))
-                        raw_amp = float(m.get("current", 0.0)) if "current" in m else (raw_watt / 230.0 if raw_watt > 0 else 0.0)
-                        volt = float(m.get("voltage", 230.0)) if "voltage" in m else 230.0
-                    
-                    # EIGENVERBRAUCHS-KOMPENSATION:
-                    # Liegt der Wert im Leerlauf-Bereich des Plugs selbst, bereinigen wir ihn auf echte 0.0 W
-                    if raw_watt < SHELLY_IDLE_NOISE_THRESHOLD_WATT and raw_amp < SHELLY_IDLE_NOISE_THRESHOLD_AMP:
-                        watt = 0.0
-                        amp = 0.0
-                    else:
-                        watt = raw_watt
-                        amp = raw_amp
+def fetch_live_cloud_metrics():
+    now = time.time()
+    # Maximal alle 1.0s aktualisieren, um API-Ratenbegrenzungen zu schonen
+    if now - global_state["last_fetch_time"] < 1.0:
+        return global_state["last_watt"], global_state["last_amp"], global_state["last_volt"]
 
-                    global_state["cached_watt"] = watt
-                    global_state["cached_current"] = amp
-                    global_state["cached_voltage"] = volt
-            else:
-                global_state["cached_watt"] = 0.0
-                global_state["cached_current"] = 0.0
-        except:
-            pass
-        time.sleep(1.2)
+    payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID}
+    try:
+        res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=2.5).json()
+        if res.get("isok"):
+            status = res.get("data", {}).get("device_status", {})
+            watt = 0.0
+            amp = 0.0
+            volt = 230.0
 
-threading.Thread(target=background_sensor_poller, daemon=True).start()
+            # Gen 2 / Plus / Gen 3
+            if "switch:0" in status:
+                sw = status["switch:0"]
+                watt = float(sw.get("apower", 0.0))
+                amp = float(sw.get("current", 0.0))
+                volt = float(sw.get("voltage", 230.0))
+            # Gen 1 Geräte
+            elif "meters" in status and len(status["meters"]) > 0:
+                m = status["meters"][0]
+                watt = float(m.get("power", 0.0))
+                amp = float(m.get("current", 0.0)) if "current" in m else (watt / 230.0 if watt > 0 else 0.0)
+                volt = float(m.get("voltage", 230.0)) if "voltage" in m else 230.0
+            elif "relays" in status and len(status["relays"]) > 0:
+                watt = float(status["relays"][0].get("power", 0.0))
+                amp = watt / 230.0 if watt > 0 else 0.0
+
+            global_state["last_watt"] = watt
+            global_state["last_amp"] = amp
+            global_state["last_volt"] = volt
+            global_state["last_fetch_time"] = now
+            return watt, amp, volt
+    except Exception as e:
+        pass
+
+    return global_state["last_watt"], global_state["last_amp"], global_state["last_volt"]
 
 def generate_pdf_invoice(report_data):
     html_invoice = f"""
@@ -358,7 +349,7 @@ HTML_PAGE = """
     </style>
 </head>
 <body>
-    <!-- MODAL 1: GERTÄT MANUELL AUSWÄHLEN -->
+    <!-- MODAL 1: GERTÄT AUSWÄHLEN -->
     <div id="deviceModal" class="modal-overlay">
         <div class="modal-box">
             <h3 style="margin-bottom: 6px;">Gerät festlegen</h3>
@@ -373,7 +364,7 @@ HTML_PAGE = """
         </div>
     </div>
 
-    <!-- MODAL 2: FREIGABE-ANFRAGE BEI NUTZER 1 -->
+    <!-- MODAL 2: FREIGABE-ANFRAGE -->
     <div id="transferModal" class="modal-overlay">
         <div class="modal-box" style="border: 2px solid var(--accent-amber);">
             <div style="font-size: 40px; margin-bottom: 6px;">👋🔔</div>
@@ -745,12 +736,12 @@ HTML_PAGE = """
                 let startBtn = document.getElementById('mainStartBtn');
                 
                 if (data.active) {
-                    if (currentW > 3.0) {
+                    if (currentW > 1.0) {
                         hadHeavyPowerPhase = true;
                     }
 
-                    // --- EIGENVERBRAUCHS-BEREINIGTE UNPLUG-ERKENNUNG ---
-                    if (isBatteryDevice && hadHeavyPowerPhase && currentW === 0.0 && currentA === 0.0) {
+                    // --- UNPLUG-ERKENNUNG NUR BEI AKKU-GERÄTEN ---
+                    if (isBatteryDevice && hadHeavyPowerPhase && currentW < 0.1 && currentA < 0.005) {
                         zeroPowerStreak++;
                         document.getElementById('wattSub').innerText = `Keine Last (${zeroPowerStreak}/15s)...`;
                         
@@ -766,15 +757,15 @@ HTML_PAGE = """
                         }
                     } else {
                         zeroPowerStreak = 0;
-                        document.getElementById('wattSub').innerText = currentW > 0.0 ? "Fließt stabil" : "Bereit / Leerlauf";
+                        document.getElementById('wattSub').innerText = currentW > 0.1 ? "Fließt stabil" : "Bereit / Leerlauf";
                     }
 
                     badge.className = "status-pill status-on";
                     text.innerText = "Aktiv / Strom fließt";
                     startBtn.innerText = "▶️ Läuft bereits";
 
-                    // 100% VOLLGELADEN BEI AKKUS (Netzteil zieht noch Standby 0.8W - 2.0W)
-                    if (isBatteryDevice && hadHeavyPowerPhase && currentW >= 0.8 && currentW < 2.2 && data.wh > 2.0) {
+                    // 100% VOLLGELADEN BEI AKKUS
+                    if (isBatteryDevice && hadHeavyPowerPhase && currentW >= 0.4 && currentW < 1.8 && data.wh > 2.0) {
                         await sendAction('/stop');
                         document.getElementById('fullModal').style.display = 'flex';
                         startAudioAlert();
@@ -983,13 +974,11 @@ def status():
     if active_uid and active_uid != uid:
         if user_sessions.get(active_uid, {}).get("active", False):
             is_busy = True
-            global_w = global_state["cached_watt"]
+            global_w = global_state["last_watt"]
 
     if u["active"]:
         now = time.time()
-        w = global_state["cached_watt"]
-        a = global_state["cached_current"]
-        v = global_state["cached_voltage"]
+        w, a, v = fetch_live_cloud_metrics()
         
         u["current_watt"] = w
         u["current_ampere"] = a
