@@ -4,27 +4,28 @@ import time
 import uuid
 
 app = Flask(__name__)
-app.secret_key = "shelly_smart_hub_stable_multiuser_v4"
+app.secret_key = "shelly_smart_hub_high_precision_metrics_2026"
 
 # --- SHELLY CLOUD KONFIGURATION ---
 SHELLY_CLOUD_URL = "https://shelly-274-eu.shelly.cloud"
 AUTH_KEY = "NDcwMzFkdWlkF9839F81801CF17665B14F2EED9BDC41514AEAB2C6C041201D306ABBC40BDE2A0AD2F80ACE98C596"
 DEVICE_ID = "08927249a904"
 
-STROMPREIS_PER_KWH = 0.35
+STROMPREIS_PER_KWH = 0.35  # 0,35 € pro kWh
 
-# Globaler Zustand für Multi-User Management & dauerhaftes Gerätelernen
 global_state = {
     "active_user_id": None,
     "active_since": 0,
     "transfer_requested": False,
     "transfer_requester_id": None,
-    "last_device_key": "lamp"  # Standardmäßig Lampe als gelerntes Standardgerät
+    "last_device_key": "lamp",
+    "cached_watt": 0.0,
+    "cached_current": 0.0,
+    "cached_voltage": 230.0
 }
 
 user_sessions = {}
 
-# Geräteprofile
 DEVICE_PROFILES = {
     "lamp": {"name": "💡 Lampe / Beleuchtung", "icon": "💡", "is_battery": False},
     "phone": {"name": "📱 Smartphone / Tablet", "icon": "📱", "is_battery": True},
@@ -43,12 +44,7 @@ def add_universal_headers(response):
 
 def cloud_control(turn_on=True):
     turn_str = "on" if turn_on else "off"
-    payload = {
-        "auth_key": AUTH_KEY,
-        "id": DEVICE_ID,
-        "turn": turn_str,
-        "channel": 0
-    }
+    payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID, "turn": turn_str, "channel": 0}
     try:
         requests.post(f"{SHELLY_CLOUD_URL}/device/relay/control", data=payload, timeout=3.5)
     except:
@@ -65,31 +61,43 @@ def cloud_control(turn_on=True):
     except:
         pass
 
-def cloud_get_watt():
-    payload = {
-        "auth_key": AUTH_KEY,
-        "id": DEVICE_ID
-    }
+def cloud_get_metrics():
+    payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID}
     try:
         res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=3.5).json()
         if res.get("isok"):
             status = res.get("data", {}).get("device_status", {})
+            watt = 0.0
+            amp = 0.0
+            volt = 230.0
+            
+            # Gen 2 / Gen 3 Devices
             if "switch:0" in status:
-                return float(status["switch:0"].get("apower", 0.0))
+                sw = status["switch:0"]
+                watt = float(sw.get("apower", 0.0))
+                amp = float(sw.get("current", 0.0))
+                volt = float(sw.get("voltage", 230.0))
+            # Gen 1 Relays / Meters
             elif "meters" in status and len(status["meters"]) > 0:
-                return float(status["meters"][0].get("power", 0.0))
-            elif "relays" in status and len(status["relays"]) > 0:
-                return float(status["relays"][0].get("power", 0.0))
+                m = status["meters"][0]
+                watt = float(m.get("power", 0.0))
+                amp = float(m.get("current", 0.0)) if "current" in m else (watt / 230.0 if watt > 0 else 0.0)
+                volt = float(m.get("voltage", 230.0)) if "voltage" in m else 230.0
+            
+            global_state["cached_watt"] = watt
+            global_state["cached_current"] = amp
+            global_state["cached_voltage"] = volt
+            return watt, amp, volt
     except:
         pass
-    return 0.0
+    return global_state["cached_watt"], global_state["cached_current"], global_state["cached_voltage"]
 
 HTML = """
 <!DOCTYPE html>
 <html lang="de">
 <head>
     <meta charset="utf-8">
-    <title>Smart Power Station</title>
+    <title>Smart Power Precision Hub</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <style>
         :root {
@@ -101,6 +109,7 @@ HTML = """
             --accent-green: #059669;
             --accent-amber: #d97706;
             --accent-red: #dc2626;
+            --accent-cyan: #0891b2;
             --border-color: #e2e8f0;
             --shadow-md: 0 10px 25px -5px rgba(15, 23, 42, 0.07), 0 8px 10px -6px rgba(15, 23, 42, 0.04);
         }
@@ -108,7 +117,7 @@ HTML = """
         * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; padding: 0; }
         body { background-color: var(--bg-color); color: var(--text-main); display: flex; justify-content: center; padding: 18px 12px; min-height: 100vh; }
         
-        .container { width: 100%; max-width: 410px; margin: auto; }
+        .container { width: 100%; max-width: 420px; margin: auto; }
         .card { background: var(--card-bg); border-radius: 24px; padding: 22px 18px; box-shadow: var(--shadow-md); border: 1px solid var(--border-color); text-align: center; }
         
         .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
@@ -153,11 +162,13 @@ HTML = """
         .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
         .stat-card { background: #f8fafc; border: 1px solid var(--border-color); border-radius: 16px; padding: 12px; text-align: left; }
         .stat-label { font-size: 11px; font-weight: 600; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.4px; }
-        .stat-val { font-size: 20px; font-weight: 700; color: var(--text-main); margin-top: 3px; }
+        .stat-val { font-size: 19px; font-weight: 700; color: var(--text-main); margin-top: 3px; }
         .stat-sub { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
 
-        .stat-watt .stat-val { color: var(--accent-primary); }
-        .stat-cost .stat-val { color: var(--accent-green); }
+        .stat-watt .stat-val { color: var(--accent-primary); font-family: monospace; font-size: 18px; }
+        .stat-cost .stat-val { color: var(--accent-green); font-family: monospace; font-size: 17px; }
+        .stat-volt .stat-val { color: var(--accent-amber); font-family: monospace; }
+        .stat-amp .stat-val { color: var(--accent-cyan); font-family: monospace; }
         .stat-time .stat-val { font-family: monospace; }
 
         .bar-wrap { margin-top: 6px; width: 100%; height: 5px; background: #e2e8f0; border-radius: 3px; overflow: hidden; }
@@ -230,7 +241,7 @@ HTML = """
     </style>
 </head>
 <body>
-    <!-- MODAL 1: GERTÄT MANUELL AUSWÄHLEN / TRAINIEREN -->
+    <!-- MODAL 1: GERTÄT MANUELL AUSWÄHLEN -->
     <div id="deviceModal" class="modal-overlay">
         <div class="modal-box">
             <h3 style="margin-bottom: 6px;">Gerät festlegen</h3>
@@ -274,7 +285,7 @@ HTML = """
     </div>
 
     <div class="container">
-        <!-- BESETZT-KARTE (NUR WENN NUTZER 2 DIE SEITE ÖFFNET) -->
+        <!-- BESETZT-KARTE -->
         <div class="card busy-card" id="busyCard">
             <div style="font-size: 48px; margin-bottom: 10px;">⏳🔒</div>
             <div class="title" style="margin-bottom: 6px;">Steckdose aktuell belegt</div>
@@ -282,7 +293,7 @@ HTML = """
                 Ein anderer Nutzer verwendet die Steckdose gerade aktiv.
             </p>
             <div style="background: #f1f5f9; padding: 12px; border-radius: 14px; margin-bottom: 16px; text-align: left; font-size: 13px;">
-                Aktuelle Leistung: <b id="busyWatt">0.0 W</b><br>
+                Aktuelle Leistung: <b id="busyWatt">0.000 W</b><br>
                 Laufzeit: <b id="busyTimer">00:00:00</b>
             </div>
             <button class="btn-start" id="btnRequestSlot" style="background: var(--accent-primary);" onclick="requestSlot()">🔔 Nutzer anfragen (Bescheid geben)</button>
@@ -291,7 +302,7 @@ HTML = """
             </div>
         </div>
 
-        <!-- HAUPTKARTE (FÜR DEN AKTIVEN NUTZER) -->
+        <!-- HAUPTKARTE -->
         <div class="card" id="mainCard">
             <div class="header">
                 <span class="title">⚡ Smart Power Hub</span>
@@ -319,10 +330,25 @@ HTML = """
                 </div>
             </div>
 
+            <!-- NETZDATEN: VOLT & AMPERE -->
+            <div class="grid-2">
+                <div class="stat-card stat-volt">
+                    <div class="stat-label">Netzspannung (U)</div>
+                    <div class="stat-val"><span id="volt">230.0</span> <span style="font-size:12px; font-weight:500;">V</span></div>
+                    <div class="stat-sub">Wechselspannung</div>
+                </div>
+                <div class="stat-card stat-amp">
+                    <div class="stat-label">Stromstärke (I)</div>
+                    <div class="stat-val"><span id="amp">0.000</span> <span style="font-size:12px; font-weight:500;">A</span></div>
+                    <div class="stat-sub"><span id="milliAmp">0</span> mA</div>
+                </div>
+            </div>
+
+            <!-- LEISTUNG & LAUFZEIT -->
             <div class="grid-2">
                 <div class="stat-card stat-watt">
-                    <div class="stat-label">Leistung</div>
-                    <div class="stat-val"><span id="watt">0.0</span> <span style="font-size:13px; font-weight:500;">W</span></div>
+                    <div class="stat-label">Wirkleistung (P)</div>
+                    <div class="stat-val"><span id="watt">0.000</span> <span style="font-size:12px; font-weight:500;">W</span></div>
                     <div class="stat-sub" id="wattSub">Kein Strom</div>
                 </div>
                 <div class="stat-card stat-time">
@@ -332,15 +358,18 @@ HTML = """
                 </div>
             </div>
 
+            <!-- ENERGIE (WH / MWH) & PRÄZISE KOSTEN (€) -->
             <div class="grid-2">
                 <div class="stat-card">
-                    <div class="stat-label">Verbrauch (Wh)</div>
-                    <div class="stat-val" style="color:var(--accent-primary);"><span id="wh">0.0</span></div>
+                    <div class="stat-label">Verbrauch</div>
+                    <div class="stat-val" style="color:var(--accent-primary); font-family:monospace; font-size:17px;"><span id="wh">0.0000</span> <span style="font-size:11px;">Wh</span></div>
+                    <div class="stat-sub"><span id="mwh">0.0</span> mWh</div>
                     <div class="bar-wrap"><div class="bar-fill bar-blue" id="whBar"></div></div>
                 </div>
                 <div class="stat-card stat-cost">
                     <div class="stat-label">Kosten (€)</div>
-                    <div class="stat-val"><span id="cost">0,00</span> €</div>
+                    <div class="stat-val"><span id="cost">0.00000</span> €</div>
+                    <div class="stat-sub"><span id="microCost">0.00</span> Cent</div>
                     <div class="bar-wrap"><div class="bar-fill bar-green" id="costBar"></div></div>
                 </div>
             </div>
@@ -363,9 +392,9 @@ HTML = """
             <div class="receipt-row"><span>Gerät:</span> <b id="rDevice">-</b></div>
             <div class="receipt-row"><span>Betriebsart:</span> <b id="rMode">-</b></div>
             <div class="receipt-row"><span>Gesamte Zeit:</span> <b id="rTime">00:00:00</b></div>
-            <div class="receipt-row"><span>Verbrauch:</span> <b id="rWh">0.00 Wh</b></div>
-            <div class="receipt-row"><span>Verbrauch (kWh):</span> <b id="rKwh">0.0000 kWh</b></div>
-            <div class="receipt-row receipt-total"><span>Gesamtbetrag:</span> <span id="rCost" style="color: var(--accent-green);">0,00 €</span></div>
+            <div class="receipt-row"><span>Verbrauch (Wh):</span> <b id="rWh">0.0000 Wh</b></div>
+            <div class="receipt-row"><span>Verbrauch (kWh):</span> <b id="rKwh">0.000000 kWh</b></div>
+            <div class="receipt-row receipt-total"><span>Gesamtbetrag:</span> <span id="rCost" style="color: var(--accent-green);">0.00000 €</span></div>
 
             <button class="btn-start" style="margin-top:20px;" onclick="window.location.reload()">🔄 Neue Sitzung</button>
         </div>
@@ -378,7 +407,7 @@ HTML = """
 
         let hadPowerPhase = false;
         let isBatteryDevice = false;
-        let unplugCounter = 0;
+        let zeroPowerStreak = 0;
         let isUnplugged = false;
         let currentProfileKey = "lamp";
 
@@ -413,7 +442,7 @@ HTML = """
         function startSession() {
             if (audioCtx.state === 'suspended') { audioCtx.resume(); }
             isUnplugged = false;
-            unplugCounter = 0;
+            zeroPowerStreak = 0;
             sendAction('/start');
         }
 
@@ -473,9 +502,9 @@ HTML = """
                 document.getElementById('rDevice').innerText = document.getElementById('detectedName').innerText;
                 document.getElementById('rMode').innerText = isBatteryDevice ? "Akku-Ladeüberwachung" : "Dauerbetrieb";
                 document.getElementById('rTime').innerText = report.time_formatted;
-                document.getElementById('rWh').innerText = report.wh.toFixed(2) + " Wh";
-                document.getElementById('rKwh').innerText = report.kwh.toFixed(4) + " kWh";
-                document.getElementById('rCost').innerText = report.cost.toFixed(3).replace('.', ',') + " €";
+                document.getElementById('rWh').innerText = report.wh.toFixed(4) + " Wh";
+                document.getElementById('rKwh').innerText = report.kwh.toFixed(6) + " kWh";
+                document.getElementById('rCost').innerText = report.cost.toFixed(5) + " €";
                 
                 document.getElementById('mainCard').style.display = 'none';
                 document.getElementById('busyCard').style.display = 'none';
@@ -491,28 +520,25 @@ HTML = """
                 let res = await fetch('/status', { cache: 'no-store' });
                 let data = await res.json();
                 
-                // 1. MULTI-USER STATUS
                 if (data.is_busy_for_other) {
                     document.getElementById('mainCard').style.display = 'none';
                     document.getElementById('busyCard').style.display = 'block';
-                    document.getElementById('busyWatt').innerText = data.global_watt.toFixed(1) + " W";
+                    document.getElementById('busyWatt').innerText = data.global_watt.toFixed(3) + " W";
                     let sec = data.elapsed_seconds;
                     let h = Math.floor(sec / 3600).toString().padStart(2, '0');
                     let m = Math.floor((sec % 3600) / 60).toString().padStart(2, '0');
                     let s = Math.floor(sec % 60).toString().padStart(2, '0');
                     document.getElementById('busyTimer').innerText = `${h}:${m}:${s}`;
-                    return; // Beenden für den wartenden Nutzer
+                    return;
                 } else {
                     document.getElementById('busyCard').style.display = 'none';
                     document.getElementById('mainCard').style.display = 'block';
                 }
 
-                // 2. GELERNTES GERÄTEPROFIL VOM SERVER ÜBERNEHMEN
                 if (data.current_profile && currentProfileKey !== data.current_profile_key) {
                     applyProfile(data.current_profile_key, data.current_profile);
                 }
 
-                // 3. FREIGABE-ANFRAGE NUR BEIM AKTIVEN NUTZER ANZEIGEN
                 if (data.transfer_requested) {
                     document.getElementById('transferModal').style.display = 'flex';
                 } else {
@@ -520,9 +546,19 @@ HTML = """
                 }
 
                 let currentW = data.watt;
-                document.getElementById('watt').innerText = currentW.toFixed(1);
-                document.getElementById('wh').innerText = data.wh.toFixed(2);
-                document.getElementById('cost').innerText = data.cost.toFixed(3).replace('.', ',');
+                let currentA = data.current_ampere || 0.0;
+                let currentV = data.voltage || 230.0;
+
+                // Präzisions-Werte
+                document.getElementById('volt').innerText = currentV.toFixed(1);
+                document.getElementById('amp').innerText = currentA.toFixed(3);
+                document.getElementById('milliAmp').innerText = (currentA * 1000.0).toFixed(0);
+
+                document.getElementById('watt').innerText = currentW.toFixed(3);
+                document.getElementById('wh').innerText = data.wh.toFixed(4);
+                document.getElementById('mwh').innerText = (data.wh * 1000.0).toFixed(1);
+                document.getElementById('cost').innerText = data.cost.toFixed(5);
+                document.getElementById('microCost').innerText = (data.cost * 100.0).toFixed(3);
                 
                 let sec = data.elapsed_seconds;
                 let h = Math.floor(sec / 3600).toString().padStart(2, '0');
@@ -535,18 +571,18 @@ HTML = """
                 let startBtn = document.getElementById('mainStartBtn');
                 
                 if (data.active) {
-                    if (currentW > 2.0) {
+                    if (currentW > 1.5 || currentA > 0.02) {
                         hadPowerPhase = true;
                     }
 
-                    // --- 10-SEKUNDEN UNPLUG FILTER (NUR WENN DIESE SESSION AKTIV IST) ---
-                    if (hadPowerPhase && currentW < 0.2) {
-                        unplugCounter++;
-                        document.getElementById('wattSub').innerText = `Kabel gezogen? (${unplugCounter}/10s)...`;
+                    // --- EINDEUTIGE UNPLUG-ERKENNUNG (15s Null-Last) ---
+                    if (hadPowerPhase && currentW < 0.1 && currentA < 0.01) {
+                        zeroPowerStreak++;
+                        document.getElementById('wattSub').innerText = `Keine Last gemessen (${zeroPowerStreak}/15s)...`;
                         
-                        if (unplugCounter >= 10) {
+                        if (zeroPowerStreak >= 15) {
                             isUnplugged = true;
-                            unplugCounter = 0;
+                            zeroPowerStreak = 0;
                             await sendAction('/stop');
                             badge.className = "status-pill status-unplug";
                             text.innerText = "🔌 Kabel ausgesteckt – Pausiert";
@@ -555,15 +591,15 @@ HTML = """
                             return;
                         }
                     } else {
-                        unplugCounter = 0;
-                        document.getElementById('wattSub').innerText = currentW > 0.5 ? "Fließt stabil" : "Keine Last";
+                        zeroPowerStreak = 0;
+                        document.getElementById('wattSub').innerText = currentW > 0.5 ? "Fließt stabil" : "Bereit / Minimallast";
                     }
 
                     badge.className = "status-pill status-on";
                     text.innerText = "Aktiv / Strom fließt";
                     startBtn.innerText = "▶️ Läuft bereits";
 
-                    // --- 100% VOLLGELADEN BEI AKKUS (NUR WENN AKKU-MODUS) ---
+                    // --- 100% VOLLGELADEN BEI AKKUS ---
                     if (isBatteryDevice && hadPowerPhase && currentW >= 0.3 && currentW < 2.0 && data.wh > 2.0) {
                         await sendAction('/stop');
                         document.getElementById('fullModal').style.display = 'flex';
@@ -571,7 +607,7 @@ HTML = """
                     }
 
                 } else {
-                    unplugCounter = 0;
+                    zeroPowerStreak = 0;
                     if (isUnplugged) {
                         badge.className = "status-pill status-unplug";
                         text.innerText = "🔌 Kabel ausgesteckt – Pausiert";
@@ -584,7 +620,7 @@ HTML = """
                     
                     if (sec === 0) {
                         hadPowerPhase = false;
-                        unplugCounter = 0;
+                        zeroPowerStreak = 0;
                     }
                 }
 
@@ -611,7 +647,9 @@ def get_user_data():
             "total_kwh": 0.0,
             "total_seconds": 0,
             "last_check": None,
-            "current_watt": 0.0
+            "current_watt": 0.0,
+            "current_ampere": 0.0,
+            "current_voltage": 230.0
         }
     return user_sessions[uid], uid
 
@@ -623,7 +661,6 @@ def home():
 @app.route('/start', methods=['POST', 'GET'])
 def start():
     u, uid = get_user_data()
-    # Nur erlauben, wenn kein anderer Nutzer aktiv ist
     if global_state["active_user_id"] and global_state["active_user_id"] != uid:
         return jsonify({"status": "busy"})
         
@@ -641,6 +678,7 @@ def stop():
     u["active"] = False
     u["last_check"] = None
     u["current_watt"] = 0.0
+    u["current_ampere"] = 0.0
     cloud_control(turn_on=False)
     return jsonify({"status": "ok"})
 
@@ -675,7 +713,6 @@ def logout():
     u["active"] = False
     cloud_control(turn_on=False)
 
-    # Wenn der aktive Nutzer beendet, Steckdose sofort freigeben
     if global_state["active_user_id"] == uid:
         global_state["active_user_id"] = None
         global_state["transfer_requested"] = False
@@ -704,7 +741,6 @@ def status():
     u, uid = get_user_data()
     active_uid = global_state.get("active_user_id")
     
-    # Ist die Station von jemand anderem belegt?
     is_busy = False
     global_w = 0.0
     if active_uid and active_uid != uid:
@@ -714,8 +750,10 @@ def status():
 
     if u["active"]:
         now = time.time()
-        w = cloud_get_watt()
+        w, a, v = cloud_get_metrics()
         u["current_watt"] = w
+        u["current_ampere"] = a
+        u["current_voltage"] = v
         
         if u["last_check"]:
             dt = now - u["last_check"]
@@ -726,12 +764,16 @@ def status():
         u["last_check"] = now
     else:
         u["current_watt"] = 0.0
+        u["current_ampere"] = 0.0
+        u["current_voltage"] = 230.0
 
     dev_key = global_state.get("last_device_key", "lamp")
     
     return jsonify({
         "active": u["active"],
         "watt": u["current_watt"],
+        "current_ampere": u["current_ampere"],
+        "voltage": u["current_voltage"],
         "global_watt": global_w,
         "wh": u["total_kwh"] * 1000.0,
         "kwh": u["total_kwh"],
