@@ -25,7 +25,6 @@ app.config.update(
     PERMANENT_SESSION_LIFETIME=14400
 )
 
-# GEHEIMER VOR-ORT TOKEN
 STATION_PHYSICAL_TOKEN = "SEC-STATION-2026-X99Q-ALPHA-77"
 
 # --- SHELLY CLOUD KONFIGURATION ---
@@ -33,7 +32,7 @@ SHELLY_CLOUD_URL = "https://shelly-274-eu.shelly.cloud"
 AUTH_KEY = "NDcwMzFkdWlkF9839F81801CF17665B14F2EED9BDC41514AEAB2C6C041201D306ABBC40BDE2A0AD2F80ACE98C596"
 DEVICE_ID = "08927249a904"
 
-STROMPREIS_PER_KWH = 0.35  # 0,35 € pro kWh
+STROMPREIS_PER_KWH = 0.35
 
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
@@ -89,11 +88,25 @@ global_state = {
 
 user_sessions = {}
 
+# Sichert den Zähler-Thread gegen den Server-Tod ab
+WORKER_STARTED = False
+WORKER_LOCK = threading.Lock()
+
+def ensure_worker():
+    global WORKER_STARTED
+    if not WORKER_STARTED:
+        with WORKER_LOCK:
+            if not WORKER_STARTED:
+                threading.Thread(target=background_meter_worker, daemon=True).start()
+                WORKER_STARTED = True
+
 @app.after_request
 def add_security_headers(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, private, max-age=0"
     response.headers["Pragma"] = "no-cache"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
     return response
 
 def check_authenticated():
@@ -169,7 +182,7 @@ def ai_learn_from_feedback(correct_key, samples):
     save_ai_models(learned_models)
 
 # ------------------------------------------------------------------------------
-# HERZSTÜCK: Der autarke Server-Hintergrund-Prozess (100% Sicher vor Resets)
+# ZENTRALER HERZSCHLAG FÜR DEN ZÄHLER (Immun gegen Server-Neustarts)
 # ------------------------------------------------------------------------------
 def background_meter_worker():
     last_loop = time.time()
@@ -177,6 +190,8 @@ def background_meter_worker():
         now = time.time()
         dt = now - last_loop
         last_loop = now
+        
+        # Abfangen von Lags, damit der Zähler nicht springt
         if dt < 0 or dt > 5:
             dt = 1.0
 
@@ -185,16 +200,15 @@ def background_meter_worker():
             if active_uid and active_uid in user_sessions:
                 u = user_sessions[active_uid]
                 
-                # NUR zählen, wenn die Sitzung vom Nutzer aktiv ist
+                # Zähler läuft unaufhörlich weiter, sofern Sitzung aktiv!
                 if u.get("active", False):
-                    # Zeit sofort und unaufhaltsam erhöhen
+                    # Zeit aufaddieren
                     u["total_seconds"] += dt
                     
                     watt = u.get("current_watt", 0.0)
                     amp = u.get("current_ampere", 0.0)
                     volt = u.get("current_voltage", 230.0)
 
-                    # Cloud abfragen
                     try:
                         payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID}
                         res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=2.0).json()
@@ -209,7 +223,7 @@ def background_meter_worker():
                                 amp = float(status["meters"][0].get("current", 0.0)) if "current" in status["meters"][0] else (watt / 230.0 if watt > 0 else 0.0)
                                 volt = float(status["meters"][0].get("voltage", 230.0)) if "voltage" in status["meters"][0] else 230.0
                     except Exception:
-                        pass # Bei API-Fehlern bleiben die letzten Werte bestehen!
+                        pass # Bei API-Fehlern zählen die alten Werte nahtlos weiter
 
                     u["current_watt"] = watt
                     u["current_ampere"] = amp
@@ -218,10 +232,10 @@ def background_meter_worker():
                     global_state["last_amp"] = amp
                     global_state["last_volt"] = volt
 
-                    # Laufende Energie (Wh & Kosten) sicher aufaddieren
+                    # Energie aufaddieren
                     u["total_kwh"] += (watt * dt) / 3600000.0
 
-                    # 1. AI-ANALYSE IN DEN ERSTEN 30 SEKUNDEN (Nur Daten sammeln, Zähler laufen weiter!)
+                    # 1. AI-ANALYSE (Sammelt Daten 30s lang, ohne den Zähler zu berühren)
                     if u["total_seconds"] < 30.0 and not u["manually_selected"]:
                         if watt > 0.5:
                             u["analysis_samples"].append(watt)
@@ -229,7 +243,7 @@ def background_meter_worker():
                         u["device_key"] = ai_classify_samples(u["analysis_samples"])
                         u["analysis_completed"] = True
 
-                    # 2. STABILE UNPLUG-ERKENNUNG (Kabel gezogen) - Jetzt mit 15-Sekunden Puffer
+                    # 2. AUSSTECK-ERKENNUNG (Zieht erst nach echten 15 Sekunden Leerlauf)
                     if watt > 1.0:
                         u["had_power_draw"] = True
                         u["zero_power_counter"] = 0.0
@@ -241,27 +255,27 @@ def background_meter_worker():
                             u["unplugged_detected"] = True
                             u["had_power_draw"] = False
                             async_cloud_control(turn_on=False)
-                    else:
+                    elif watt >= 0.3:
                         u["zero_power_counter"] = 0.0
 
-                    # 3. AKKU 100% ERKENNUNG (Sättigung) - Auch hier 30s Puffer
+                    # 3. AKKU 100% ERKENNUNG
                     prof = DEVICE_PROFILES.get(u["device_key"], {})
                     if prof.get("is_battery", False) and u["total_seconds"] > 60.0:
-                        if u["had_power_draw"] and 0.2 <= watt < 1.8 and (u["total_kwh"] * 1000.0) > 2.0:
+                        if watt > 6.0:
+                            u["had_charging_phase"] = True
+                        
+                        if u["had_charging_phase"] and 0.2 <= watt < 1.8 and (u["total_kwh"] * 1000.0) > 2.0:
                             u["battery_full_counter"] += dt
                             if u["battery_full_counter"] >= 30.0:
                                 u["battery_full_triggered"] = True
                                 u["active"] = False
                                 async_cloud_control(turn_on=False)
-                        else:
+                        elif watt >= 1.8:
                             u["battery_full_counter"] = 0.0
         except Exception:
             pass
         
         time.sleep(1.0)
-
-# Startet den Server-Zeitgeber
-threading.Thread(target=background_meter_worker, daemon=True).start()
 # ------------------------------------------------------------------------------
 
 def generate_pdf_invoice(report_data):
@@ -552,7 +566,7 @@ HTML_PAGE = """
     <div id="deviceModal" class="modal-overlay">
         <div class="modal-box">
             <h3 style="margin-bottom: 6px;">Gerät manuell festlegen</h3>
-            <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">Wähle dein Gerät aus. Die Anzeige passt sich automatisch an.</p>
+            <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">Wähle dein Gerät. Die AI lernt deine Auswahl für zukünftige Messungen.</p>
             <button class="device-option-btn" onclick="saveDeviceProfile('lamp')">💡 Lampe / Dauerbetrieb</button>
             <button class="device-option-btn" onclick="saveDeviceProfile('phone')">📱 Smartphone / Tablet (Akku ~20 Wh)</button>
             <button class="device-option-btn" onclick="saveDeviceProfile('laptop')">💻 Laptop / Monitor (Akku ~65 Wh)</button>
@@ -563,6 +577,7 @@ HTML_PAGE = """
         </div>
     </div>
 
+    <!-- ANFRAGE MODAL BEI NUTZER 1 -->
     <div id="transferModal" class="modal-overlay">
         <div class="modal-box" style="border: 2px solid var(--accent-amber);">
             <div style="font-size: 40px; margin-bottom: 6px;">👋🔔</div>
@@ -575,6 +590,7 @@ HTML_PAGE = """
         </div>
     </div>
 
+    <!-- 80% AKKU POP-UP -->
     <div id="eightyModal" class="modal-overlay">
         <div class="modal-box" style="border: 2px solid var(--accent-primary);">
             <div style="font-size: 48px; margin-bottom: 8px;">🔋⚡</div>
@@ -587,6 +603,7 @@ HTML_PAGE = """
         </div>
     </div>
 
+    <!-- 100% AKKU VOLL POP-UP -->
     <div id="fullModal" class="modal-overlay">
         <div class="modal-box" style="border: 2px solid var(--accent-green);">
             <div style="font-size: 48px; margin-bottom: 8px;">🔋✨</div>
@@ -597,6 +614,7 @@ HTML_PAGE = """
     </div>
 
     <div class="container">
+        <!-- BESETZT-KARTE -->
         <div class="card busy-card" id="busyCard">
             <div style="font-size: 48px; margin-bottom: 10px;">⏳🔒</div>
             <div class="title" style="margin-bottom: 6px;">Steckdose aktuell belegt</div>
@@ -612,6 +630,7 @@ HTML_PAGE = """
             </div>
         </div>
 
+        <!-- WARTE-KARTE FÜR PAUSIERTEN NUTZER 1 -->
         <div class="card pause-wait-card" id="pauseWaitCard">
             <div style="font-size: 48px; margin-bottom: 10px;">⏸️⏳</div>
             <div class="title" style="margin-bottom: 6px;">Sitzung pausiert</div>
@@ -628,6 +647,7 @@ HTML_PAGE = """
             <button class="btn-finish" onclick="finalizeTermination()">🛑 Jetzt doch endgültig beenden & abrechnen</button>
         </div>
 
+        <!-- HAUPTKARTE -->
         <div class="card" id="mainCard">
             <div class="header">
                 <span class="title">⚡ Smart Power Hub</span>
@@ -642,6 +662,7 @@ HTML_PAGE = """
                 </div>
             </div>
 
+            <!-- GERÄTE ERKENNUNG -->
             <div class="ai-banner">
                 <div class="ai-header">
                     <span class="ai-title" id="aiStatusTitle">AI Erkennung</span>
@@ -656,6 +677,7 @@ HTML_PAGE = """
                 </div>
             </div>
 
+            <!-- AKKU LADESTAND & RESTZEIT -->
             <div class="battery-card" id="batteryCard">
                 <div class="battery-header">
                     <span>🔋 Geschätzter Ladefortschritt</span>
@@ -670,6 +692,7 @@ HTML_PAGE = """
                 </div>
             </div>
 
+            <!-- NETZDATEN -->
             <div class="grid-2">
                 <div class="stat-card stat-volt">
                     <div class="stat-label">Netzspannung (U)</div>
@@ -683,6 +706,7 @@ HTML_PAGE = """
                 </div>
             </div>
 
+            <!-- LEISTUNG & LAUFZEIT -->
             <div class="grid-2">
                 <div class="stat-card stat-watt">
                     <div class="stat-label">Wirkleistung (P)</div>
@@ -696,6 +720,7 @@ HTML_PAGE = """
                 </div>
             </div>
 
+            <!-- ENERGIE & KOSTEN -->
             <div class="grid-2">
                 <div class="stat-card">
                     <div class="stat-label">Verbrauch</div>
@@ -716,6 +741,7 @@ HTML_PAGE = """
             </div>
         </div>
 
+        <!-- QUITTUNG NACH ÜBERGABE -->
         <div class="card receipt-card" id="receiptCard">
             <div class="receipt-header">
                 <div style="font-size: 40px; margin-bottom: 4px;">🧾</div>
@@ -738,6 +764,7 @@ HTML_PAGE = """
                 <div id="emailFeedback" style="display:none; font-size:12px; font-weight:600; margin-top:8px;"></div>
             </div>
 
+            <!-- WAHLMÖGLICHKEIT BEIM NUTZERWECHSEL -->
             <div id="transferChoiceBox" style="margin-top: 16px; display: flex; flex-direction: column; gap: 8px;">
                 <button class="btn-stop" style="background: #e0f2fe; color: #0369a1; border-color: #bae6fd;" onclick="setWaitingMode()">⏳ Sitzung pausieren (Warten bis anderer Nutzer fertig ist)</button>
                 <button class="btn-finish" style="font-size: 14px;" onclick="finalizeTermination()">🛑 Endgültig beenden & Finales PDF</button>
@@ -987,6 +1014,7 @@ HTML_PAGE = """
                 document.getElementById('cost').innerText = data.cost.toFixed(5);
                 document.getElementById('microCost').innerText = (data.cost * 100.0).toFixed(3);
 
+                // AI Lern-Feedback
                 if (data.active && sec < 30 && !data.manually_selected) {
                     let remain = 30 - sec;
                     document.getElementById('aiStatusTitle').innerText = "AI lernt Last...";
@@ -997,6 +1025,7 @@ HTML_PAGE = """
                     document.getElementById('aiStatusTitle').innerText = "Vom Nutzer gelernt";
                 }
 
+                // Batterie-Anzeige & Pop-ups
                 if (data.current_profile && data.current_profile.is_battery) {
                     let cap = data.current_profile.capacity_wh || 20.0;
                     let pct = data.battery_pct;
@@ -1014,6 +1043,7 @@ HTML_PAGE = """
                 let statusText = document.getElementById('statusText');
                 let startBtn = document.getElementById('mainStartBtn');
 
+                // UNPLUG ERKENNUNG
                 if (data.unplugged_detected) {
                     badge.className = "status-pill status-unplug";
                     statusText.innerText = "🔌 Kabel ausgesteckt – Strom gestoppt";
@@ -1114,6 +1144,8 @@ def scan_qr_entry(token):
 @app.route('/start', methods=['POST', 'GET'])
 @require_physical_auth
 def start():
+    ensure_worker() # Stellt sicher, dass der Background-Zähler immer lebt
+    
     u, uid = get_user_data()
     if u.get("terminated", False):
         return jsonify({"status": "forbidden"}), 403
@@ -1145,6 +1177,8 @@ def start():
 @app.route('/stop', methods=['POST', 'GET'])
 @require_physical_auth
 def stop():
+    ensure_worker()
+    
     u, uid = get_user_data()
     if u.get("terminated", False) or global_state.get("active_user_id") != uid:
         return jsonify({"status": "forbidden"}), 403
@@ -1306,6 +1340,8 @@ def send_email_invoice():
 @app.route('/status')
 @require_physical_auth
 def status():
+    ensure_worker() # Stellt sicher, dass der Background-Zähler immer lebt
+    
     u, uid = get_user_data()
     active_uid = global_state.get("active_user_id")
 
