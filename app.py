@@ -44,8 +44,8 @@ AI_MODEL_FILE = "ai_learned_models.json"
 
 DEFAULT_AI_PROFILES = {
     "lamp": {"avg_w": 1.2, "peak_w": 2.0, "variance": 0.1, "count": 1},
-    "phone": {"name": "📱 Smartphone / Tablet", "avg_w": 12.0, "peak_w": 18.0, "variance": 4.5, "count": 1},
-    "laptop": {"name": "💻 Laptop / Monitor", "avg_w": 45.0, "peak_w": 65.0, "variance": 12.0, "count": 1},
+    "phone": {"name": "📱 Smartphone / Tablet", "avg_w": 18.0, "peak_w": 25.0, "variance": 3.5, "count": 1},
+    "laptop": {"name": "💻 Laptop / Monitor", "avg_w": 55.0, "peak_w": 80.0, "variance": 15.0, "count": 1},
     "ebike_std": {"name": "🚲 E-Bike Akku Standard", "avg_w": 140.0, "peak_w": 170.0, "variance": 8.0, "count": 1},
     "ebike_fast": {"name": "⚡ E-Bike Schnelllader / PC", "avg_w": 350.0, "peak_w": 420.0, "variance": 15.0, "count": 1},
     "appliance": {"name": "🍳 Großgerät / Dauerbetrieb", "avg_w": 850.0, "peak_w": 1200.0, "variance": 50.0, "count": 1}
@@ -198,14 +198,12 @@ def estimate_initial_soc(profile_key, avg_w):
     if profile_key == "phone":
         if avg_w >= 16.0: return 10.0
         elif avg_w >= 10.0: return 50.0
-        elif avg_w >= 5.0: return 75.0
-        elif avg_w >= 1.5: return 90.0
-        else: return 100.0
+        elif avg_w >= 2.0: return 82.0 # Direkt ab 2W als bereits >=80% voll erkannt!
+        else: return 95.0
     elif profile_key == "laptop":
         if avg_w >= 45.0: return 15.0
         elif avg_w >= 30.0: return 60.0
-        elif avg_w >= 15.0: return 85.0
-        else: return 95.0
+        else: return 85.0
     return 0.0
 
 def background_meter_worker():
@@ -257,10 +255,28 @@ def background_meter_worker():
 
                 if u.get("active", False):
                     u["total_seconds"] += dt
-                    u["total_kwh"] += (watt * dt) / 3600000.0
+                    if watt > 0.05:
+                        u["total_kwh"] += (watt * dt) / 3600000.0
 
                     threshold = get_analysis_threshold()
 
+                    # 1. TURBO-ERKENNUNG IN DEN ERSTEN 10 SEKUNDEN FÜR BEREITS VOLLE AKKUS
+                    if u["total_seconds"] <= 10.0 and not u.get("turbo_checked", False):
+                        if watt > 0.3:
+                            u["analysis_samples"].append(watt)
+                        if u["total_seconds"] >= 10.0:
+                            u["turbo_checked"] = True
+                            avg_w = sum(u["analysis_samples"]) / len(u["analysis_samples"]) if u["analysis_samples"] else watt
+                            if 0.5 <= avg_w < 5.0: # Bereits im CV-Bereich angesteckt
+                                u["device_key"] = "phone"
+                                u["manually_selected"] = True
+                                u["analysis_completed"] = True
+                                u["estimated_soc_0"] = 82.0
+                                u["eighty_percent_triggered"] = True
+                                u["active"] = False
+                                async_cloud_control(turn_on=False)
+
+                    # Normale KI Analyse
                     if u["total_seconds"] < threshold and not u["manually_selected"]:
                         if watt > 0.5:
                             u["analysis_samples"].append(watt)
@@ -285,9 +301,8 @@ def background_meter_worker():
                     elif watt > 0.1:
                         u["zero_power_counter"] = 0.0
 
-                    # Automatisches Abschalten bei 80% / 100% für Akkus
                     prof = DEVICE_PROFILES.get(u["device_key"], {})
-                    if prof.get("is_battery", False) and u["total_seconds"] > threshold:
+                    if prof.get("is_battery", False) and u["total_seconds"] > 10.0:
                         wh = u["total_kwh"] * 1000.0
                         cap = prof.get("capacity_wh", 20.0)
                         base_soc = u.get("estimated_soc_0", 0.0)
@@ -295,13 +310,15 @@ def background_meter_worker():
 
                         if current_pct >= 80.0 and not u.get("eighty_percent_triggered", False):
                             u["eighty_percent_triggered"] = True
+                            u["active"] = False
+                            async_cloud_control(turn_on=False)
 
                         if watt > 6.0:
                             u["had_charging_phase"] = True
                         
                         if u["had_charging_phase"] and 0.2 <= watt < 1.8 and (u["total_kwh"] * 1000.0) > 2.0:
                             u["battery_full_counter"] += dt
-                            if u["battery_full_counter"] >= 30.0:
+                            if u["battery_full_counter"] >= 20.0:
                                 u["battery_full_triggered"] = True
                                 u["active"] = False
                                 async_cloud_control(turn_on=False)
@@ -364,32 +381,6 @@ def generate_pdf_invoice(report_data):
     HTML(string=html_invoice).write_pdf(pdf_buffer)
     pdf_buffer.seek(0)
     return pdf_buffer
-
-HTML_ACCESS_DENIED = """
-<!DOCTYPE html>
-<html lang="de">
-<head>
-    <meta charset="utf-8">
-    <title>Zugriff Verweigert</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: white; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; text-align: center; padding: 20px; }
-        .box { background: #1e293b; padding: 30px; border-radius: 20px; border: 1px solid #334155; max-width: 360px; }
-        .icon { font-size: 50px; margin-bottom: 15px; }
-        h2 { font-size: 20px; margin-bottom: 10px; color: #f87171; }
-        p { font-size: 14px; color: #94a3b8; line-height: 1.5; }
-    </style>
-</head>
-<body>
-    <div class="box">
-        <div class="icon">🔒🚫</div>
-        <h2>Sicherheits-Sperre</h2>
-        <p>Ein direkter Web-Aufruf über das Internet ist nicht gestattet.</p>
-        <p style="margin-top: 12px; color: #e2e8f0; font-weight: 600;">Bitte scanne den QR-Code auf dem Laptop-Bildschirm oder an der Ladestation.</p>
-    </div>
-</body>
-</html>
-"""
 
 HTML_PAGE = """
 <!DOCTYPE html>
@@ -486,7 +477,7 @@ HTML_PAGE = """
         .status-dot { width: 8px; height: 8px; border-radius: 50%; }
         .status-on .status-dot { background: var(--accent-green); box-shadow: 0 0 8px rgba(16,185,129,0.6); }
         .status-off .status-dot { background: #94a3b8; }
-        .status-unplug .status-dot { background: var(--accent-amber); }
+        .status-unplug .status-dot { background: #94a3b8; }
 
         .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
         .stat-card {
@@ -624,16 +615,16 @@ HTML_PAGE = """
         </div>
     </div>
 
-    <!-- 80% AKKU POP-UP -->
+    <!-- 80% AKKU POP-UP (GEWÜNSCHTER ENGLISCHER TEXT) -->
     <div id="eightyModal" class="modal-overlay">
         <div class="modal-box" style="border: 2px solid var(--accent-primary);">
             <div style="font-size: 48px; margin-bottom: 8px;">🔋⚡</div>
-            <h2 style="font-size: 19px; color: var(--accent-primary); margin-bottom: 6px;">Akku zu 80% geladen!</h2>
+            <h2 style="font-size: 19px; color: var(--accent-primary); margin-bottom: 6px;">Device already 80% charged</h2>
             <p style="font-size: 13px; color: var(--text-main); margin-bottom: 12px;">
-                Der optimale Akkuzustand ist erreicht und der Stromfluss wurde automatisch gestoppt, um deinen Akku zu schonen!
+                Please unplug to protect battery life. (Charging stopped automatically)
             </p>
-            <button class="btn-start" style="background: var(--accent-green); margin-bottom: 8px;" onclick="logout(true)">✅ Quittung & Rechnung anzeigen</button>
-            <button class="btn-stop" onclick="dismissEightyModal()">Weiterladen bis 100%</button>
+            <button class="btn-start" style="background: var(--accent-green); margin-bottom: 8px;" onclick="logout(true)">✅ Show Receipt & Summary</button>
+            <button class="btn-stop" onclick="dismissEightyModal()">Continue charging to 100%</button>
         </div>
     </div>
 
@@ -642,7 +633,7 @@ HTML_PAGE = """
         <div class="modal-box" style="border: 2px solid var(--accent-green);">
             <div style="font-size: 48px; margin-bottom: 8px;">🔋✨</div>
             <h2 style="font-size: 20px; color: var(--accent-green); margin-bottom: 6px;">Akku 100% Vollgeladen!</h2>
-            <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 12px;">Der Akku ist voll. Der Stromfluss wurde automatisch gestoppt.</p>
+            <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 12px;">Der Stromfluss wurde automatisch gestoppt. Kein weiterer Strombedarf.</p>
             <button class="btn-start" style="background: var(--accent-green);" onclick="logout(true)">🧾 Quittung & Rechnung anzeigen</button>
         </div>
     </div>
@@ -798,9 +789,9 @@ HTML_PAGE = """
                 <div id="emailFeedback" style="display:none; font-size:12px; font-weight:600; margin-top:8px;"></div>
             </div>
 
-            <!-- SCHLIESSEN & NEU STARTEN BUTTON -->
+            <!-- GEWÜNSCHTER BUTTON -->
             <div style="margin-top: 16px; display: flex; flex-direction: column; gap: 8px;">
-                <button class="btn-start" style="background: var(--accent-green); font-size: 15px;" onclick="startNewSessionCompletely()">❌ Schließen & Neue Sitzung starten</button>
+                <button class="btn-start" style="background: var(--text-main); font-size: 14px; padding: 12px;" onclick="startNewSessionCompletely()">Please restart by scanning the QR code again</button>
                 <div id="transferChoiceBox" style="display: flex; flex-direction: column; gap: 8px;">
                     <button class="btn-stop" style="background: #e0f2fe; color: #0369a1; border-color: #bae6fd;" onclick="setWaitingMode()">⏳ Sitzung pausieren (Warten bis anderer Nutzer fertig ist)</button>
                     <button class="btn-finish" style="font-size: 14px;" onclick="finalizeTermination()">🛑 Endgültig beenden</button>
@@ -940,7 +931,7 @@ HTML_PAGE = """
         async function startNewSessionCompletely() {
             await sendAction('/new_session');
             localStorage.removeItem('hub_user_id');
-            window.location.reload();
+            window.location.href = '/';
         }
 
         function setWaitingMode() {
