@@ -81,7 +81,6 @@ def get_total_learned_count():
     return sum(m.get("count", 1) for m in models.values())
 
 def get_analysis_threshold():
-    # Exakt 30 Sekunden Stabile Erkennungsphase wie gewünscht
     return 30.0
 
 learned_models = load_ai_models()
@@ -164,7 +163,8 @@ def ai_classify_samples(samples):
     avg_w, peak_w, var_w = extract_features(samples)
 
     # Intelligente Vorab-Regeln für Handys / Akkus vs Dauerbetrieb
-    if 1.5 <= avg_w < 35.0 or (2.0 <= peak_w < 40.0 and avg_w < 30.0):
+    # HIER ANGEPASST: Grenze auf 0.5W gesenkt, da Handys bei 80%+ extrem wenig Strom ziehen
+    if 0.5 <= avg_w < 35.0 or (1.0 <= peak_w < 40.0 and avg_w < 30.0):
         return "phone"
     elif 35.0 <= avg_w < 90.0:
         return "laptop"
@@ -274,7 +274,6 @@ def background_meter_worker():
 
                     threshold = get_analysis_threshold()
 
-                    # Exakte 30 Sekunden Analysephase
                     if u["total_seconds"] < threshold and not u["manually_selected"]:
                         if watt > 0.2:
                             u["analysis_samples"].append(watt)
@@ -299,7 +298,6 @@ def background_meter_worker():
                     elif watt > 0.05:
                         u["zero_power_counter"] = 0.0
 
-                    # 80% & 100% Erkennung
                     prof = DEVICE_PROFILES.get(u["device_key"], {})
                     if prof.get("is_battery", False) and u["total_seconds"] > threshold:
                         wh = u["total_kwh"] * 1000.0
@@ -814,9 +812,11 @@ HTML_PAGE = """
                 <div id="emailFeedback" style="display:none; font-size:12px; font-weight:600; margin-top:8px;"></div>
             </div>
 
-            <!-- QR-CODE SCHLIESSEN BUTTON -->
+            <!-- ABSCHLUSS / SCHLIESSEN BUTTONS -->
             <div style="margin-top: 16px; display: flex; flex-direction: column; gap: 8px;">
+                <button class="btn-stop" style="background: #fef2f2; color: var(--accent-red); border-color: #fecaca; font-size: 15px; padding: 14px; font-weight: bold;" onclick="closeApp()">❌ Fenster komplett schließen</button>
                 <button class="btn-start" style="background: var(--text-main); font-size: 14px; padding: 12px;" onclick="startNewSessionCompletely()">Please restart by scanning the QR code again</button>
+                
                 <div id="transferChoiceBox" style="display: flex; flex-direction: column; gap: 8px;">
                     <button class="btn-stop" style="background: #e0f2fe; color: #0369a1; border-color: #bae6fd;" onclick="setWaitingMode()">⏳ Sitzung pausieren (Warten bis anderer Nutzer fertig ist)</button>
                     <button class="btn-finish" style="font-size: 14px;" onclick="finalizeTermination()">🛑 Endgültig beenden</button>
@@ -838,6 +838,22 @@ HTML_PAGE = """
         if (!userId) {
             userId = 'usr_' + Math.random().toString(36).substr(2, 9) + Date.now();
             localStorage.setItem('hub_user_id', userId);
+        }
+
+        // --- APP SCHLIESSEN FUNKTION ---
+        function closeApp() {
+            try {
+                window.close();
+            } catch (e) {}
+            // Fallback für Browser (wie Safari), die window.close() blockieren
+            document.body.innerHTML = `
+                <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; text-align:center; color:#64748b; font-family:sans-serif; padding:20px;">
+                    <div style="font-size: 50px; margin-bottom:20px;">👋</div>
+                    <h2 style="color:#0f172a; margin-bottom: 10px;">Sitzung beendet</h2>
+                    <p style="max-width:300px;">Du kannst diesen Tab oder deinen Browser nun sicher schließen.</p>
+                </div>
+            `;
+            document.body.style.background = '#f8fafc';
         }
 
         function updateTimerUI(sec) {
