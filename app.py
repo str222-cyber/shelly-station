@@ -81,7 +81,6 @@ def get_total_learned_count():
     return sum(m.get("count", 1) for m in models.values())
 
 def get_analysis_threshold():
-    # Stabile Erkennungsphase nach exakt 20 Sekunden
     return 20.0
 
 learned_models = load_ai_models()
@@ -195,10 +194,10 @@ def ai_learn_from_feedback(correct_key, samples):
 
 def estimate_initial_soc(profile_key, avg_w):
     if profile_key == "phone":
-        if avg_w >= 15.0: return 10.0  # Leer (CC-Phase)
-        elif avg_w >= 8.0: return 40.0  # Halbvoll
-        elif avg_w >= 3.0: return 65.0  # Ziemlich voll
-        elif avg_w >= 1.0: return 85.0  # Bereits über 80% beim Anstecken!
+        if avg_w >= 15.0: return 10.0
+        elif avg_w >= 8.0: return 40.0
+        elif avg_w >= 3.0: return 65.0
+        elif avg_w >= 1.0: return 85.0
         else: return 95.0
     elif profile_key == "laptop":
         if avg_w >= 40.0: return 15.0
@@ -260,7 +259,6 @@ def background_meter_worker():
 
                     threshold = get_analysis_threshold()
 
-                    # 20-Sekunden Analysephase
                     if u["total_seconds"] < threshold and not u["manually_selected"]:
                         if watt > 0.5:
                             u["analysis_samples"].append(watt)
@@ -285,7 +283,6 @@ def background_meter_worker():
                     elif watt > 0.05:
                         u["zero_power_counter"] = 0.0
 
-                    # 80% & 100% Erkennung und automatischer Stopp
                     prof = DEVICE_PROFILES.get(u["device_key"], {})
                     if prof.get("is_battery", False) and u["total_seconds"] > threshold:
                         wh = u["total_kwh"] * 1000.0
@@ -323,7 +320,7 @@ def generate_pdf_invoice(report_data):
     <style>
     @page {{ size: A4; margin: 20mm 15mm; background-color: #ffffff; }}
     body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: #0f172a; margin: 0; padding: 0; }}
-    .header {{ border-bottom: 2px solid #2563eb; padding-bottom: 15mm; margin-bottom: 25px; }}
+    .header {{ border-bottom: 2px solid #2563eb; padding-bottom: 15px; margin-bottom: 25px; }}
     .brand {{ font-size: 22pt; font-weight: 800; color: #2563eb; }}
     .meta {{ font-size: 10pt; color: #64748b; margin-top: 5px; }}
     table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
@@ -626,7 +623,7 @@ HTML_PAGE = """
         </div>
     </div>
 
-    <!-- 80% AKKU POP-UP (ENGLISCHER WUNSCHTEXT) -->
+    <!-- 80% AKKU POP-UP -->
     <div id="eightyModal" class="modal-overlay">
         <div class="modal-box" style="border: 2px solid var(--accent-primary);">
             <div style="font-size: 48px; margin-bottom: 8px;">🔋⚡</div>
@@ -708,7 +705,7 @@ HTML_PAGE = """
                     <div class="ai-icon" id="devIcon">💡</div>
                     <div>
                         <div class="ai-detected" id="detectedName">Bereit</div>
-                        <div class="ai-mode" id="detectedMode">Automatische AI-Lastanalyse (20s)...</div>
+                        <div class="ai-mode" id="detectedMode">AI Lastanalyse (20s)...</div>
                     </div>
                 </div>
             </div>
@@ -800,7 +797,7 @@ HTML_PAGE = """
                 <div id="emailFeedback" style="display:none; font-size:12px; font-weight:600; margin-top:8px;"></div>
             </div>
 
-            <!-- GEWÜNSCHTER QR-CODE SCHLIESSEN BUTTON -->
+            <!-- SCHLIESSEN & QR-CODE HINWEIS -->
             <div style="margin-top: 16px; display: flex; flex-direction: column; gap: 8px;">
                 <button class="btn-start" style="background: var(--text-main); font-size: 14px; padding: 12px;" onclick="startNewSessionCompletely()">Please restart by scanning the QR code again</button>
                 <div id="transferChoiceBox" style="display: flex; flex-direction: column; gap: 8px;">
@@ -1069,8 +1066,8 @@ HTML_PAGE = """
                 let thresh = data.analysis_threshold;
                 if (data.active && sec < thresh && !data.manually_selected) {
                     let remain = Math.max(0, Math.floor(thresh - sec));
-                    document.getElementById('aiStatusTitle').innerText = `AI Analyse (20s)`;
-                    document.getElementById('detectedName').innerText = `Analysiere Features... (${remain}s)`;
+                    document.getElementById('aiStatusTitle').innerText = `AI Erkennung (20s)`;
+                    document.getElementById('detectedName').innerText = `Analysiere... (${remain}s)`;
                 } else if (data.analysis_completed && !data.manually_selected) {
                     document.getElementById('aiStatusTitle').innerText = `🤖 AI Erkannt`;
                 } else if (data.manually_selected) {
@@ -1222,7 +1219,7 @@ def start():
 def stop():
     ensure_worker()
     u, uid = get_user_data()
-    if u.get("terminated", False) or global_state.get("active_user_id"] != uid:
+    if u.get("terminated", False) or global_state.get("active_user_id") != uid:
         return jsonify({"status": "forbidden"}), 403
 
     u["active"] = False
