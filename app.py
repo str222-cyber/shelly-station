@@ -1,10 +1,16 @@
-from flask import Flask, render_template_string, jsonify, session, request
+from flask import Flask, render_template_string, jsonify, session, request, send_file
 import requests
 import time
 import uuid
+import smtplib
+import io
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.application import MIMEApplication
+from weasyprint import HTML
 
 app = Flask(__name__)
-app.secret_key = "shelly_smart_hub_high_precision_metrics_2026"
+app.secret_key = "shelly_smart_hub_pdf_email_flow_2026"
 
 # --- SHELLY CLOUD KONFIGURATION ---
 SHELLY_CLOUD_URL = "https://shelly-274-eu.shelly.cloud"
@@ -12,6 +18,12 @@ AUTH_KEY = "NDcwMzFkdWlkF9839F81801CF17665B14F2EED9BDC41514AEAB2C6C041201D306ABB
 DEVICE_ID = "08927249a904"
 
 STROMPREIS_PER_KWH = 0.35  # 0,35 € pro kWh
+
+# --- OPTIONALE SMTP-DATEN FÜR E-MAIL-VERSAND ---
+SMTP_SERVER = "smtp.gmail.com"  # z. B. smtp.gmail.com oder dein E-Mail Provider
+SMTP_PORT = 587
+SMTP_USER = "deine-email@gmail.com"      # Hier deine E-Mail eintragen
+SMTP_PASSWORD = "dein-app-passwort"      # Hier dein Passwort / App-Passwort eintragen
 
 global_state = {
     "active_user_id": None,
@@ -71,13 +83,11 @@ def cloud_get_metrics():
             amp = 0.0
             volt = 230.0
             
-            # Gen 2 / Gen 3 Devices
             if "switch:0" in status:
                 sw = status["switch:0"]
                 watt = float(sw.get("apower", 0.0))
                 amp = float(sw.get("current", 0.0))
                 volt = float(sw.get("voltage", 230.0))
-            # Gen 1 Relays / Meters
             elif "meters" in status and len(status["meters"]) > 0:
                 m = status["meters"][0]
                 watt = float(m.get("power", 0.0))
@@ -92,12 +102,65 @@ def cloud_get_metrics():
         pass
     return global_state["cached_watt"], global_state["cached_current"], global_state["cached_voltage"]
 
-HTML = """
+def generate_pdf_invoice(report_data):
+    html_invoice = f"""
+    <!DOCTYPE html>
+    <html lang="de">
+    <head>
+    <meta charset="utf-8">
+    <style>
+    @page {{ size: A4; margin: 20mm 15mm; background-color: #ffffff; }}
+    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: #0f172a; margin: 0; padding: 0; }}
+    .header {{ border-bottom: 2px solid #2563eb; padding-bottom: 15px; margin-bottom: 25px; }}
+    .brand {{ font-size: 22pt; font-weight: 800; color: #2563eb; }}
+    .meta {{ font-size: 10pt; color: #64748b; margin-top: 5px; }}
+    table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
+    th {{ background-color: #f1f5f9; color: #334155; text-align: left; padding: 10px; font-size: 10pt; border-bottom: 1px solid #cbd5e1; }}
+    td {{ padding: 10px; font-size: 10pt; border-bottom: 1px solid #e2e8f0; }}
+    tr:nth-child(even) {{ background-color: #f8fafc; }}
+    .total {{ margin-top: 25px; background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 12px; padding: 15px; text-align: right; }}
+    .total-title {{ font-size: 11pt; color: #166534; font-weight: 600; }}
+    .total-val {{ font-size: 20pt; font-weight: 800; color: #15803d; }}
+    .footer {{ margin-top: 50px; font-size: 9pt; color: #94a3b8; text-align: center; border-top: 1px solid #e2e8f0; padding-top: 15px; }}
+    </style>
+    </head>
+    <body>
+    <div class="header">
+        <div class="brand">⚡ Smart Power Hub</div>
+        <div class="meta">Lade- & Stromquittung • Vorgangs-ID: {report_data.get('invoice_id')} • Datum: {time.strftime('%d.%m.%Y %H:%M')}</div>
+    </div>
+    <table>
+        <thead>
+            <tr><th>Position / Parameter</th><th>Wert</th><th>Einheit</th></tr>
+        </thead>
+        <tbody>
+            <tr><td><strong>Angeschlossenes Gerät</strong></td><td>{report_data.get('device')}</td><td>-</td></tr>
+            <tr><td><strong>Betriebsmodus</strong></td><td>{report_data.get('mode')}</td><td>-</td></tr>
+            <tr><td><strong>Gesamte Nutzungsdauer</strong></td><td>{report_data.get('time_formatted')}</td><td>hh:mm:ss</td></tr>
+            <tr><td><strong>Verbrauchte Energie (Wh)</strong></td><td>{report_data.get('wh'):.4f}</td><td>Wh</td></tr>
+            <tr><td><strong>Verbrauchte Energie (kWh)</strong></td><td>{report_data.get('kwh'):.6f}</td><td>kWh</td></tr>
+            <tr><td><strong>Arbeitspreis</strong></td><td>{STROMPREIS_PER_KWH:.3f}</td><td>€ / kWh</td></tr>
+        </tbody>
+    </table>
+    <div class="total">
+        <div class="total-title">Gesamtbetrag</div>
+        <div class="total-val">{report_data.get('cost'):.5f} €</div>
+    </div>
+    <div class="footer">Vielen Dank für die Nutzung der Smart Power Station!</div>
+    </body>
+    </html>
+    """
+    pdf_buffer = io.BytesIO()
+    HTML(string=html_invoice).write_pdf(pdf_buffer)
+    pdf_buffer.seek(0)
+    return pdf_buffer
+
+HTML_PAGE = """
 <!DOCTYPE html>
 <html lang="de">
 <head>
     <meta charset="utf-8">
-    <title>Smart Power Precision Hub</title>
+    <title>Smart Power Hub</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <style>
         :root {
@@ -237,6 +300,23 @@ HTML = """
         .receipt-row { display: flex; justify-content: space-between; padding: 9px 0; border-bottom: 1px solid var(--border-color); font-size: 14px; }
         .receipt-total { border-top: 2px solid var(--text-main); border-bottom: none; font-size: 17px; font-weight: 700; margin-top: 10px; padding-top: 12px; }
 
+        .email-box {
+            margin-top: 18px;
+            background: #f8fafc;
+            border: 1px solid var(--border-color);
+            border-radius: 14px;
+            padding: 14px;
+        }
+        .email-input {
+            width: 100%;
+            padding: 11px;
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            font-size: 14px;
+            margin-bottom: 8px;
+            box-sizing: border-box;
+        }
+
         .busy-card { display: none; text-align: center; }
     </style>
 </head>
@@ -246,14 +326,12 @@ HTML = """
         <div class="modal-box">
             <h3 style="margin-bottom: 6px;">Gerät festlegen</h3>
             <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">Wähle dein Gerät. Die Station merkt sich diese Auswahl dauerhaft.</p>
-            
             <button class="device-option-btn" onclick="saveDeviceProfile('lamp')">💡 Lampe / Beleuchtung (Dauerbetrieb)</button>
             <button class="device-option-btn" onclick="saveDeviceProfile('phone')">📱 Smartphone / Tablet (Akku)</button>
             <button class="device-option-btn" onclick="saveDeviceProfile('laptop')">💻 Laptop / Monitor (Akku)</button>
             <button class="device-option-btn" onclick="saveDeviceProfile('ebike_std')">🚲 E-Bike Ladegerät Standard (Akku)</button>
             <button class="device-option-btn" onclick="saveDeviceProfile('ebike_fast')">⚡ E-Bike Schnelllader (Akku)</button>
             <button class="device-option-btn" onclick="saveDeviceProfile('appliance')">🍳 Großgerät / Dauerbetrieb</button>
-
             <button class="btn-stop" style="margin-top: 6px;" onclick="document.getElementById('deviceModal').style.display='none'">Abbrechen</button>
         </div>
     </div>
@@ -330,7 +408,7 @@ HTML = """
                 </div>
             </div>
 
-            <!-- NETZDATEN: VOLT & AMPERE -->
+            <!-- NETZDATEN -->
             <div class="grid-2">
                 <div class="stat-card stat-volt">
                     <div class="stat-label">Netzspannung (U)</div>
@@ -358,7 +436,7 @@ HTML = """
                 </div>
             </div>
 
-            <!-- ENERGIE (WH / MWH) & PRÄZISE KOSTEN (€) -->
+            <!-- ENERGIE & KOSTEN -->
             <div class="grid-2">
                 <div class="stat-card">
                     <div class="stat-label">Verbrauch</div>
@@ -381,12 +459,12 @@ HTML = """
             </div>
         </div>
 
-        <!-- QUITTUNG -->
+        <!-- QUITTUNG MIT PDF- & EMAIL-VERSAND -->
         <div class="card receipt-card" id="receiptCard">
             <div class="receipt-header">
                 <div style="font-size: 40px; margin-bottom: 4px;">🧾</div>
                 <div class="title">Lade- & Stromquittung</div>
-                <div style="font-size: 12px; color: var(--text-muted); margin-top: 3px;">Sitzung erfolgreich beendet</div>
+                <div style="font-size: 12px; color: var(--text-muted); margin-top: 3px;">Sitzung erfolgreich beendet & Steckdose freigegeben</div>
             </div>
 
             <div class="receipt-row"><span>Gerät:</span> <b id="rDevice">-</b></div>
@@ -396,12 +474,23 @@ HTML = """
             <div class="receipt-row"><span>Verbrauch (kWh):</span> <b id="rKwh">0.000000 kWh</b></div>
             <div class="receipt-row receipt-total"><span>Gesamtbetrag:</span> <span id="rCost" style="color: var(--accent-green);">0.00000 €</span></div>
 
-            <button class="btn-start" style="margin-top:20px;" onclick="window.location.reload()">🔄 Neue Sitzung</button>
+            <!-- PDF PER E-MAIL SENDEN -->
+            <div class="email-box">
+                <div style="font-size:12px; font-weight:700; margin-bottom:6px; color:var(--text-main);">📧 Rechnung als PDF zusenden:</div>
+                <input type="email" id="emailInput" class="email-input" placeholder="deine-email@beispiel.de">
+                <button class="btn-start" style="background:var(--accent-primary); font-size:14px; padding:11px;" onclick="sendInvoiceEmail()">Rechnung per E-Mail senden</button>
+                <button class="btn-stop" style="font-size:13px; padding:8px; margin-top:6px;" onclick="downloadInvoicePdf()">📥 PDF direkt herunterladen</button>
+                <div id="emailFeedback" style="display:none; font-size:12px; font-weight:600; margin-top:8px;"></div>
+            </div>
+
+            <!-- NEUE SITZUNG STARTEN (FALLS WEITERVERWENDUNG GEWÜNSCHT) -->
+            <button class="btn-start" style="margin-top:16px; background:var(--text-main);" onclick="window.location.reload()">🔄 Neue Sitzung / Erneut verbinden</button>
         </div>
     </div>
 
     <script>
         let isTerminated = false;
+        let lastReport = null;
         let alarmInterval = null;
         const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 
@@ -498,6 +587,7 @@ HTML = """
             isTerminated = true;
             try {
                 let report = await sendAction('/logout');
+                lastReport = report;
                 
                 document.getElementById('rDevice').innerText = document.getElementById('detectedName').innerText;
                 document.getElementById('rMode').innerText = isBatteryDevice ? "Akku-Ladeüberwachung" : "Dauerbetrieb";
@@ -512,6 +602,39 @@ HTML = """
             } catch(e) {
                 isTerminated = false;
             }
+        }
+
+        async function sendInvoiceEmail() {
+            let email = document.getElementById('emailInput').value.trim();
+            let fb = document.getElementById('emailFeedback');
+            if (!email || !email.includes('@')) {
+                fb.style.display = 'block';
+                fb.style.color = 'var(--accent-red)';
+                fb.innerText = 'Bitte eine gültige E-Mail-Adresse eingeben.';
+                return;
+            }
+            fb.style.display = 'block';
+            fb.style.color = 'var(--accent-primary)';
+            fb.innerText = 'Erstelle PDF und versende E-Mail...';
+
+            let res = await sendAction('/send_email_invoice', {
+                email: email,
+                report: lastReport,
+                device: document.getElementById('rDevice').innerText,
+                mode: document.getElementById('rMode').innerText
+            });
+
+            if (res.status === 'ok') {
+                fb.style.color = 'var(--accent-green)';
+                fb.innerText = '✅ Rechnung wurde erfolgreich an deine E-Mail gesendet!';
+            } else {
+                fb.style.color = 'var(--accent-amber)';
+                fb.innerText = 'Hinweis: ' + res.message;
+            }
+        }
+
+        function downloadInvoicePdf() {
+            window.open('/download_invoice', '_blank');
         }
 
         setInterval(async () => {
@@ -549,7 +672,6 @@ HTML = """
                 let currentA = data.current_ampere || 0.0;
                 let currentV = data.voltage || 230.0;
 
-                // Präzisions-Werte
                 document.getElementById('volt').innerText = currentV.toFixed(1);
                 document.getElementById('amp').innerText = currentA.toFixed(3);
                 document.getElementById('milliAmp').innerText = (currentA * 1000.0).toFixed(0);
@@ -575,7 +697,6 @@ HTML = """
                         hadPowerPhase = true;
                     }
 
-                    // --- EINDEUTIGE UNPLUG-ERKENNUNG (15s Null-Last) ---
                     if (hadPowerPhase && currentW < 0.1 && currentA < 0.01) {
                         zeroPowerStreak++;
                         document.getElementById('wattSub').innerText = `Keine Last gemessen (${zeroPowerStreak}/15s)...`;
@@ -599,7 +720,6 @@ HTML = """
                     text.innerText = "Aktiv / Strom fließt";
                     startBtn.innerText = "▶️ Läuft bereits";
 
-                    // --- 100% VOLLGELADEN BEI AKKUS ---
                     if (isBatteryDevice && hadPowerPhase && currentW >= 0.3 && currentW < 2.0 && data.wh > 2.0) {
                         await sendAction('/stop');
                         document.getElementById('fullModal').style.display = 'flex';
@@ -649,14 +769,15 @@ def get_user_data():
             "last_check": None,
             "current_watt": 0.0,
             "current_ampere": 0.0,
-            "current_voltage": 230.0
+            "current_voltage": 230.0,
+            "last_report": None
         }
     return user_sessions[uid], uid
 
 @app.route('/')
 def home():
     get_user_data()
-    return render_template_string(HTML)
+    return render_template_string(HTML_PAGE)
 
 @app.route('/start', methods=['POST', 'GET'])
 def start():
@@ -723,18 +844,74 @@ def logout():
     m = str((sec % 3600) // 60).zfill(2)
     s = str(sec % 60).zfill(2)
 
+    invoice_num = f"RE-{time.strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}"
+
     report = {
+        "invoice_id": invoice_num,
         "time_formatted": f"{h}:{m}:{s}",
         "wh": u["total_kwh"] * 1000.0,
         "kwh": u["total_kwh"],
         "cost": u["total_kwh"] * STROMPREIS_PER_KWH
     }
-
-    if uid in user_sessions:
-        del user_sessions[uid]
-    session.clear()
+    u["last_report"] = report
 
     return jsonify(report)
+
+@app.route('/download_invoice', methods=['GET'])
+def download_invoice():
+    u, _ = get_user_data()
+    report = u.get("last_report") or {
+        "invoice_id": "RE-SAMPLE",
+        "device": "💡 Lampe",
+        "mode": "Dauerbetrieb",
+        "time_formatted": "00:15:00",
+        "wh": 10.5,
+        "kwh": 0.0105,
+        "cost": 0.00367
+    }
+    pdf_buffer = generate_pdf_invoice(report)
+    return send_file(pdf_buffer, mimetype="application/pdf", as_attachment=True, download_name=f"{report.get('invoice_id', 'Rechnung')}.pdf")
+
+@app.route('/send_email_invoice', methods=['POST'])
+def send_email_invoice():
+    data = request.get_json() or {}
+    recipient = data.get("email")
+    report = data.get("report") or {}
+    report["device"] = data.get("device", "Elektrogerät")
+    report["mode"] = data.get("mode", "Standard")
+
+    if not recipient or "@" not in recipient:
+        return jsonify({"status": "error", "message": "Ungültige E-Mail-Adresse"})
+
+    pdf_buffer = generate_pdf_invoice(report)
+
+    # E-Mail zusammenstellen
+    try:
+        msg = MIMEMultipart()
+        msg["From"] = SMTP_USER
+        msg["To"] = recipient
+        msg["Subject"] = f"Deine Stromquittung ({report.get('invoice_id')})"
+
+        body_text = f"""Hallo,\n\nvielen Dank für die Nutzung der Smart Power Station.\n\nZusammenfassung deiner Sitzung:\n- Dauer: {report.get('time_formatted')}\n- Verbrauch: {report.get('wh', 0):.2f} Wh ({report.get('kwh', 0):.5f} kWh)\n- Gesamtbetrag: {report.get('cost', 0):.5f} €\n\nIm Anhang findest du deine detaillierte PDF-Rechnung.\n\nViele Grüße\nDein Smart Power Team"""
+        msg.attach(MIMEText(body_text, "plain", "utf-8"))
+
+        pdf_attachment = MIMEApplication(pdf_buffer.read(), _subtype="pdf")
+        pdf_attachment.add_header('Content-Disposition', 'attachment', filename=f"{report.get('invoice_id')}.pdf")
+        msg.attach(pdf_attachment)
+
+        # Versand über SMTP
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=10)
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": "E-Mail-Server nicht konfiguriert. Du kannst das PDF direkt über 'PDF herunterladen' speichern."
+        })
 
 @app.route('/status')
 def status():
