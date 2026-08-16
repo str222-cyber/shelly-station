@@ -4,14 +4,14 @@ import time
 import uuid
 
 app = Flask(__name__)
-app.secret_key = "shelly_harmonisch_cloud_secret_888"
+app.secret_key = "shelly_smart_power_continuous_eval_2026"
 
 # --- SHELLY CLOUD DATEN ---
 SHELLY_CLOUD_URL = "https://shelly-274-eu.shelly.cloud"
 AUTH_KEY = "NDcwMzFkdWlkF9839F81801CF17665B14F2EED9BDC41514AEAB2C6C041201D306ABBC40BDE2A0AD2F80ACE98C596"
 DEVICE_ID = "08927249a904"
 
-STROMPREIS_PER_KWH = 0.35  # 0,35 € pro kWh
+STROMPREIS_PER_KWH = 0.35
 
 user_sessions = {}
 
@@ -35,7 +35,6 @@ def cloud_control(turn_on=True):
     except:
         pass
 
-    # Gen 2 / Gen 3 Fallback
     rpc_payload = {
         "auth_key": AUTH_KEY,
         "id": DEVICE_ID,
@@ -71,7 +70,7 @@ HTML = """
 <html lang="de">
 <head>
     <meta charset="utf-8">
-    <title>Smart Charge & Power</title>
+    <title>Smart Power Station</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <style>
         :root {
@@ -79,50 +78,49 @@ HTML = """
             --card-bg: #ffffff;
             --text-main: #0f172a;
             --text-muted: #64748b;
-            --accent-primary: #3b82f6;
-            --accent-green: #10b981;
-            --accent-amber: #f59e0b;
-            --accent-violet: #6366f1;
+            --accent-primary: #2563eb;
+            --accent-green: #059669;
+            --accent-amber: #d97706;
+            --accent-red: #dc2626;
             --border-color: #e2e8f0;
-            --shadow-sm: 0 1px 3px rgba(0,0,0,0.04), 0 1px 2px rgba(0,0,0,0.02);
-            --shadow-md: 0 10px 25px -5px rgba(15, 23, 42, 0.06), 0 8px 10px -6px rgba(15, 23, 42, 0.04);
+            --shadow-md: 0 10px 25px -5px rgba(15, 23, 42, 0.07), 0 8px 10px -6px rgba(15, 23, 42, 0.04);
         }
 
         * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; padding: 0; }
         body { background-color: var(--bg-color); color: var(--text-main); display: flex; justify-content: center; padding: 20px 12px; min-height: 100vh; }
         
         .container { width: 100%; max-width: 410px; margin: auto; }
-        .card { background: var(--card-bg); border-radius: 24px; padding: 24px 20px; box-shadow: var(--shadow-md); border: 1px solid var(--border-color); }
+        .card { background: var(--card-bg); border-radius: 24px; padding: 22px 18px; box-shadow: var(--shadow-md); border: 1px solid var(--border-color); text-align: center; }
         
-        .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; }
-        .title { font-size: 19px; font-weight: 700; color: var(--text-main); letter-spacing: -0.3px; }
+        .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+        .title { font-size: 18px; font-weight: 700; color: var(--text-main); letter-spacing: -0.3px; }
         .rate-badge { background: #f1f5f9; color: var(--text-muted); font-size: 12px; padding: 4px 10px; border-radius: 20px; font-weight: 600; }
 
-        /* Auto-Erkennungsbanner */
         .ai-banner {
-            background: linear-gradient(135deg, #eef2ff 0%, #f0fdf4 100%);
-            border: 1px solid #cbd5e1;
+            background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
+            border: 1px solid var(--border-color);
             border-radius: 16px;
             padding: 12px 14px;
-            margin-bottom: 16px;
+            margin-bottom: 14px;
             text-align: left;
             display: flex;
             align-items: center;
-            gap: 10px;
+            gap: 12px;
         }
-        .ai-icon { font-size: 20px; }
-        .ai-title { font-size: 11px; font-weight: 700; text-transform: uppercase; color: var(--accent-violet); letter-spacing: 0.5px; }
-        .ai-detected { font-size: 14px; font-weight: 600; color: var(--text-main); margin-top: 1px; }
+        .ai-icon { font-size: 24px; }
+        .ai-title { font-size: 11px; font-weight: 700; text-transform: uppercase; color: var(--accent-primary); letter-spacing: 0.5px; }
+        .ai-detected { font-size: 14px; font-weight: 700; color: var(--text-main); margin-top: 1px; }
+        .ai-mode { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
 
         .status-pill {
             display: inline-flex;
             align-items: center;
             gap: 6px;
-            font-size: 13px;
+            font-size: 12px;
             font-weight: 600;
-            padding: 6px 14px;
+            padding: 5px 12px;
             border-radius: 30px;
-            margin-bottom: 16px;
+            margin-bottom: 14px;
         }
         .status-on { background: #ecfdf5; color: #065f46; }
         .status-off { background: #f1f5f9; color: var(--text-muted); }
@@ -130,96 +128,131 @@ HTML = """
         .status-on .status-dot { background: var(--accent-green); box-shadow: 0 0 8px rgba(16,185,129,0.6); }
         .status-off .status-dot { background: #94a3b8; }
 
-        .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }
+        .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
         .stat-card {
             background: #f8fafc;
             border: 1px solid var(--border-color);
             border-radius: 16px;
-            padding: 14px;
+            padding: 12px;
             text-align: left;
         }
         .stat-label { font-size: 11px; font-weight: 600; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.4px; }
-        .stat-val { font-size: 21px; font-weight: 700; color: var(--text-main); margin-top: 4px; }
+        .stat-val { font-size: 20px; font-weight: 700; color: var(--text-main); margin-top: 3px; }
         .stat-sub { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
 
-        /* Farbige Akzente */
         .stat-watt .stat-val { color: var(--accent-primary); }
         .stat-cost .stat-val { color: var(--accent-green); }
-        .stat-time .stat-val { color: var(--text-main); font-family: monospace; }
+        .stat-time .stat-val { font-family: monospace; }
 
-        /* Fortschritts-Balken */
-        .bar-wrap { margin-top: 6px; width: 100%; height: 6px; background: #e2e8f0; border-radius: 3px; overflow: hidden; }
+        .bar-wrap { margin-top: 6px; width: 100%; height: 5px; background: #e2e8f0; border-radius: 3px; overflow: hidden; }
         .bar-fill { height: 100%; width: 0%; border-radius: 3px; transition: width 0.4s ease; }
         .bar-blue { background: var(--accent-primary); }
         .bar-green { background: var(--accent-green); }
 
-        /* Tasten */
-        .btn-group { display: flex; flex-direction: column; gap: 8px; margin-top: 18px; }
+        .btn-group { display: flex; flex-direction: column; gap: 8px; margin-top: 14px; }
         button {
             width: 100%;
-            padding: 14px;
+            padding: 13px;
             font-size: 15px;
             font-weight: 600;
             border: none;
             border-radius: 14px;
             cursor: pointer;
-            transition: transform 0.1s ease, opacity 0.2s ease;
+            transition: transform 0.1s ease;
         }
         button:active { transform: scale(0.98); }
         .btn-start { background: var(--text-main); color: white; }
         .btn-stop { background: #f1f5f9; color: var(--text-main); border: 1px solid var(--border-color); }
-        .btn-finish { background: #fee2e2; color: #991b1b; }
+        .btn-finish { background: #fee2e2; color: var(--accent-red); }
 
-        /* Quittung */
+        /* MODAL POPUP BEI 100% */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(15, 23, 42, 0.75);
+            backdrop-filter: blur(4px);
+            z-index: 999;
+            padding: 20px;
+            align-items: center;
+            justify-content: center;
+        }
+        .modal-box {
+            background: white;
+            border-radius: 24px;
+            padding: 28px 20px;
+            text-align: center;
+            max-width: 340px;
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.2);
+            animation: popIn 0.3s ease-out;
+            border: 2px solid var(--accent-green);
+        }
+        @keyframes popIn { from { transform: scale(0.85); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+
+        /* QUITTUNG */
         .receipt-card { display: none; text-align: left; }
-        .receipt-header { text-align: center; margin-bottom: 20px; }
-        .receipt-row { display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid var(--border-color); font-size: 14px; }
+        .receipt-header { text-align: center; margin-bottom: 18px; }
+        .receipt-row { display: flex; justify-content: space-between; padding: 9px 0; border-bottom: 1px solid var(--border-color); font-size: 14px; }
         .receipt-total { border-top: 2px solid var(--text-main); border-bottom: none; font-size: 17px; font-weight: 700; margin-top: 10px; padding-top: 12px; }
     </style>
 </head>
 <body>
+    <!-- 100% LADE-ENDE POPUP -->
+    <div id="fullModal" class="modal-overlay">
+        <div class="modal-box">
+            <div style="font-size: 48px; margin-bottom: 8px;">🔋✨</div>
+            <h2 style="font-size: 20px; color: var(--accent-green); margin-bottom: 6px;">Akku 100% Vollgeladen!</h2>
+            <p style="font-size: 14px; color: var(--text-muted); margin-bottom: 12px;">Der Stromfluss wurde automatisch gestoppt.</p>
+            <div style="background: #fef3c7; border: 1px solid #fde68a; color: #92400e; font-size: 13px; font-weight: 600; padding: 10px; border-radius: 12px; margin-bottom: 18px;">
+                ⚠️ Bitte trenne jetzt dein Ladekabel, damit andere die Station nutzen können!
+            </div>
+            <button class="btn-start" style="background: var(--accent-green);" onclick="dismissFullAlarm()">🔕 Alarm Stoppen & Quittung anzeigen</button>
+        </div>
+    </div>
+
     <div class="container">
-        <!-- HAUPTANSICHT -->
+        <!-- HAUPTKARTE -->
         <div class="card" id="mainCard">
             <div class="header">
-                <span class="title">⚡ Energie Monitor</span>
+                <span class="title">⚡ Smart Power Hub</span>
                 <span class="rate-badge">""" + str(STROMPREIS_PER_KWH) + """ €/kWh</span>
             </div>
 
-            <div style="text-align: center;">
+            <div>
                 <div id="statusBadge" class="status-pill status-off">
                     <span class="status-dot"></span>
                     <span id="statusText">Bereit / Aus</span>
                 </div>
             </div>
 
-            <!-- AUTO DETECT BANNER -->
+            <!-- DYNAMISCHE GERÄTE-ERKENNUNG -->
             <div class="ai-banner">
-                <div class="ai-icon">🔍</div>
+                <div class="ai-icon" id="devIcon">🔍</div>
                 <div>
-                    <div class="ai-title">Automatische Erkennung</div>
+                    <div class="ai-title" id="evalCycleTitle">Intelligente Erkennung</div>
                     <div class="ai-detected" id="detectedName">Warte auf Start...</div>
+                    <div class="ai-mode" id="detectedMode">Dauerüberwachung aktiv (Intervall: 60s)</div>
                 </div>
             </div>
 
-            <!-- LEISTUNG & ZEIT -->
+            <!-- LEISTUNG & LAUFZEIT -->
             <div class="grid-2">
                 <div class="stat-card stat-watt">
-                    <div class="stat-label">Aktuelle Last</div>
-                    <div class="stat-val"><span id="watt">0.0</span> <span style="font-size:14px; font-weight:500;">W</span></div>
-                    <div class="stat-sub" id="wattSub">Kein Verbrauch</div>
+                    <div class="stat-label">Leistung</div>
+                    <div class="stat-val"><span id="watt">0.0</span> <span style="font-size:13px; font-weight:500;">W</span></div>
+                    <div class="stat-sub" id="wattPeak">Spitze: 0.0 W</div>
                 </div>
                 <div class="stat-card stat-time">
                     <div class="stat-label">Laufzeit</div>
                     <div class="stat-val" id="timer">00:00:00</div>
-                    <div class="stat-sub">Sekundengenau</div>
+                    <div class="stat-sub" id="nextCheckSub">Nächster Check in --s</div>
                 </div>
             </div>
 
             <!-- ENERGIE & KOSTEN -->
             <div class="grid-2">
                 <div class="stat-card">
-                    <div class="stat-label">Energie (Wh)</div>
+                    <div class="stat-label">Verbrauch (Wh)</div>
                     <div class="stat-val" style="color:var(--accent-primary);"><span id="wh">0.0</span></div>
                     <div class="bar-wrap"><div class="bar-fill bar-blue" id="whBar"></div></div>
                 </div>
@@ -231,50 +264,74 @@ HTML = """
             </div>
 
             <div class="btn-group">
-                <button class="btn-start" onclick="sendAction('/start')">▶️ Start / Einschalten</button>
+                <button class="btn-start" onclick="startSession()">▶️ Start / Einschalten</button>
                 <button class="btn-stop" onclick="sendAction('/stop')">⏸️ Pause / Ausschalten</button>
                 <button class="btn-finish" onclick="logout()">🧾 Beenden & Abrechnen</button>
             </div>
         </div>
 
-        <!-- QUITTUNGS-ANSICHT -->
+        <!-- QUITTUNG -->
         <div class="card receipt-card" id="receiptCard">
             <div class="receipt-header">
-                <div style="font-size: 38px; margin-bottom: 6px;">🧾</div>
-                <div class="title">Verbrauchs-Abrechnung</div>
-                <div style="font-size: 12px; color: var(--text-muted); margin-top: 4px;">Sitzung erfolgreich beendet</div>
+                <div style="font-size: 40px; margin-bottom: 4px;">🧾</div>
+                <div class="title">Lade- & Stromquittung</div>
+                <div style="font-size: 12px; color: var(--text-muted); margin-top: 3px;">Sitzung erfolgreich beendet</div>
             </div>
 
             <div class="receipt-row"><span>Erkanntes Gerät:</span> <b id="rDevice">-</b></div>
+            <div class="receipt-row"><span>Betriebsart:</span> <b id="rMode">-</b></div>
             <div class="receipt-row"><span>Gesamte Zeit:</span> <b id="rTime">00:00:00</b></div>
             <div class="receipt-row"><span>Verbrauch:</span> <b id="rWh">0.00 Wh</b></div>
             <div class="receipt-row"><span>Verbrauch (kWh):</span> <b id="rKwh">0.0000 kWh</b></div>
             <div class="receipt-row receipt-total"><span>Gesamtbetrag:</span> <span id="rCost" style="color: var(--accent-green);">0,00 €</span></div>
 
-            <button class="btn-start" style="margin-top:20px;" onclick="window.location.reload()">🔄 Neue Sitzung</button>
+            <button class="btn-start" style="margin-top:20px;" onclick="window.location.reload()">🔄 Neue Sitzung starten</button>
         </div>
     </div>
 
     <script>
         let isTerminated = false;
-        let samples = [];
-        let detectedDeviceName = "Wird analysiert...";
+        let alarmInterval = null;
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 
-        // Automatische Klassifizierung nach Lastprofil
-        function classifyLoad(avgWatt, maxWatt) {
-            if (avgWatt < 2.0 && maxWatt < 3.0) {
-                return "Standby / Leerlauf (< 3W)";
-            } else if (avgWatt >= 2.0 && avgWatt < 35.0) {
-                return "📱 Smartphone / Tablet / LED-Licht";
-            } else if (avgWatt >= 35.0 && avgWatt < 110.0) {
-                return "💻 Laptop / TV / Bildschirm";
-            } else if (avgWatt >= 110.0 && avgWatt < 260.0) {
-                return "🚲 E-Bike Ladegerät (Standard 2A-4A)";
-            } else if (avgWatt >= 260.0 && avgWatt < 650.0) {
-                return "⚡ E-Bike Schnelllader / PC / Kleingerät";
-            } else {
-                return "🍳 Großverbraucher / Küchengerät (> 650W)";
+        // Messreihen für minütliche Re-Klassifizierung
+        let windowSamples = [];
+        let historicalPeakWatt = 0.0;
+        let hadHighChargingPhase = false;
+        let isBatteryDevice = false;
+        let currentClassification = { name: "Warte auf Messung...", icon: "🔍", isBattery: false };
+
+        function playContinuousTone() {
+            try {
+                if (audioCtx.state === 'suspended') { audioCtx.resume(); }
+                let osc = audioCtx.createOscillator();
+                let gain = audioCtx.createGain();
+                osc.type = 'sine';
+                osc.frequency.value = 880;
+                gain.gain.value = 0.25;
+                osc.connect(gain);
+                gain.connect(audioCtx.destination);
+                osc.start();
+                setTimeout(() => osc.stop(), 350);
+            } catch(e) {}
+        }
+
+        function startAudioAlert() {
+            if (alarmInterval) return;
+            playContinuousTone();
+            alarmInterval = setInterval(playContinuousTone, 700);
+        }
+
+        function stopAudioAlert() {
+            if (alarmInterval) {
+                clearInterval(alarmInterval);
+                alarmInterval = null;
             }
+        }
+
+        function startSession() {
+            if (audioCtx.state === 'suspended') { audioCtx.resume(); }
+            sendAction('/start');
         }
 
         async function sendAction(url) {
@@ -283,13 +340,39 @@ HTML = """
             } catch(e) {}
         }
 
+        async function dismissFullAlarm() {
+            stopAudioAlert();
+            document.getElementById('fullModal').style.display = 'none';
+            await logout();
+        }
+
+        // Klassifizierungs-Engine
+        function evaluateProfile(avgW, peakW) {
+            if (avgW < 2.5 && peakW < 3.5) {
+                return { name: "Standby / Kein aktives Gerät", icon: "🔌", isBattery: false };
+            } else if (avgW >= 2.5 && avgW < 18.0) {
+                return { name: "📱 Smartphone / LED-Lampe", icon: "📱", isBattery: true };
+            } else if (avgW >= 18.0 && avgW < 45.0) {
+                return { name: "📟 Tablet / Beleuchtung", icon: "📟", isBattery: true };
+            } else if (avgW >= 45.0 && avgW < 110.0) {
+                return { name: "💻 Laptop / Monitor", icon: "💻", isBattery: true };
+            } else if (avgW >= 110.0 && avgW < 260.0) {
+                return { name: "🚲 E-Bike Ladegerät (Standard)", icon: "🚲", isBattery: true };
+            } else if (avgW >= 260.0 && avgW < 600.0) {
+                return { name: "⚡ E-Bike Schnelllader / PC", icon: "⚡", isBattery: true };
+            } else {
+                return { name: "🍳 Dauerbetrieb / Haushaltsgerät", icon: "🍳", isBattery: false };
+            }
+        }
+
         async function logout() {
             isTerminated = true;
             try {
                 let res = await fetch('/logout', { cache: 'no-store' });
                 let report = await res.json();
                 
-                document.getElementById('rDevice').innerText = detectedDeviceName;
+                document.getElementById('rDevice').innerText = currentClassification.icon + " " + currentClassification.name;
+                document.getElementById('rMode').innerText = currentClassification.isBattery ? "Akku-Ladeüberwachung (Auto-Stop)" : "Dauerbetrieb ohne Auto-Stop";
                 document.getElementById('rTime').innerText = report.time_formatted;
                 document.getElementById('rWh').innerText = report.wh.toFixed(2) + " Wh";
                 document.getElementById('rKwh').innerText = report.kwh.toFixed(4) + " kWh";
@@ -321,34 +404,62 @@ HTML = """
 
                 let badge = document.getElementById('statusBadge');
                 let text = document.getElementById('statusText');
+                
                 if (data.active) {
                     badge.className = "status-pill status-on";
                     text.innerText = "Aktiv / Strom fließt";
-                    
-                    // Automatische Erkennung in den ersten 30 Sekunden
-                    if (sec < 30) {
-                        samples.push(currentW);
-                        let remainingSec = 30 - sec;
-                        document.getElementById('detectedName').innerText = `Analysiere Stromprofil... (${remainingSec}s)`;
-                    } else {
-                        if (samples.length > 0) {
-                            let avg = samples.reduce((a, b) => a + b, 0) / samples.length;
-                            let max = Math.max(...samples);
-                            detectedDeviceName = classifyLoad(avg, max);
-                            document.getElementById('detectedName').innerText = detectedDeviceName;
-                        }
+
+                    windowSamples.push(currentW);
+                    if (currentW > historicalPeakWatt) historicalPeakWatt = currentW;
+                    document.getElementById('wattPeak').innerText = `Spitze: ${historicalPeakWatt.toFixed(1)} W`;
+
+                    if (historicalPeakWatt > 6.0 && currentW > 5.0) {
+                        hadHighChargingPhase = true;
                     }
+
+                    // Jede volle Minute (oder nach den ersten 30s) Re-Klassifizierung
+                    let secInMinute = sec % 60;
+                    let nextCheck = 60 - secInMinute;
+                    document.getElementById('nextCheckSub').innerText = `Prüfe Profil in ${nextCheck}s`;
+
+                    if (sec >= 30 && (sec === 30 || secInMinute === 0)) {
+                        let avg = windowSamples.reduce((a, b) => a + b, 0) / windowSamples.length;
+                        let peak = Math.max(...windowSamples);
+                        
+                        currentClassification = evaluateProfile(avg, peak);
+                        isBatteryDevice = currentClassification.isBattery;
+
+                        document.getElementById('devIcon').innerText = currentClassification.icon;
+                        document.getElementById('detectedName').innerText = currentClassification.name;
+                        document.getElementById('detectedMode').innerText = isBatteryDevice 
+                            ? "🔋 Akku erkannt (Auto-Stop bei 100%)" 
+                            : "💡 Dauerbetrieb (Kein Auto-Stop)";
+                        
+                        windowSamples = []; // Reset für das nächste Minutenfenster
+                    } else if (sec < 30) {
+                        document.getElementById('detectedName').innerText = `Analysiere Last... (${30 - sec}s)`;
+                    }
+
+                    // 100% VOLLGELADEN-ERKENNUNG BEI AKKUS
+                    // Wenn ein Akku-Gerät zuvor geladen hat und die Leistung nun auf < 2.0 W fällt
+                    if (isBatteryDevice && hadHighChargingPhase && currentW < 2.2 && data.wh > 2.0) {
+                        // Sofort Steckdose ausschalten
+                        await sendAction('/stop');
+                        document.getElementById('fullModal').style.display = 'flex';
+                        startAudioAlert();
+                    }
+
                 } else {
                     badge.className = "status-pill status-off";
                     text.innerText = "Pausiert / Bereit";
                     if (sec === 0) {
                         document.getElementById('detectedName').innerText = "Warte auf Start...";
-                        samples = [];
+                        document.getElementById('devIcon').innerText = "🔍";
+                        windowSamples = [];
+                        historicalPeakWatt = 0;
+                        hadHighChargingPhase = false;
                     }
                 }
-
-                // Subtitle
-                document.getElementById('wattSub').innerText = currentW > 0.5 ? "Fließt stabil" : "Keine Last";
 
                 // Balken Animationen
                 let whP = Math.min(100, (data.wh / 500.0) * 100);
