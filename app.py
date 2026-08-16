@@ -42,7 +42,6 @@ SMTP_PASSWORD = ""
 
 AI_MODEL_FILE = "ai_learned_models.json"
 
-# Angepasste Start-Cluster für moderne Schnelllader
 DEFAULT_AI_PROFILES = {
     "lamp": {"avg_w": 1.2, "peak_w": 2.0, "variance": 0.1, "count": 1},
     "phone": {"name": "📱 Smartphone / Tablet", "avg_w": 18.0, "peak_w": 25.0, "variance": 3.5, "count": 1},
@@ -151,7 +150,6 @@ def async_cloud_control(turn_on=True):
             pass
     threading.Thread(target=_worker, daemon=True).start()
 
-# --- KI FEATURE EXTRAKTION ---
 def extract_features(samples):
     if not samples:
         return 0.0, 0.0, 0.0
@@ -196,35 +194,20 @@ def ai_learn_from_feedback(correct_key, samples):
     
     save_ai_models(current_models)
 
-# --- PHYSIKALISCHE LADEKURVEN-SCHÄTZUNG (SOC0) ---
 def estimate_initial_soc(profile_key, avg_w):
-    """
-    Schätzt den Start-Ladezustand (%) anhand der inititalen Stromaufnahme ab.
-    """
     if profile_key == "phone":
-        if avg_w >= 16.0: return 10.0   # Fast Charge (CC Phase) -> Leer
-        elif avg_w >= 10.0: return 50.0 # Mittlere Ladeleistung -> Halbvoll
-        elif avg_w >= 5.0: return 75.0  # (CV Phase Einstieg) -> Fast voll
-        elif avg_w >= 1.5: return 90.0  # Sättigung
-        else: return 100.0              # Standby
+        if avg_w >= 16.0: return 10.0
+        elif avg_w >= 10.0: return 50.0
+        elif avg_w >= 5.0: return 75.0
+        elif avg_w >= 1.5: return 90.0
+        else: return 100.0
     elif profile_key == "laptop":
         if avg_w >= 45.0: return 15.0
         elif avg_w >= 30.0: return 60.0
         elif avg_w >= 15.0: return 85.0
         else: return 95.0
-    elif profile_key == "ebike_std":
-        if avg_w >= 120.0: return 20.0
-        elif avg_w >= 60.0: return 75.0
-        else: return 95.0
-    elif profile_key == "ebike_fast":
-        if avg_w >= 280.0: return 20.0
-        elif avg_w >= 100.0: return 80.0
-        else: return 95.0
     return 0.0
 
-# ------------------------------------------------------------------------------
-# ZENTRALER HERZSCHLAG (Absolut ausfallsicher & stabil)
-# ------------------------------------------------------------------------------
 def background_meter_worker():
     last_loop = time.time()
     while True:
@@ -263,11 +246,9 @@ def background_meter_worker():
                 u["current_ampere"] = amp
                 u["current_voltage"] = volt
                 
-                # GLÄTTUNGSFILTER (Anti-Flicker für das UI)
                 if u.get("smoothed_watt") is None:
                     u["smoothed_watt"] = watt
                 else:
-                    # 80% Alt-Wert, 20% Neu-Wert = Seidenweiche Anzeige
                     u["smoothed_watt"] = (u["smoothed_watt"] * 0.8) + (watt * 0.2)
 
                 global_state["last_watt"] = watt
@@ -275,25 +256,21 @@ def background_meter_worker():
                 global_state["last_volt"] = volt
 
                 if u.get("active", False):
-                    # ZÄHLT IMMER NAHTLOS DURCH!
                     u["total_seconds"] += dt
                     u["total_kwh"] += (watt * dt) / 3600000.0
 
                     threshold = get_analysis_threshold()
 
-                    # 1. KI LERN-PHASE & START-LADEZUSTAND (SOC0) BERECHNUNG
                     if u["total_seconds"] < threshold and not u["manually_selected"]:
                         if watt > 0.5:
                             u["analysis_samples"].append(watt)
                     elif u["total_seconds"] >= threshold and not u["analysis_completed"] and not u["manually_selected"]:
                         u["device_key"] = ai_classify_samples(u["analysis_samples"])
-                        # Schätze Start-Akkuwert physikalisch ab
                         if u["analysis_samples"]:
                             avg_w = sum(u["analysis_samples"]) / len(u["analysis_samples"])
                             u["estimated_soc_0"] = estimate_initial_soc(u["device_key"], avg_w)
                         u["analysis_completed"] = True
 
-                    # 2. AUSSTECK-ERKENNUNG (Zieht erst nach echten 15 Sekunden Leerlauf)
                     if watt > 1.0:
                         u["had_power_draw"] = True
                         u["zero_power_counter"] = 0.0
@@ -308,13 +285,12 @@ def background_meter_worker():
                     elif watt > 0.1:
                         u["zero_power_counter"] = 0.0
 
-                    # 3. AKKU 100% ERKENNUNG (Greift erst NACH der KI-Erkennung)
                     prof = DEVICE_PROFILES.get(u["device_key"], {})
                     if prof.get("is_battery", False) and u["total_seconds"] > threshold:
                         if watt > 6.0:
                             u["had_charging_phase"] = True
                         
-                        if u["had_charging_phase"] and 0.2 <= watt < 1.8 and (u["total_kwh"] * 1000.0) > 1.0:
+                        if u["had_charging_phase"] and 0.2 <= watt < 1.8 and (u["total_kwh"] * 1000.0) > 2.0:
                             u["battery_full_counter"] += dt
                             if u["battery_full_counter"] >= 30.0:
                                 u["battery_full_triggered"] = True
@@ -326,7 +302,6 @@ def background_meter_worker():
             pass
         
         time.sleep(1.0)
-# ------------------------------------------------------------------------------
 
 def generate_pdf_invoice(report_data):
     html_invoice = f"""
@@ -380,32 +355,6 @@ def generate_pdf_invoice(report_data):
     HTML(string=html_invoice).write_pdf(pdf_buffer)
     pdf_buffer.seek(0)
     return pdf_buffer
-
-HTML_ACCESS_DENIED = """
-<!DOCTYPE html>
-<html lang="de">
-<head>
-    <meta charset="utf-8">
-    <title>Zugriff Verweigert</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: white; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; text-align: center; padding: 20px; }
-        .box { background: #1e293b; padding: 30px; border-radius: 20px; border: 1px solid #334155; max-width: 360px; }
-        .icon { font-size: 50px; margin-bottom: 15px; }
-        h2 { font-size: 20px; margin-bottom: 10px; color: #f87171; }
-        p { font-size: 14px; color: #94a3b8; line-height: 1.5; }
-    </style>
-</head>
-<body>
-    <div class="box">
-        <div class="icon">🔒🚫</div>
-        <h2>Sicherheits-Sperre</h2>
-        <p>Ein direkter Web-Aufruf über das Internet ist nicht gestattet.</p>
-        <p style="margin-top: 12px; color: #e2e8f0; font-weight: 600;">Bitte scanne den QR-Code auf dem Laptop-Bildschirm oder an der Ladestation.</p>
-    </div>
-</body>
-</html>
-"""
 
 HTML_PAGE = """
 <!DOCTYPE html>
@@ -712,7 +661,7 @@ HTML_PAGE = """
                 </div>
             </div>
 
-            <!-- GERÄTE ERKENNUNG (NUN MIT SCHWARMWISSEN) -->
+            <!-- GERÄTE ERKENNUNG -->
             <div class="ai-banner">
                 <div class="ai-header">
                     <span class="ai-title" id="aiStatusTitle">AI Erkennung</span>
@@ -722,7 +671,7 @@ HTML_PAGE = """
                     <div class="ai-icon" id="devIcon">💡</div>
                     <div>
                         <div class="ai-detected" id="detectedName">Bereit</div>
-                        <div class="ai-mode" id="detectedMode">Warte auf Start...</div>
+                        <div class="ai-mode" id="detectedMode">Automatische AI-Lastanalyse...</div>
                     </div>
                 </div>
             </div>
@@ -791,12 +740,12 @@ HTML_PAGE = """
             </div>
         </div>
 
-        <!-- QUITTUNG NACH ÜBERGABE -->
+        <!-- QUITTUNG NACH ÜBERGABE / BEENDEN -->
         <div class="card receipt-card" id="receiptCard">
             <div class="receipt-header">
                 <div style="font-size: 40px; margin-bottom: 4px;">🧾</div>
                 <div class="title" id="receiptTitle">Lade- & Stromquittung</div>
-                <div style="font-size: 12px; color: var(--text-muted); margin-top: 3px;" id="receiptSubtitle">Steckdose wurde an nächsten Nutzer übergeben</div>
+                <div style="font-size: 12px; color: var(--text-muted); margin-top: 3px;" id="receiptSubtitle">Sitzung erfolgreich beendet</div>
             </div>
 
             <div class="receipt-row"><span>Gerät:</span> <b id="rDevice">-</b></div>
@@ -814,10 +763,13 @@ HTML_PAGE = """
                 <div id="emailFeedback" style="display:none; font-size:12px; font-weight:600; margin-top:8px;"></div>
             </div>
 
-            <!-- WAHLMÖGLICHKEIT BEIM NUTZERWECHSEL -->
-            <div id="transferChoiceBox" style="margin-top: 16px; display: flex; flex-direction: column; gap: 8px;">
-                <button class="btn-stop" style="background: #e0f2fe; color: #0369a1; border-color: #bae6fd;" onclick="setWaitingMode()">⏳ Sitzung pausieren (Warten bis anderer Nutzer fertig ist)</button>
-                <button class="btn-finish" style="font-size: 14px;" onclick="finalizeTermination()">🛑 Endgültig beenden & Finales PDF</button>
+            <!-- NEU: SCHLIESSEN & NEUEN VORGANG STARTEN BUTTON -->
+            <div style="margin-top: 16px; display: flex; flex-direction: column; gap: 8px;">
+                <button class="btn-start" style="background: var(--accent-green); font-size: 15px;" onclick="startNewSessionCompletely()">❌ Schließen & Neue Sitzung starten</button>
+                <div id="transferChoiceBox" style="display: flex; flex-direction: column; gap: 8px;">
+                    <button class="btn-stop" style="background: #e0f2fe; color: #0369a1; border-color: #bae6fd;" onclick="setWaitingMode()">⏳ Sitzung pausieren (Warten bis anderer Nutzer fertig ist)</button>
+                    <button class="btn-finish" style="font-size: 14px;" onclick="finalizeTermination()">🛑 Endgültig beenden</button>
+                </div>
             </div>
         </div>
     </div>
@@ -830,7 +782,6 @@ HTML_PAGE = """
         let eightyModalDismissed = false;
         let currentProfileKey = "lamp";
 
-        // UNLÖSCHBARE NUTZER ID: Verhindert das "Zurück auf 0"-Problem bei Standby
         let stationToken = 'SEC-STATION-2026-X99Q-ALPHA-77';
         let userId = localStorage.getItem('hub_user_id');
         if (!userId) {
@@ -911,7 +862,6 @@ HTML_PAGE = """
         async function acceptTransfer() {
             transferModalOpen = false;
             document.getElementById('transferModal').style.display = 'none';
-            // Direkter Handover
             let res = await sendAction('/accept_transfer');
             lastReport = res.report;
             setWaitingMode();
@@ -950,6 +900,13 @@ HTML_PAGE = """
                     document.getElementById('transferChoiceBox').style.display = 'flex';
                 }
             } catch(e) {}
+        }
+
+        // NEU: Schließt die Quittung, generiert neue User-ID und startet völlig neu
+        async function startNewSessionCompletely() {
+            await sendAction('/new_session');
+            localStorage.removeItem('hub_user_id');
+            window.location.reload();
         }
 
         function setWaitingMode() {
@@ -1008,7 +965,6 @@ HTML_PAGE = """
             window.open('/download_invoice', '_blank');
         }
 
-        // Blitzschnelles lokales UI Update
         async function fetchSyncData() {
             if (isTerminated) return;
             try {
@@ -1026,7 +982,6 @@ HTML_PAGE = """
                     return;
                 }
 
-                // Warteraum Logik für Nutzer A
                 if (isWaitingForResume) {
                     if (!data.is_busy_for_other) {
                         isWaitingForResume = false;
@@ -1038,7 +993,6 @@ HTML_PAGE = """
                     return;
                 }
 
-                // Besetzt Logik für neuen Nutzer
                 if (data.is_busy_for_other) {
                     document.getElementById('mainCard').style.display = 'none';
                     document.getElementById('receiptCard').style.display = 'none';
@@ -1062,7 +1016,7 @@ HTML_PAGE = """
                 let sec = data.elapsed_seconds;
                 updateTimerUI(sec);
 
-                let currentW = data.watt; // Jetzt seidenweich geglättet vom Server
+                let currentW = data.watt;
                 let currentA = data.current_ampere || 0.0;
                 let currentV = data.voltage || 230.0;
 
@@ -1076,7 +1030,6 @@ HTML_PAGE = """
                 document.getElementById('cost').innerText = data.cost.toFixed(5);
                 document.getElementById('microCost').innerText = (data.cost * 100.0).toFixed(3);
 
-                // --- AI SCHWARMWISSEN DISPLAY UPDATE ---
                 let thresh = data.analysis_threshold;
                 if (data.active && sec < thresh && !data.manually_selected) {
                     let remain = Math.max(0, Math.floor(thresh - sec));
@@ -1088,7 +1041,6 @@ HTML_PAGE = """
                     document.getElementById('aiStatusTitle').innerText = `Vom Nutzer angelernt`;
                 }
 
-                // Batterie Update
                 if (data.current_profile && data.current_profile.is_battery) {
                     let cap = data.current_profile.capacity_wh || 20.0;
                     let pct = data.battery_pct;
@@ -1106,7 +1058,6 @@ HTML_PAGE = """
                 let statusText = document.getElementById('statusText');
                 let startBtn = document.getElementById('mainStartBtn');
 
-                // UNPLUG ERKENNUNG
                 if (data.unplugged_detected) {
                     badge.className = "status-pill status-unplug";
                     statusText.innerText = "🔌 Kabel ausgesteckt – Strom gestoppt";
@@ -1140,7 +1091,6 @@ HTML_PAGE = """
 """
 
 def get_user_data():
-    # HOCHSICHERER NUTZER-ABGLEICH (Schützt vor Browser-Standby)
     uid = request.headers.get("X-User-Id")
     if not uid:
         if "user_id" not in session:
@@ -1169,6 +1119,7 @@ def get_user_data():
             "analysis_completed": False,
             "manually_selected": False,
             "estimated_soc_0": 0.0,
+            "already_saturated_detected": False,
             "battery_full_triggered": False,
             "last_report": None
         }
@@ -1210,8 +1161,14 @@ def start():
     ensure_worker()
     u, uid = get_user_data()
     
+    # Sitzung zurücksetzen falls sie vorher terminiert war
     if u.get("terminated", False):
-        return jsonify({"status": "forbidden"}), 403
+        u["terminated"] = False
+        u["total_kwh"] = 0.0
+        u["total_seconds"] = 0.0
+        u["analysis_samples"] = []
+        u["analysis_completed"] = False
+        u["manually_selected"] = False
 
     active_uid = global_state.get("active_user_id")
     if active_uid and active_uid != uid:
@@ -1255,7 +1212,6 @@ def save_device():
         u["manually_selected"] = True
         u["analysis_completed"] = True
         
-        # User-Feedback speist das KI-Gedächtnis & Berechnet SOC neu
         if u.get("analysis_samples"):
             ai_learn_from_feedback(key, u["analysis_samples"])
             avg_w = sum(u["analysis_samples"]) / len(u["analysis_samples"])
@@ -1275,7 +1231,6 @@ def request_transfer():
         global_state["transfer_requester_id"] = uid
     return jsonify({"status": "requested"})
 
-# NEUE ROUTE: Perfekter Handover direkt von Nutzer A an Nutzer B
 @app.route('/accept_transfer', methods=['POST'])
 @require_physical_auth
 def accept_transfer():
@@ -1286,7 +1241,6 @@ def accept_transfer():
     u["paused_by_transfer"] = True
     async_cloud_control(turn_on=False)
     
-    # Nutzer B bekommt sofort den Slot
     if requester:
         global_state["active_user_id"] = requester
     else:
@@ -1329,7 +1283,6 @@ def logout():
     if final_terminate:
         u["terminated"] = True
 
-    # Gibt den Slot für andere/wartende Nutzer frei
     if global_state["active_user_id"] == uid:
         global_state["active_user_id"] = None
         global_state["transfer_requested"] = False
@@ -1362,6 +1315,20 @@ def finalize():
     u["terminated"] = True
     u["paused_by_transfer"] = False
     return jsonify({"status": "finalized"})
+
+@app.route('/new_session', methods=['POST'])
+@require_physical_auth
+def new_session():
+    u, uid = get_user_data()
+    u["terminated"] = False
+    u["active"] = False
+    u["total_kwh"] = 0.0
+    u["total_seconds"] = 0.0
+    u["analysis_samples"] = []
+    u["analysis_completed"] = False
+    u["manually_selected"] = False
+    u["battery_full_triggered"] = False
+    return jsonify({"status": "ok"})
 
 @app.route('/download_invoice', methods=['GET'])
 @require_physical_auth
@@ -1448,7 +1415,6 @@ def status():
     wh = u["total_kwh"] * 1000.0
     cap = prof.get("capacity_wh", 20.0)
     
-    # SOC Berechnung mit Startwert + Geladenen Wh
     base_soc = u.get("estimated_soc_0", 0.0)
     if prof.get("is_battery") and cap > 0:
         added_pct = (wh / cap) * 100.0
@@ -1474,7 +1440,7 @@ def status():
     return jsonify({
         "active": u["active"] and (active_uid == uid),
         "unplugged_detected": u.get("unplugged_detected", False),
-        "watt": curr_w if (active_uid == uid) else 0.0, # Liefert den weichen, geglätteten Wert ans Frontend
+        "watt": curr_w if (active_uid == uid) else 0.0,
         "current_ampere": u.get("current_ampere", 0.0),
         "voltage": u.get("current_voltage", 230.0),
         "global_watt": global_w,
