@@ -1,19 +1,37 @@
-from flask import Flask, render_template_string, jsonify, session
+from flask import Flask, render_template_string, jsonify, session, request
 import requests
 import time
 import uuid
 
 app = Flask(__name__)
-app.secret_key = "shelly_smart_power_continuous_eval_2026"
+app.secret_key = "shelly_smart_learning_multiuser_2026"
 
-# --- SHELLY CLOUD DATEN ---
+# --- SHELLY CLOUD KONFIGURATION ---
 SHELLY_CLOUD_URL = "https://shelly-274-eu.shelly.cloud"
 AUTH_KEY = "NDcwMzFkdWlkF9839F81801CF17665B14F2EED9BDC41514AEAB2C6C041201D306ABBC40BDE2A0AD2F80ACE98C596"
 DEVICE_ID = "08927249a904"
 
 STROMPREIS_PER_KWH = 0.35
 
+# Globaler Status für Multi-User Management
+global_state = {
+    "active_user_id": None,
+    "waiting_user_id": None,
+    "request_transfer": False,
+    "last_seen_active": 0
+}
+
 user_sessions = {}
+
+# Gelernte Geräteprofile (Watt-Spannen)
+learned_profiles = {
+    "lamp": {"name": "💡 Lampe / Beleuchtung", "icon": "💡", "min_w": 2.0, "max_w": 40.0, "is_battery": False},
+    "phone": {"name": "📱 Smartphone / Tablet", "icon": "📱", "min_w": 4.0, "max_w": 35.0, "is_battery": True},
+    "laptop": {"name": "💻 Laptop / Monitor", "icon": "💻", "min_w": 35.0, "max_w": 100.0, "is_battery": True},
+    "ebike_std": {"name": "🚲 E-Bike Ladegerät (Standard)", "icon": "🚲", "min_w": 100.0, "max_w": 250.0, "is_battery": True},
+    "ebike_fast": {"name": "⚡ E-Bike Schnelllader / PC", "icon": "⚡", "min_w": 250.0, "max_w": 600.0, "is_battery": True},
+    "appliance": {"name": "🍳 Dauerbetrieb / Großgerät", "icon": "🍳", "min_w": 600.0, "max_w": 3500.0, "is_battery": False}
+}
 
 @app.after_request
 def add_universal_headers(response):
@@ -87,31 +105,34 @@ HTML = """
         }
 
         * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; padding: 0; }
-        body { background-color: var(--bg-color); color: var(--text-main); display: flex; justify-content: center; padding: 20px 12px; min-height: 100vh; }
+        body { background-color: var(--bg-color); color: var(--text-main); display: flex; justify-content: center; padding: 18px 12px; min-height: 100vh; }
         
         .container { width: 100%; max-width: 410px; margin: auto; }
         .card { background: var(--card-bg); border-radius: 24px; padding: 22px 18px; box-shadow: var(--shadow-md); border: 1px solid var(--border-color); text-align: center; }
         
-        .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+        .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
         .title { font-size: 18px; font-weight: 700; color: var(--text-main); letter-spacing: -0.3px; }
         .rate-badge { background: #f1f5f9; color: var(--text-muted); font-size: 12px; padding: 4px 10px; border-radius: 20px; font-weight: 600; }
 
+        /* KI & LERNEN BANNER */
         .ai-banner {
             background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
             border: 1px solid var(--border-color);
-            border-radius: 16px;
-            padding: 12px 14px;
+            border-radius: 18px;
+            padding: 14px;
             margin-bottom: 14px;
             text-align: left;
-            display: flex;
-            align-items: center;
-            gap: 12px;
         }
-        .ai-icon { font-size: 24px; }
+        .ai-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
         .ai-title { font-size: 11px; font-weight: 700; text-transform: uppercase; color: var(--accent-primary); letter-spacing: 0.5px; }
-        .ai-detected { font-size: 14px; font-weight: 700; color: var(--text-main); margin-top: 1px; }
-        .ai-mode { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+        .btn-edit { background: #e2e8f0; color: var(--text-main); border: none; font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 8px; cursor: pointer; }
+        
+        .ai-body { display: flex; align-items: center; gap: 10px; }
+        .ai-icon { font-size: 26px; }
+        .ai-detected { font-size: 14px; font-weight: 700; color: var(--text-main); }
+        .ai-mode { font-size: 11px; color: var(--text-muted); margin-top: 1px; }
 
+        /* STATUS BADGE */
         .status-pill {
             display: inline-flex;
             align-items: center;
@@ -124,18 +145,14 @@ HTML = """
         }
         .status-on { background: #ecfdf5; color: #065f46; }
         .status-off { background: #f1f5f9; color: var(--text-muted); }
+        .status-unplug { background: #fef3c7; color: #92400e; }
         .status-dot { width: 8px; height: 8px; border-radius: 50%; }
         .status-on .status-dot { background: var(--accent-green); box-shadow: 0 0 8px rgba(16,185,129,0.6); }
         .status-off .status-dot { background: #94a3b8; }
+        .status-unplug .status-dot { background: var(--accent-amber); }
 
         .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
-        .stat-card {
-            background: #f8fafc;
-            border: 1px solid var(--border-color);
-            border-radius: 16px;
-            padding: 12px;
-            text-align: left;
-        }
+        .stat-card { background: #f8fafc; border: 1px solid var(--border-color); border-radius: 16px; padding: 12px; text-align: left; }
         .stat-label { font-size: 11px; font-weight: 600; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.4px; }
         .stat-val { font-size: 20px; font-weight: 700; color: var(--text-main); margin-top: 3px; }
         .stat-sub { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
@@ -165,7 +182,7 @@ HTML = """
         .btn-stop { background: #f1f5f9; color: var(--text-main); border: 1px solid var(--border-color); }
         .btn-finish { background: #fee2e2; color: var(--accent-red); }
 
-        /* MODAL POPUP BEI 100% */
+        /* MODAL OVERLAYS */
         .modal-overlay {
             display: none;
             position: fixed;
@@ -180,38 +197,106 @@ HTML = """
         .modal-box {
             background: white;
             border-radius: 24px;
-            padding: 28px 20px;
+            padding: 24px 20px;
             text-align: center;
             max-width: 340px;
+            width: 100%;
             box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.2);
             animation: popIn 0.3s ease-out;
-            border: 2px solid var(--accent-green);
         }
         @keyframes popIn { from { transform: scale(0.85); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+
+        /* GERÄTE AUSWAHL LISTE */
+        .device-option-btn {
+            background: #f8fafc;
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 10px;
+            text-align: left;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 8px;
+            width: 100%;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+        .device-option-btn:hover { background: #edf2f7; }
 
         /* QUITTUNG */
         .receipt-card { display: none; text-align: left; }
         .receipt-header { text-align: center; margin-bottom: 18px; }
         .receipt-row { display: flex; justify-content: space-between; padding: 9px 0; border-bottom: 1px solid var(--border-color); font-size: 14px; }
         .receipt-total { border-top: 2px solid var(--text-main); border-bottom: none; font-size: 17px; font-weight: 700; margin-top: 10px; padding-top: 12px; }
+
+        /* BESETZT ANSICHT */
+        .busy-card { display: none; text-align: center; }
     </style>
 </head>
 <body>
-    <!-- 100% LADE-ENDE POPUP -->
-    <div id="fullModal" class="modal-overlay">
+    <!-- MODAL 1: GERTÄT MANUELL TRAINIEREN / ÄNDERN -->
+    <div id="deviceModal" class="modal-overlay">
         <div class="modal-box">
+            <h3 style="margin-bottom: 6px;">Gerät auswählen & trainieren</h3>
+            <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">Wähle das tatsächliche Gerät. Das System lernt dieses Profil für die Zukunft.</p>
+            
+            <button class="device-option-btn" onclick="saveDeviceProfile('lamp')">💡 Lampe / Beleuchtung (Dauerbetrieb)</button>
+            <button class="device-option-btn" onclick="saveDeviceProfile('phone')">📱 Smartphone / Tablet (Akku)</button>
+            <button class="device-option-btn" onclick="saveDeviceProfile('laptop')">💻 Laptop / Monitor (Akku)</button>
+            <button class="device-option-btn" onclick="saveDeviceProfile('ebike_std')">🚲 E-Bike Ladegerät Standard (Akku)</button>
+            <button class="device-option-btn" onclick="saveDeviceProfile('ebike_fast')">⚡ E-Bike Schnelllader (Akku)</button>
+            <button class="device-option-btn" onclick="saveDeviceProfile('appliance')">🍳 Großgerät / Dauerbetrieb</button>
+
+            <button class="btn-stop" style="margin-top: 6px;" onclick="document.getElementById('deviceModal').style.display='none'">Abbrechen</button>
+        </div>
+    </div>
+
+    <!-- MODAL 2: ANFRAGE ZWEITER NUTZER -->
+    <div id="transferModal" class="modal-overlay">
+        <div class="modal-box" style="border: 2px solid var(--accent-amber);">
+            <div style="font-size: 40px; margin-bottom: 6px;">👋🔔</div>
+            <h3 style="color: var(--accent-amber); margin-bottom: 6px;">Freigabe-Anfrage!</h3>
+            <p style="font-size: 13px; color: var(--text-main); margin-bottom: 14px;">
+                Ein anderer Nutzer hat den QR-Code gescannt und möchte laden. Bist du fertig?
+            </p>
+            <button class="btn-start" style="background: var(--accent-green); margin-bottom: 8px;" onclick="acceptTransfer()">✅ Ja, beenden & freigeben</button>
+            <button class="btn-stop" onclick="rejectTransfer()">Ich lade noch weiter</button>
+        </div>
+    </div>
+
+    <!-- MODAL 3: 100% VOLL ALARM -->
+    <div id="fullModal" class="modal-overlay">
+        <div class="modal-box" style="border: 2px solid var(--accent-green);">
             <div style="font-size: 48px; margin-bottom: 8px;">🔋✨</div>
             <h2 style="font-size: 20px; color: var(--accent-green); margin-bottom: 6px;">Akku 100% Vollgeladen!</h2>
-            <p style="font-size: 14px; color: var(--text-muted); margin-bottom: 12px;">Der Stromfluss wurde automatisch gestoppt.</p>
-            <div style="background: #fef3c7; border: 1px solid #fde68a; color: #92400e; font-size: 13px; font-weight: 600; padding: 10px; border-radius: 12px; margin-bottom: 18px;">
+            <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 12px;">Der Stromfluss wurde automatisch gestoppt.</p>
+            <div style="background: #fef3c7; border: 1px solid #fde68a; color: #92400e; font-size: 13px; font-weight: 600; padding: 10px; border-radius: 12px; margin-bottom: 16px;">
                 ⚠️ Bitte trenne jetzt dein Ladekabel, damit andere die Station nutzen können!
             </div>
-            <button class="btn-start" style="background: var(--accent-green);" onclick="dismissFullAlarm()">🔕 Alarm Stoppen & Quittung anzeigen</button>
+            <button class="btn-start" style="background: var(--accent-green);" onclick="dismissFullAlarm()">🔕 Alarm Stoppen & Quittung</button>
         </div>
     </div>
 
     <div class="container">
-        <!-- HAUPTKARTE -->
+        <!-- BESETZT-KARTE (FÜR NUTZER 2) -->
+        <div class="card busy-card" id="busyCard">
+            <div style="font-size: 48px; margin-bottom: 10px;">⏳🔒</div>
+            <div class="title" style="margin-bottom: 6px;">Steckdose aktuell belegt</div>
+            <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 16px;">
+                Ein anderer Nutzer lädt gerade aktiv an dieser Steckdose.
+            </p>
+            <div style="background: #f1f5f9; padding: 12px; border-radius: 14px; margin-bottom: 16px; text-align: left; font-size: 13px;">
+                Aktuelle Leistung: <b id="busyWatt">0.0 W</b><br>
+                Laufzeit: <b id="busyTimer">00:00:00</b>
+            </div>
+            <button class="btn-start" style="background: var(--accent-primary);" onclick="requestSlot()">🔔 Nutzer anfragen (Bescheid geben)</button>
+            <div id="requestSentText" style="display:none; color: var(--accent-green); font-size: 12px; font-weight: 600; margin-top: 10px;">
+                ✅ Anfrage gesendet! Der aktive Nutzer wurde benachrichtigt.
+            </div>
+        </div>
+
+        <!-- HAUPTKARTE (FÜR NUTZER 1) -->
         <div class="card" id="mainCard">
             <div class="header">
                 <span class="title">⚡ Smart Power Hub</span>
@@ -225,13 +310,18 @@ HTML = """
                 </div>
             </div>
 
-            <!-- DYNAMISCHE GERÄTE-ERKENNUNG -->
+            <!-- KI & LERNEN -->
             <div class="ai-banner">
-                <div class="ai-icon" id="devIcon">🔍</div>
-                <div>
-                    <div class="ai-title" id="evalCycleTitle">Intelligente Erkennung</div>
-                    <div class="ai-detected" id="detectedName">Warte auf Start...</div>
-                    <div class="ai-mode" id="detectedMode">Dauerüberwachung aktiv (Intervall: 60s)</div>
+                <div class="ai-header">
+                    <span class="ai-title">Erkanntes Gerät & Modus</span>
+                    <button class="btn-edit" onclick="document.getElementById('deviceModal').style.display='flex'">✏️ Ändern / Trainieren</button>
+                </div>
+                <div class="ai-body">
+                    <div class="ai-icon" id="devIcon">🔍</div>
+                    <div>
+                        <div class="ai-detected" id="detectedName">Warte auf Start...</div>
+                        <div class="ai-mode" id="detectedMode">Erkennung aktiv (Check alle 60s)</div>
+                    </div>
                 </div>
             </div>
 
@@ -240,12 +330,12 @@ HTML = """
                 <div class="stat-card stat-watt">
                     <div class="stat-label">Leistung</div>
                     <div class="stat-val"><span id="watt">0.0</span> <span style="font-size:13px; font-weight:500;">W</span></div>
-                    <div class="stat-sub" id="wattPeak">Spitze: 0.0 W</div>
+                    <div class="stat-sub" id="wattSub">Kein Strom</div>
                 </div>
                 <div class="stat-card stat-time">
                     <div class="stat-label">Laufzeit</div>
                     <div class="stat-val" id="timer">00:00:00</div>
-                    <div class="stat-sub" id="nextCheckSub">Nächster Check in --s</div>
+                    <div class="stat-sub" id="nextCheckSub">Check in --s</div>
                 </div>
             </div>
 
@@ -264,8 +354,8 @@ HTML = """
             </div>
 
             <div class="btn-group">
-                <button class="btn-start" onclick="startSession()">▶️ Start / Einschalten</button>
-                <button class="btn-stop" onclick="sendAction('/stop')">⏸️ Pause / Ausschalten</button>
+                <button class="btn-start" onclick="startSession()">▶️ Start / Fortsetzen</button>
+                <button class="btn-stop" onclick="sendAction('/stop')">⏸️ Pause</button>
                 <button class="btn-finish" onclick="logout()">🧾 Beenden & Abrechnen</button>
             </div>
         </div>
@@ -278,14 +368,14 @@ HTML = """
                 <div style="font-size: 12px; color: var(--text-muted); margin-top: 3px;">Sitzung erfolgreich beendet</div>
             </div>
 
-            <div class="receipt-row"><span>Erkanntes Gerät:</span> <b id="rDevice">-</b></div>
+            <div class="receipt-row"><span>Gerät:</span> <b id="rDevice">-</b></div>
             <div class="receipt-row"><span>Betriebsart:</span> <b id="rMode">-</b></div>
             <div class="receipt-row"><span>Gesamte Zeit:</span> <b id="rTime">00:00:00</b></div>
             <div class="receipt-row"><span>Verbrauch:</span> <b id="rWh">0.00 Wh</b></div>
             <div class="receipt-row"><span>Verbrauch (kWh):</span> <b id="rKwh">0.0000 kWh</b></div>
             <div class="receipt-row receipt-total"><span>Gesamtbetrag:</span> <span id="rCost" style="color: var(--accent-green);">0,00 €</span></div>
 
-            <button class="btn-start" style="margin-top:20px;" onclick="window.location.reload()">🔄 Neue Sitzung starten</button>
+            <button class="btn-start" style="margin-top:20px;" onclick="window.location.reload()">🔄 Neue Sitzung</button>
         </div>
     </div>
 
@@ -294,11 +384,13 @@ HTML = """
         let alarmInterval = null;
         const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 
-        // Messreihen für minütliche Re-Klassifizierung
         let windowSamples = [];
         let historicalPeakWatt = 0.0;
         let hadHighChargingPhase = false;
         let isBatteryDevice = false;
+        let manualOverride = false;
+        let unpluggedDetected = false;
+        let currentDeviceKey = "lamp";
         let currentClassification = { name: "Warte auf Messung...", icon: "🔍", isBattery: false };
 
         function playContinuousTone() {
@@ -331,13 +423,58 @@ HTML = """
 
         function startSession() {
             if (audioCtx.state === 'suspended') { audioCtx.resume(); }
+            unpluggedDetected = false;
             sendAction('/start');
         }
 
-        async function sendAction(url) {
+        async function sendAction(url, data={}) {
             try {
-                await fetch(url, { cache: 'no-store' });
-            } catch(e) {}
+                let res = await fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(data)
+                });
+                return await res.json();
+            } catch(e) { return {}; }
+        }
+
+        async function saveDeviceProfile(key) {
+            manualOverride = true;
+            currentDeviceKey = key;
+            document.getElementById('deviceModal').style.display = 'none';
+            
+            // Profil an Server zum Trainieren senden
+            await sendAction('/train_profile', { key: key, peak_w: historicalPeakWatt });
+            
+            let prof = {
+                'lamp': { name: "💡 Lampe / Beleuchtung", icon: "💡", isBattery: false },
+                'phone': { name: "📱 Smartphone / Tablet", icon: "📱", isBattery: true },
+                'laptop': { name: "💻 Laptop / Monitor", icon: "💻", isBattery: true },
+                'ebike_std': { name: "🚲 E-Bike Ladegerät (Standard)", icon: "🚲", isBattery: true },
+                'ebike_fast': { name: "⚡ E-Bike Schnelllader / PC", icon: "⚡", isBattery: true },
+                'appliance': { name: "🍳 Großgerät / Dauerbetrieb", icon: "🍳", isBattery: false }
+            }[key];
+
+            currentClassification = prof;
+            isBatteryDevice = prof.isBattery;
+            document.getElementById('devIcon').innerText = prof.icon;
+            document.getElementById('detectedName').innerText = prof.name + " (Bestätigt)";
+            document.getElementById('detectedMode').innerText = isBatteryDevice ? "🔋 Akku (Auto-Stop bei 100%)" : "💡 Dauerbetrieb (Kein Auto-Stop)";
+        }
+
+        async function requestSlot() {
+            await sendAction('/request_transfer');
+            document.getElementById('requestSentText').style.display = 'block';
+        }
+
+        async function acceptTransfer() {
+            document.getElementById('transferModal').style.display = 'none';
+            await logout();
+        }
+
+        async function rejectTransfer() {
+            document.getElementById('transferModal').style.display = 'none';
+            await sendAction('/reject_transfer');
         }
 
         async function dismissFullAlarm() {
@@ -346,39 +483,36 @@ HTML = """
             await logout();
         }
 
-        // Klassifizierungs-Engine
         function evaluateProfile(avgW, peakW) {
-            if (avgW < 2.5 && peakW < 3.5) {
-                return { name: "Standby / Kein aktives Gerät", icon: "🔌", isBattery: false };
-            } else if (avgW >= 2.5 && avgW < 18.0) {
-                return { name: "📱 Smartphone / LED-Lampe", icon: "📱", isBattery: true };
-            } else if (avgW >= 18.0 && avgW < 45.0) {
-                return { name: "📟 Tablet / Beleuchtung", icon: "📟", isBattery: true };
-            } else if (avgW >= 45.0 && avgW < 110.0) {
-                return { name: "💻 Laptop / Monitor", icon: "💻", isBattery: true };
-            } else if (avgW >= 110.0 && avgW < 260.0) {
+            if (avgW < 2.0 && peakW < 3.0) {
+                return { name: "Standby / Leerlauf", icon: "🔌", isBattery: false };
+            } else if (avgW >= 2.0 && avgW < 35.0) {
+                return { name: "💡 Lampe / 📱 Smartphone", icon: "💡", isBattery: false };
+            } else if (avgW >= 35.0 && avgW < 100.0) {
+                return { name: "💻 Laptop / Bildschirm", icon: "💻", isBattery: true };
+            } else if (avgW >= 100.0 && avgW < 250.0) {
                 return { name: "🚲 E-Bike Ladegerät (Standard)", icon: "🚲", isBattery: true };
-            } else if (avgW >= 260.0 && avgW < 600.0) {
+            } else if (avgW >= 250.0 && avgW < 600.0) {
                 return { name: "⚡ E-Bike Schnelllader / PC", icon: "⚡", isBattery: true };
             } else {
-                return { name: "🍳 Dauerbetrieb / Haushaltsgerät", icon: "🍳", isBattery: false };
+                return { name: "🍳 Großverbraucher / Dauerbetrieb", icon: "🍳", isBattery: false };
             }
         }
 
         async function logout() {
             isTerminated = true;
             try {
-                let res = await fetch('/logout', { cache: 'no-store' });
-                let report = await res.json();
+                let report = await sendAction('/logout');
                 
                 document.getElementById('rDevice').innerText = currentClassification.icon + " " + currentClassification.name;
-                document.getElementById('rMode').innerText = currentClassification.isBattery ? "Akku-Ladeüberwachung (Auto-Stop)" : "Dauerbetrieb ohne Auto-Stop";
+                document.getElementById('rMode').innerText = currentClassification.isBattery ? "Akku-Ladeüberwachung" : "Dauerbetrieb";
                 document.getElementById('rTime').innerText = report.time_formatted;
                 document.getElementById('rWh').innerText = report.wh.toFixed(2) + " Wh";
                 document.getElementById('rKwh').innerText = report.kwh.toFixed(4) + " kWh";
                 document.getElementById('rCost').innerText = report.cost.toFixed(3).replace('.', ',') + " €";
                 
                 document.getElementById('mainCard').style.display = 'none';
+                document.getElementById('busyCard').style.display = 'none';
                 document.getElementById('receiptCard').style.display = 'block';
             } catch(e) {
                 isTerminated = false;
@@ -391,6 +525,27 @@ HTML = """
                 let res = await fetch('/status', { cache: 'no-store' });
                 let data = await res.json();
                 
+                // MULTI-USER CHECK
+                if (data.is_busy_for_other) {
+                    document.getElementById('mainCard').style.display = 'none';
+                    document.getElementById('busyCard').style.display = 'block';
+                    document.getElementById('busyWatt').innerText = data.watt.toFixed(1) + " W";
+                    let sec = data.elapsed_seconds;
+                    let h = Math.floor(sec / 3600).toString().padStart(2, '0');
+                    let m = Math.floor((sec % 3600) / 60).toString().padStart(2, '0');
+                    let s = Math.floor(sec % 60).toString().padStart(2, '0');
+                    document.getElementById('busyTimer').innerText = `${h}:${m}:${s}`;
+                    return;
+                } else {
+                    document.getElementById('busyCard').style.display = 'none';
+                    document.getElementById('mainCard').style.display = 'block';
+                }
+
+                // ANFRAGE DES ANDEREN NUTZERS ERHALTEN?
+                if (data.transfer_requested) {
+                    document.getElementById('transferModal').style.display = 'flex';
+                }
+
                 let currentW = data.watt;
                 document.getElementById('watt').innerText = currentW.toFixed(1);
                 document.getElementById('wh').innerText = data.wh.toFixed(2);
@@ -406,62 +561,79 @@ HTML = """
                 let text = document.getElementById('statusText');
                 
                 if (data.active) {
-                    badge.className = "status-pill status-on";
-                    text.innerText = "Aktiv / Strom fließt";
-
                     windowSamples.push(currentW);
                     if (currentW > historicalPeakWatt) historicalPeakWatt = currentW;
-                    document.getElementById('wattPeak').innerText = `Spitze: ${historicalPeakWatt.toFixed(1)} W`;
 
                     if (historicalPeakWatt > 6.0 && currentW > 5.0) {
                         hadHighChargingPhase = true;
                     }
 
-                    // Jede volle Minute (oder nach den ersten 30s) Re-Klassifizierung
-                    let secInMinute = sec % 60;
-                    let nextCheck = 60 - secInMinute;
-                    document.getElementById('nextCheckSub').innerText = `Prüfe Profil in ${nextCheck}s`;
-
-                    if (sec >= 30 && (sec === 30 || secInMinute === 0)) {
-                        let avg = windowSamples.reduce((a, b) => a + b, 0) / windowSamples.length;
-                        let peak = Math.max(...windowSamples);
-                        
-                        currentClassification = evaluateProfile(avg, peak);
-                        isBatteryDevice = currentClassification.isBattery;
-
-                        document.getElementById('devIcon').innerText = currentClassification.icon;
-                        document.getElementById('detectedName').innerText = currentClassification.name;
-                        document.getElementById('detectedMode').innerText = isBatteryDevice 
-                            ? "🔋 Akku erkannt (Auto-Stop bei 100%)" 
-                            : "💡 Dauerbetrieb (Kein Auto-Stop)";
-                        
-                        windowSamples = []; // Reset für das nächste Minutenfenster
-                    } else if (sec < 30) {
-                        document.getElementById('detectedName').innerText = `Analysiere Last... (${30 - sec}s)`;
+                    // 1. UNPLUG-ERKENNUNG (Kabel gezogen -> Strom schlagartig 0)
+                    if (sec > 5 && hadHighChargingPhase && currentW < 0.3) {
+                        unpluggedDetected = true;
+                        await sendAction('/stop');
+                        badge.className = "status-pill status-unplug";
+                        text.innerText = "🔌 Kabel ausgesteckt (Pausiert)";
+                        document.getElementById('wattSub').innerText = "Warte auf Wiedereinstecken";
+                        return;
                     }
 
-                    // 100% VOLLGELADEN-ERKENNUNG BEI AKKUS
-                    // Wenn ein Akku-Gerät zuvor geladen hat und die Leistung nun auf < 2.0 W fällt
-                    if (isBatteryDevice && hadHighChargingPhase && currentW < 2.2 && data.wh > 2.0) {
-                        // Sofort Steckdose ausschalten
+                    badge.className = "status-pill status-on";
+                    text.innerText = "Aktiv / Strom fließt";
+                    document.getElementById('wattSub').innerText = currentW > 0.5 ? "Fließt stabil" : "Keine Last";
+
+                    // Re-Klassifizierung alle 60s (wenn nicht manuell überschrieben)
+                    let secInMinute = sec % 60;
+                    let nextCheck = 60 - secInMinute;
+                    document.getElementById('nextCheckSub').innerText = `Check in ${nextCheck}s`;
+
+                    if (!manualOverride) {
+                        if (sec >= 30 && (sec === 30 || secInMinute === 0)) {
+                            let avg = windowSamples.reduce((a, b) => a + b, 0) / windowSamples.length;
+                            let peak = Math.max(...windowSamples);
+                            
+                            currentClassification = evaluateProfile(avg, peak);
+                            isBatteryDevice = currentClassification.isBattery;
+
+                            document.getElementById('devIcon').innerText = currentClassification.icon;
+                            document.getElementById('detectedName').innerText = currentClassification.name;
+                            document.getElementById('detectedMode').innerText = isBatteryDevice 
+                                ? "🔋 Akku (Auto-Stop bei 100%)" 
+                                : "💡 Dauerbetrieb (Kein Auto-Stop)";
+                            
+                            windowSamples = [];
+                        } else if (sec < 30) {
+                            document.getElementById('detectedName').innerText = `Analysiere... (${30 - sec}s)`;
+                        }
+                    }
+
+                    // 2. 100% VOLLGELADEN BEI AKKUS
+                    if (isBatteryDevice && hadHighChargingPhase && currentW < 2.0 && data.wh > 2.0 && !unpluggedDetected) {
                         await sendAction('/stop');
                         document.getElementById('fullModal').style.display = 'flex';
                         startAudioAlert();
                     }
 
                 } else {
-                    badge.className = "status-pill status-off";
-                    text.innerText = "Pausiert / Bereit";
+                    if (unpluggedDetected) {
+                        badge.className = "status-pill status-unplug";
+                        text.innerText = "🔌 Kabel gezogen – Pausiert";
+                    } else {
+                        badge.className = "status-pill status-off";
+                        text.innerText = "Pausiert / Bereit";
+                    }
+                    
                     if (sec === 0) {
                         document.getElementById('detectedName').innerText = "Warte auf Start...";
                         document.getElementById('devIcon').innerText = "🔍";
                         windowSamples = [];
                         historicalPeakWatt = 0;
                         hadHighChargingPhase = false;
+                        manualOverride = false;
                     }
                 }
 
-                // Balken Animationen
+                // Balken
                 let whP = Math.min(100, (data.wh / 500.0) * 100);
                 document.getElementById('whBar').style.width = whP + '%';
 
@@ -487,35 +659,61 @@ def get_user_data():
             "last_check": None,
             "current_watt": 0.0
         }
-    return user_sessions[uid]
+    return user_sessions[uid], uid
 
 @app.route('/')
 def home():
     get_user_data()
     return render_template_string(HTML)
 
-@app.route('/start')
+@app.route('/start', methods=['POST', 'GET'])
 def start():
-    u = get_user_data()
+    u, uid = get_user_data()
+    global_state["active_user_id"] = uid
+    global_state["last_seen_active"] = time.time()
     u["active"] = True
     u["last_check"] = time.time()
     cloud_control(turn_on=True)
     return jsonify({"status": "ok"})
 
-@app.route('/stop')
+@app.route('/stop', methods=['POST', 'GET'])
 def stop():
-    u = get_user_data()
+    u, _ = get_user_data()
     u["active"] = False
     u["last_check"] = None
     u["current_watt"] = 0.0
     cloud_control(turn_on=False)
     return jsonify({"status": "ok"})
 
-@app.route('/logout')
+@app.route('/train_profile', methods=['POST'])
+def train_profile():
+    data = request.get_json() or {}
+    key = data.get("key")
+    peak_w = float(data.get("peak_w", 0.0))
+    if key in learned_profiles and peak_w > 0:
+        # Dynamisches Anpassen der gelernten Watt-Grenzen
+        learned_profiles[key]["max_w"] = max(learned_profiles[key]["max_w"], peak_w * 1.2)
+    return jsonify({"status": "trained"})
+
+@app.route('/request_transfer', methods=['POST'])
+def request_transfer():
+    global_state["request_transfer"] = True
+    return jsonify({"status": "requested"})
+
+@app.route('/reject_transfer', methods=['POST'])
+def reject_transfer():
+    global_state["request_transfer"] = False
+    return jsonify({"status": "rejected"})
+
+@app.route('/logout', methods=['POST', 'GET'])
 def logout():
-    u = get_user_data()
+    u, uid = get_user_data()
     u["active"] = False
     cloud_control(turn_on=False)
+
+    if global_state["active_user_id"] == uid:
+        global_state["active_user_id"] = None
+        global_state["request_transfer"] = False
 
     sec = u["total_seconds"]
     h = str(sec // 3600).zfill(2)
@@ -529,7 +727,6 @@ def logout():
         "cost": u["total_kwh"] * STROMPREIS_PER_KWH
     }
 
-    uid = session.get("user_id")
     if uid in user_sessions:
         del user_sessions[uid]
     session.clear()
@@ -538,11 +735,19 @@ def logout():
 
 @app.route('/status')
 def status():
-    u = get_user_data()
+    u, uid = get_user_data()
+    active_uid = global_state.get("active_user_id")
+    
+    # Ist ein anderer Nutzer gerade aktiv?
+    is_busy = False
+    if active_uid and active_uid != uid and user_sessions.get(active_uid, {}).get("active", False):
+        is_busy = True
+
     if u["active"]:
         now = time.time()
         w = cloud_get_watt()
         u["current_watt"] = w
+        global_state["last_seen_active"] = now
         
         if u["last_check"]:
             dt = now - u["last_check"]
@@ -560,7 +765,9 @@ def status():
         "wh": u["total_kwh"] * 1000.0,
         "kwh": u["total_kwh"],
         "cost": u["total_kwh"] * STROMPREIS_PER_KWH,
-        "elapsed_seconds": u["total_seconds"]
+        "elapsed_seconds": u["total_seconds"],
+        "is_busy_for_other": is_busy,
+        "transfer_requested": global_state.get("request_transfer", False) and (active_uid == uid)
     })
 
 if __name__ == '__main__':
