@@ -42,7 +42,6 @@ SMTP_PASSWORD = ""
 
 AI_MODEL_FILE = "ai_learned_models.json"
 
-# Basis-Muster (wird durch jeden Nutzer verfeinert)
 DEFAULT_AI_PROFILES = {
     "lamp": {"avg_w": 1.2, "peak_w": 2.0, "variance": 0.1, "count": 1},
     "phone": {"name": "📱 Smartphone / Tablet", "avg_w": 12.0, "peak_w": 18.0, "variance": 4.5, "count": 1},
@@ -61,7 +60,6 @@ DEVICE_PROFILES = {
     "appliance": {"name": "🍳 Großgerät / Dauerbetrieb", "icon": "🍳", "is_battery": False, "capacity_wh": 0}
 }
 
-# --- AI SCHWARMWISSEN LADEN & SPEICHERN ---
 def load_ai_models():
     if os.path.exists(AI_MODEL_FILE):
         try:
@@ -82,6 +80,8 @@ def get_total_learned_count():
     models = load_ai_models()
     return sum(m.get("count", 1) for m in models.values())
 
+learned_models = load_ai_models()
+
 global_state = {
     "active_user_id": None,
     "transfer_requested": False,
@@ -93,7 +93,7 @@ global_state = {
 
 user_sessions = {}
 
-# Sichert den Zähler-Thread gegen den Server-Tod ab
+# Verhindert mehrfaches Starten des Background-Workers
 WORKER_STARTED = False
 WORKER_LOCK = threading.Lock()
 
@@ -110,8 +110,6 @@ def add_security_headers(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, private, max-age=0"
     response.headers["Pragma"] = "no-cache"
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
     return response
 
 def check_authenticated():
@@ -156,11 +154,9 @@ def extract_features(samples):
     var_w = math.sqrt(sum((x - avg_w) ** 2 for x in samples) / len(samples))
     return avg_w, peak_w, var_w
 
-# KI-Klassifizierung mit frisch geladenem Schwarmwissen
 def ai_classify_samples(samples):
     if not samples or max(samples) < 2.0:
         return "lamp"
-    
     avg_w, peak_w, var_w = extract_features(samples)
     current_models = load_ai_models()
 
@@ -176,7 +172,6 @@ def ai_classify_samples(samples):
             best_key = key
     return best_key
 
-# Dynamisches Lernen (User Feedback fließt ins globale Wissen ein)
 def ai_learn_from_feedback(correct_key, samples):
     if not samples:
         return
@@ -186,18 +181,15 @@ def ai_learn_from_feedback(correct_key, samples):
     avg_w, peak_w, var_w = extract_features(samples)
     m = current_models[correct_key]
     n = m.get("count", 1)
-    
-    # Exponentieller gleitender Durchschnitt (die KI passt sich stetig an)
     learning_rate = 1.0 / min(n + 1, 10)
     m["avg_w"] = (1.0 - learning_rate) * m["avg_w"] + learning_rate * avg_w
     m["peak_w"] = (1.0 - learning_rate) * m["peak_w"] + learning_rate * peak_w
     m["variance"] = (1.0 - learning_rate) * m["variance"] + learning_rate * var_w
     m["count"] = n + 1
-    
     save_ai_models(current_models)
 
 # ------------------------------------------------------------------------------
-# HERZSTÜCK: Der autarke Server-Hintergrund-Prozess (100% Sicher vor Resets)
+# ZENTRALER HERZSCHLAG (100% zuverlässiger Zähler & schnelle UI)
 # ------------------------------------------------------------------------------
 def background_meter_worker():
     last_loop = time.time()
@@ -206,50 +198,43 @@ def background_meter_worker():
         dt = now - last_loop
         last_loop = now
         
-        # Abfangen von Lags
         if dt < 0 or dt > 5:
             dt = 1.0
 
         try:
+            # Ständige Abfrage der Shelly Cloud (Nur 1x pro Sekunde für den gesamten Server!)
+            watt, amp, volt = 0.0, 0.0, 230.0
+            payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID}
+            res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=2.0).json()
+            if res.get("isok"):
+                status = res.get("data", {}).get("device_status", {})
+                if "switch:0" in status:
+                    watt = float(status["switch:0"].get("apower", 0.0))
+                    amp = float(status["switch:0"].get("current", 0.0))
+                    volt = float(status["switch:0"].get("voltage", 230.0))
+                elif "meters" in status and len(status["meters"]) > 0:
+                    watt = float(status["meters"][0].get("power", 0.0))
+                    amp = float(status["meters"][0].get("current", 0.0)) if "current" in status["meters"][0] else (watt / 230.0 if watt > 0 else 0.0)
+                    volt = float(status["meters"][0].get("voltage", 230.0)) if "voltage" in status["meters"][0] else 230.0
+
+            global_state["last_watt"] = watt
+            global_state["last_amp"] = amp
+            global_state["last_volt"] = volt
+
             active_uid = global_state.get("active_user_id")
             if active_uid and active_uid in user_sessions:
                 u = user_sessions[active_uid]
                 
-                # Zähler läuft unaufhörlich weiter, sofern Sitzung aktiv!
+                u["current_watt"] = watt
+                u["current_ampere"] = amp
+                u["current_voltage"] = volt
+
                 if u.get("active", False):
+                    # EXAKTES ZÄHLEN DES STROMS OHNE UNTERBRECHUNG
                     u["total_seconds"] += dt
-                    
-                    watt = u.get("current_watt", 0.0)
-                    amp = u.get("current_ampere", 0.0)
-                    volt = u.get("current_voltage", 230.0)
-
-                    try:
-                        payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID}
-                        res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=2.0).json()
-                        if res.get("isok"):
-                            status = res.get("data", {}).get("device_status", {})
-                            if "switch:0" in status:
-                                watt = float(status["switch:0"].get("apower", 0.0))
-                                amp = float(status["switch:0"].get("current", 0.0))
-                                volt = float(status["switch:0"].get("voltage", 230.0))
-                            elif "meters" in status and len(status["meters"]) > 0:
-                                watt = float(status["meters"][0].get("power", 0.0))
-                                amp = float(status["meters"][0].get("current", 0.0)) if "current" in status["meters"][0] else (watt / 230.0 if watt > 0 else 0.0)
-                                volt = float(status["meters"][0].get("voltage", 230.0)) if "voltage" in status["meters"][0] else 230.0
-                    except Exception:
-                        pass # Bei API-Fehlern zählen die alten Werte nahtlos weiter
-
-                    u["current_watt"] = watt
-                    u["current_ampere"] = amp
-                    u["current_voltage"] = volt
-                    global_state["last_watt"] = watt
-                    global_state["last_amp"] = amp
-                    global_state["last_volt"] = volt
-
-                    # Energie aufaddieren
                     u["total_kwh"] += (watt * dt) / 3600000.0
 
-                    # 1. AI-ANALYSE (Sammelt Daten 30s lang, ohne den Zähler zu berühren)
+                    # 1. AI-ANALYSE IN DEN ERSTEN 30 SEKUNDEN
                     if u["total_seconds"] < 30.0 and not u["manually_selected"]:
                         if watt > 0.5:
                             u["analysis_samples"].append(watt)
@@ -257,7 +242,7 @@ def background_meter_worker():
                         u["device_key"] = ai_classify_samples(u["analysis_samples"])
                         u["analysis_completed"] = True
 
-                    # 2. AUSSTECK-ERKENNUNG (Zieht erst nach echten 15 Sekunden Leerlauf)
+                    # 2. STABILE UNPLUG-ERKENNUNG (Zieht erst nach echten 15 Sekunden Leerlauf)
                     if watt > 1.0:
                         u["had_power_draw"] = True
                         u["zero_power_counter"] = 0.0
@@ -272,7 +257,7 @@ def background_meter_worker():
                     elif watt >= 0.3:
                         u["zero_power_counter"] = 0.0
 
-                    # 3. AKKU 100% ERKENNUNG (Erst nach aktiver Ladephase)
+                    # 3. AKKU 100% ERKENNUNG
                     prof = DEVICE_PROFILES.get(u["device_key"], {})
                     if prof.get("is_battery", False) and u["total_seconds"] > 60.0:
                         if watt > 6.0:
@@ -597,9 +582,9 @@ HTML_PAGE = """
             <div style="font-size: 40px; margin-bottom: 6px;">👋🔔</div>
             <h3 style="color: var(--accent-amber); margin-bottom: 6px;">Freigabe-Anfrage</h3>
             <p style="font-size: 13px; color: var(--text-main); margin-bottom: 14px;">
-                Ein anderer Nutzer hat den QR-Code gescannt und möchte laden. Möchtest du die Steckdose jetzt überlassen?
+                Ein anderer Nutzer hat den QR-Code gescannt und möchte laden. Möchtest du die Steckdose jetzt übergeben?
             </p>
-            <button class="btn-start" style="background: var(--accent-green); margin-bottom: 8px;" onclick="acceptTransfer()">✅ Ja, überlassen</button>
+            <button class="btn-start" style="background: var(--accent-green); margin-bottom: 8px;" onclick="acceptTransfer()">✅ Ja, Steckdose übergeben</button>
             <button class="btn-stop" onclick="rejectTransfer()">Nein, ich nutze weiter</button>
         </div>
     </div>
@@ -656,9 +641,9 @@ HTML_PAGE = """
                 Bisherige Kosten: <b id="pauseCost">0.00000 €</b>
             </div>
             <p style="font-size: 12px; color: var(--accent-primary); font-weight: 600; margin-bottom: 12px;">
-                Sobald die Station wieder frei ist, kannst du hier direkt fortsetzen.
+                Sobald die Station wieder frei ist, wirst du automatisch hierher zurückgeleitet und kannst fortsetzen!
             </p>
-            <button class="btn-finish" onclick="finalizeTermination()">🛑 Jetzt doch endgültig beenden & abrechnen</button>
+            <button class="btn-finish" onclick="finalizeTermination()">🛑 Jetzt endgültig beenden & abrechnen</button>
         </div>
 
         <!-- HAUPTKARTE -->
@@ -676,7 +661,7 @@ HTML_PAGE = """
                 </div>
             </div>
 
-            <!-- GERÄTE ERKENNUNG (NUN MIT SCHWARMWISSEN) -->
+            <!-- GERÄTE ERKENNUNG -->
             <div class="ai-banner">
                 <div class="ai-header">
                     <span class="ai-title" id="aiStatusTitle">AI Erkennung</span>
@@ -777,11 +762,6 @@ HTML_PAGE = """
                 <button class="btn-stop" style="font-size:13px; padding:8px; margin-top:6px;" onclick="downloadInvoicePdf()">📥 PDF direkt herunterladen</button>
                 <div id="emailFeedback" style="display:none; font-size:12px; font-weight:600; margin-top:8px;"></div>
             </div>
-
-            <div id="transferChoiceBox" style="margin-top: 16px; display: flex; flex-direction: column; gap: 8px;">
-                <button class="btn-stop" style="background: #e0f2fe; color: #0369a1; border-color: #bae6fd;" onclick="setWaitingMode()">⏳ Sitzung pausieren (Warten bis anderer Nutzer fertig ist)</button>
-                <button class="btn-finish" style="font-size: 14px;" onclick="finalizeTermination()">🛑 Endgültig beenden & Finales PDF</button>
-            </div>
         </div>
     </div>
 
@@ -822,7 +802,7 @@ HTML_PAGE = """
             document.getElementById('statusBadge').className = "status-pill status-on";
             document.getElementById('statusText').innerText = "Aktiv / Strom fließt";
             await sendAction('/start');
-            setTimeout(fetchSyncData, 100);
+            fetchSyncData();
         }
 
         async function pauseSession() {
@@ -830,7 +810,7 @@ HTML_PAGE = """
             document.getElementById('statusBadge').className = "status-pill status-off";
             document.getElementById('statusText').innerText = "Pausiert / Bereit";
             await sendAction('/stop');
-            setTimeout(fetchSyncData, 100);
+            fetchSyncData();
         }
 
         async function saveDeviceProfile(key) {
@@ -868,7 +848,10 @@ HTML_PAGE = """
         async function acceptTransfer() {
             transferModalOpen = false;
             document.getElementById('transferModal').style.display = 'none';
-            await logout(false);
+            // Direkter Handover
+            let res = await sendAction('/accept_transfer');
+            lastReport = res.report;
+            setWaitingMode();
         }
 
         async function rejectTransfer() {
@@ -899,9 +882,6 @@ HTML_PAGE = """
                 if (finalTerminate) {
                     isTerminated = true;
                     document.getElementById('receiptSubtitle').innerText = "Sitzung endgültig abgeschlossen";
-                    document.getElementById('transferChoiceBox').style.display = 'none';
-                } else {
-                    document.getElementById('transferChoiceBox').style.display = 'flex';
                 }
             } catch(e) {}
         }
@@ -925,7 +905,6 @@ HTML_PAGE = """
             await sendAction('/finalize');
             document.getElementById('pauseWaitCard').style.display = 'none';
             document.getElementById('receiptSubtitle').innerText = "Sitzung endgültig abgeschlossen";
-            document.getElementById('transferChoiceBox').style.display = 'none';
             document.getElementById('receiptCard').style.display = 'block';
         }
 
@@ -962,6 +941,7 @@ HTML_PAGE = """
             window.open('/download_invoice', '_blank');
         }
 
+        // Blitzschnelles lokales UI Update
         async function fetchSyncData() {
             if (isTerminated) return;
             try {
@@ -976,20 +956,20 @@ HTML_PAGE = """
                     return;
                 }
 
-                if (data.is_paused_by_transfer && !isWaitingForResume && document.getElementById('receiptCard').style.display !== 'block') {
-                    await logout(false);
-                    return;
-                }
-
+                // Warteraum Logik für Nutzer A
                 if (isWaitingForResume) {
                     if (!data.is_busy_for_other) {
+                        // Steckdose wurde von Nutzer B freigegeben -> Nutzer A kann direkt fortsetzen!
                         isWaitingForResume = false;
                         document.getElementById('pauseWaitCard').style.display = 'none';
                         document.getElementById('mainCard').style.display = 'block';
+                        document.getElementById('statusBadge').className = "status-pill status-off";
+                        document.getElementById('statusText').innerText = "Bereit zum Fortsetzen";
                     }
                     return;
                 }
 
+                // Besetzt Logik für neuen Nutzer
                 if (data.is_busy_for_other) {
                     document.getElementById('mainCard').style.display = 'none';
                     document.getElementById('receiptCard').style.display = 'none';
@@ -1027,7 +1007,7 @@ HTML_PAGE = """
                 document.getElementById('cost').innerText = data.cost.toFixed(5);
                 document.getElementById('microCost').innerText = (data.cost * 100.0).toFixed(3);
 
-                // --- AI SCHWARMWISSEN DISPLAY UPDATE ---
+                // AI Lern-Feedback
                 if (data.active && sec < 30 && !data.manually_selected) {
                     let remain = 30 - sec;
                     document.getElementById('aiStatusTitle').innerText = `Schwarm-Analyse (${data.ai_learned_count} Profile)`;
@@ -1038,7 +1018,7 @@ HTML_PAGE = """
                     document.getElementById('aiStatusTitle').innerText = `Vom Nutzer angelernt`;
                 }
 
-                // Batterie Update
+                // Batterie-Anzeige & Pop-ups
                 if (data.current_profile && data.current_profile.is_battery) {
                     let cap = data.current_profile.capacity_wh || 20.0;
                     let pct = data.battery_pct;
@@ -1056,6 +1036,7 @@ HTML_PAGE = """
                 let statusText = document.getElementById('statusText');
                 let startBtn = document.getElementById('mainStartBtn');
 
+                // UNPLUG ERKENNUNG
                 if (data.unplugged_detected) {
                     badge.className = "status-pill status-unplug";
                     statusText.innerText = "🔌 Kabel ausgesteckt – Strom gestoppt";
@@ -1156,24 +1137,16 @@ def scan_qr_entry(token):
 @app.route('/start', methods=['POST', 'GET'])
 @require_physical_auth
 def start():
-    ensure_worker() # Stellt sicher, dass der Background-Zähler immer lebt!
-    
+    ensure_worker()
     u, uid = get_user_data()
+    
     if u.get("terminated", False):
         return jsonify({"status": "forbidden"}), 403
 
     active_uid = global_state.get("active_user_id")
     if active_uid and active_uid != uid:
-        other_user = user_sessions.get(active_uid, {})
-        if other_user.get("active", False) and not other_user.get("terminated", False):
-            return jsonify({"status": "busy"})
+        return jsonify({"status": "busy"})
         
-    if active_uid and active_uid != uid:
-        prev_user = user_sessions.get(active_uid)
-        if prev_user:
-            prev_user["active"] = False
-            prev_user["paused_by_transfer"] = True
-
     global_state["active_user_id"] = uid
     global_state["transfer_requested"] = False
     global_state["transfer_requester_id"] = None
@@ -1190,7 +1163,6 @@ def start():
 @require_physical_auth
 def stop():
     ensure_worker()
-    
     u, uid = get_user_data()
     if u.get("terminated", False) or global_state.get("active_user_id") != uid:
         return jsonify({"status": "forbidden"}), 403
@@ -1233,6 +1205,42 @@ def request_transfer():
         global_state["transfer_requester_id"] = uid
     return jsonify({"status": "requested"})
 
+# NEUE ROUTE: Perfekter Handover direkt von Nutzer A an Nutzer B
+@app.route('/accept_transfer', methods=['POST'])
+@require_physical_auth
+def accept_transfer():
+    u, uid = get_user_data()
+    requester = global_state.get("transfer_requester_id")
+    
+    u["active"] = False
+    u["paused_by_transfer"] = True
+    async_cloud_control(turn_on=False)
+    
+    # Nutzer B bekommt sofort den Slot
+    if requester:
+        global_state["active_user_id"] = requester
+    else:
+        global_state["active_user_id"] = None
+        
+    global_state["transfer_requested"] = False
+    global_state["transfer_requester_id"] = None
+    
+    sec = int(u["total_seconds"])
+    h = str(sec // 3600).zfill(2)
+    m = str((sec % 3600) // 60).zfill(2)
+    s = str(sec % 60).zfill(2)
+    invoice_num = f"RE-{time.strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}"
+
+    report = {
+        "invoice_id": invoice_num,
+        "time_formatted": f"{h}:{m}:{s}",
+        "wh": u["total_kwh"] * 1000.0,
+        "kwh": u["total_kwh"],
+        "cost": u["total_kwh"] * STROMPREIS_PER_KWH
+    }
+    u["last_report"] = report
+    return jsonify({"status": "ok", "report": report})
+
 @app.route('/reject_transfer', methods=['POST'])
 @require_physical_auth
 def reject_transfer():
@@ -1248,19 +1256,16 @@ def logout():
     final_terminate = data.get("final", False)
 
     u["active"] = False
-
     if final_terminate:
         u["terminated"] = True
-        u["paused_by_transfer"] = False
-    else:
-        u["paused_by_transfer"] = True
 
-    async_cloud_control(turn_on=False)
-
+    # Gibt den Slot für andere/wartende Nutzer frei
     if global_state["active_user_id"] == uid:
         global_state["active_user_id"] = None
         global_state["transfer_requested"] = False
         global_state["transfer_requester_id"] = None
+
+    async_cloud_control(turn_on=False)
 
     sec = int(u["total_seconds"])
     h = str(sec // 3600).zfill(2)
@@ -1353,7 +1358,7 @@ def send_email_invoice():
 @app.route('/status')
 @require_physical_auth
 def status():
-    ensure_worker() # Stellt sicher, dass der Background-Zähler immer lebt
+    ensure_worker()
     
     u, uid = get_user_data()
     active_uid = global_state.get("active_user_id")
@@ -1364,10 +1369,8 @@ def status():
     is_busy = False
     global_w = 0.0
     if active_uid and active_uid != uid:
-        other = user_sessions.get(active_uid, {})
-        if other.get("active", False) and not other.get("terminated", False):
-            is_busy = True
-            global_w = global_state["last_watt"]
+        is_busy = True
+        global_w = global_state["last_watt"]
 
     dev_key = u.get("device_key", "lamp")
     prof = DEVICE_PROFILES.get(dev_key, DEVICE_PROFILES["lamp"])
@@ -1406,7 +1409,7 @@ def status():
     return jsonify({
         "active": u["active"] and (active_uid == uid),
         "unplugged_detected": u.get("unplugged_detected", False),
-        "watt": u.get("current_watt", 0.0),
+        "watt": u.get("current_watt", 0.0) if (active_uid == uid) else 0.0,
         "current_ampere": u.get("current_ampere", 0.0),
         "voltage": u.get("current_voltage", 230.0),
         "global_watt": global_w,
@@ -1415,7 +1418,7 @@ def status():
         "cost": u["total_kwh"] * STROMPREIS_PER_KWH,
         "elapsed_seconds": int(u["total_seconds"]),
         "is_busy_for_other": is_busy,
-        "is_paused_by_transfer": u.get("paused_by_transfer", False) and (active_uid != uid),
+        "is_paused_by_transfer": u.get("paused_by_transfer", False),
         "transfer_requested": global_state.get("transfer_requested", False) and (active_uid == uid),
         "current_profile_key": dev_key,
         "current_profile": prof,
@@ -1425,7 +1428,7 @@ def status():
         "analysis_completed": u.get("analysis_completed", False),
         "manually_selected": u.get("manually_selected", False),
         "session_terminated": False,
-        "ai_learned_count": get_total_learned_count() # Schwarmwissen Zähler für UI
+        "ai_learned_count": get_total_learned_count()
     })
 
 if __name__ == '__main__':
