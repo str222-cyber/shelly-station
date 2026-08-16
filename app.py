@@ -4,31 +4,34 @@ import time
 import uuid
 
 app = Flask(__name__)
-app.secret_key = "shelly_smart_unplug_10s_verified_2026"
+app.secret_key = "shelly_smart_hub_stable_multiuser_v4"
 
-# --- SHELLY CLOUD DATEN ---
+# --- SHELLY CLOUD KONFIGURATION ---
 SHELLY_CLOUD_URL = "https://shelly-274-eu.shelly.cloud"
 AUTH_KEY = "NDcwMzFkdWlkF9839F81801CF17665B14F2EED9BDC41514AEAB2C6C041201D306ABBC40BDE2A0AD2F80ACE98C596"
 DEVICE_ID = "08927249a904"
 
 STROMPREIS_PER_KWH = 0.35
 
+# Globaler Zustand für Multi-User Management & dauerhaftes Gerätelernen
 global_state = {
     "active_user_id": None,
-    "waiting_user_id": None,
-    "request_transfer": False,
-    "last_seen_active": 0
+    "active_since": 0,
+    "transfer_requested": False,
+    "transfer_requester_id": None,
+    "last_device_key": "lamp"  # Standardmäßig Lampe als gelerntes Standardgerät
 }
 
 user_sessions = {}
 
-learned_profiles = {
-    "lamp": {"name": "💡 Lampe / Beleuchtung", "icon": "💡", "min_w": 2.0, "max_w": 40.0, "is_battery": False},
-    "phone": {"name": "📱 Smartphone / Tablet", "icon": "📱", "min_w": 4.0, "max_w": 35.0, "is_battery": True},
-    "laptop": {"name": "💻 Laptop / Monitor", "icon": "💻", "min_w": 35.0, "max_w": 100.0, "is_battery": True},
-    "ebike_std": {"name": "🚲 E-Bike Ladegerät (Standard)", "icon": "🚲", "min_w": 100.0, "max_w": 250.0, "is_battery": True},
-    "ebike_fast": {"name": "⚡ E-Bike Schnelllader / PC", "icon": "⚡", "min_w": 250.0, "max_w": 600.0, "is_battery": True},
-    "appliance": {"name": "🍳 Dauerbetrieb / Großgerät", "icon": "🍳", "min_w": 600.0, "max_w": 3500.0, "is_battery": False}
+# Geräteprofile
+DEVICE_PROFILES = {
+    "lamp": {"name": "💡 Lampe / Beleuchtung", "icon": "💡", "is_battery": False},
+    "phone": {"name": "📱 Smartphone / Tablet", "icon": "📱", "is_battery": True},
+    "laptop": {"name": "💻 Laptop / Monitor", "icon": "💻", "is_battery": True},
+    "ebike_std": {"name": "🚲 E-Bike Ladegerät (Standard)", "icon": "🚲", "is_battery": True},
+    "ebike_fast": {"name": "⚡ E-Bike Schnelllader / PC", "icon": "⚡", "is_battery": True},
+    "appliance": {"name": "🍳 Großgerät / Dauerbetrieb", "icon": "🍳", "is_battery": False}
 }
 
 @app.after_request
@@ -86,7 +89,7 @@ HTML = """
 <html lang="de">
 <head>
     <meta charset="utf-8">
-    <title>Smart Power Hub</title>
+    <title>Smart Power Station</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <style>
         :root {
@@ -116,13 +119,13 @@ HTML = """
             background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
             border: 1px solid var(--border-color);
             border-radius: 18px;
-            padding: 14px;
+            padding: 12px 14px;
             margin-bottom: 14px;
             text-align: left;
         }
-        .ai-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+        .ai-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
         .ai-title { font-size: 11px; font-weight: 700; text-transform: uppercase; color: var(--accent-primary); letter-spacing: 0.5px; }
-        .btn-edit { background: #e2e8f0; color: var(--text-main); border: none; font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 8px; cursor: pointer; }
+        .btn-edit { background: #e2e8f0; color: var(--text-main); border: none; font-size: 11px; font-weight: 600; padding: 4px 9px; border-radius: 8px; cursor: pointer; }
         
         .ai-body { display: flex; align-items: center; gap: 10px; }
         .ai-icon { font-size: 26px; }
@@ -205,7 +208,7 @@ HTML = """
             background: #f8fafc;
             border: 1px solid var(--border-color);
             border-radius: 12px;
-            padding: 10px;
+            padding: 11px;
             text-align: left;
             display: flex;
             align-items: center;
@@ -227,11 +230,11 @@ HTML = """
     </style>
 </head>
 <body>
-    <!-- MODAL 1: TRAINIEREN -->
+    <!-- MODAL 1: GERTÄT MANUELL AUSWÄHLEN / TRAINIEREN -->
     <div id="deviceModal" class="modal-overlay">
         <div class="modal-box">
-            <h3 style="margin-bottom: 6px;">Gerät manuell auswählen</h3>
-            <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">Wähle den Typ. Das System merkt sich das Lastprofil.</p>
+            <h3 style="margin-bottom: 6px;">Gerät festlegen</h3>
+            <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">Wähle dein Gerät. Die Station merkt sich diese Auswahl dauerhaft.</p>
             
             <button class="device-option-btn" onclick="saveDeviceProfile('lamp')">💡 Lampe / Beleuchtung (Dauerbetrieb)</button>
             <button class="device-option-btn" onclick="saveDeviceProfile('phone')">📱 Smartphone / Tablet (Akku)</button>
@@ -244,16 +247,16 @@ HTML = """
         </div>
     </div>
 
-    <!-- MODAL 2: FREIGABE-ANFRAGE -->
+    <!-- MODAL 2: FREIGABE-ANFRAGE BEI NUTZER 1 -->
     <div id="transferModal" class="modal-overlay">
         <div class="modal-box" style="border: 2px solid var(--accent-amber);">
             <div style="font-size: 40px; margin-bottom: 6px;">👋🔔</div>
-            <h3 style="color: var(--accent-amber); margin-bottom: 6px;">Freigabe-Anfrage!</h3>
+            <h3 style="color: var(--accent-amber); margin-bottom: 6px;">Freigabe-Anfrage</h3>
             <p style="font-size: 13px; color: var(--text-main); margin-bottom: 14px;">
-                Ein anderer Nutzer hat den QR-Code gescannt und möchte laden. Bist du fertig?
+                Ein anderer Nutzer hat den QR-Code gescannt. Möchtest du die Steckdose jetzt überlassen?
             </p>
             <button class="btn-start" style="background: var(--accent-green); margin-bottom: 8px;" onclick="acceptTransfer()">✅ Ja, beenden & freigeben</button>
-            <button class="btn-stop" onclick="rejectTransfer()">Ich lade noch weiter</button>
+            <button class="btn-stop" onclick="rejectTransfer()">Nein, ich nutze weiter</button>
         </div>
     </div>
 
@@ -271,24 +274,24 @@ HTML = """
     </div>
 
     <div class="container">
-        <!-- BESETZT-KARTE -->
+        <!-- BESETZT-KARTE (NUR WENN NUTZER 2 DIE SEITE ÖFFNET) -->
         <div class="card busy-card" id="busyCard">
             <div style="font-size: 48px; margin-bottom: 10px;">⏳🔒</div>
             <div class="title" style="margin-bottom: 6px;">Steckdose aktuell belegt</div>
             <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 16px;">
-                Ein anderer Nutzer lädt gerade aktiv an dieser Steckdose.
+                Ein anderer Nutzer verwendet die Steckdose gerade aktiv.
             </p>
             <div style="background: #f1f5f9; padding: 12px; border-radius: 14px; margin-bottom: 16px; text-align: left; font-size: 13px;">
                 Aktuelle Leistung: <b id="busyWatt">0.0 W</b><br>
                 Laufzeit: <b id="busyTimer">00:00:00</b>
             </div>
-            <button class="btn-start" style="background: var(--accent-primary);" onclick="requestSlot()">🔔 Nutzer anfragen (Bescheid geben)</button>
+            <button class="btn-start" id="btnRequestSlot" style="background: var(--accent-primary);" onclick="requestSlot()">🔔 Nutzer anfragen (Bescheid geben)</button>
             <div id="requestSentText" style="display:none; color: var(--accent-green); font-size: 12px; font-weight: 600; margin-top: 10px;">
                 ✅ Anfrage gesendet! Der aktive Nutzer wurde benachrichtigt.
             </div>
         </div>
 
-        <!-- HAUPTKARTE -->
+        <!-- HAUPTKARTE (FÜR DEN AKTIVEN NUTZER) -->
         <div class="card" id="mainCard">
             <div class="header">
                 <span class="title">⚡ Smart Power Hub</span>
@@ -304,14 +307,14 @@ HTML = """
 
             <div class="ai-banner">
                 <div class="ai-header">
-                    <span class="ai-title">Erkanntes Gerät</span>
-                    <button class="btn-edit" onclick="document.getElementById('deviceModal').style.display='flex'">✏️ Ändern / Trainieren</button>
+                    <span class="ai-title">Aktives Gerät</span>
+                    <button class="btn-edit" onclick="document.getElementById('deviceModal').style.display='flex'">✏️ Ändern</button>
                 </div>
                 <div class="ai-body">
-                    <div class="ai-icon" id="devIcon">🔍</div>
+                    <div class="ai-icon" id="devIcon">💡</div>
                     <div>
-                        <div class="ai-detected" id="detectedName">Warte auf Start...</div>
-                        <div class="ai-mode" id="detectedMode">Check-Intervall: 60s</div>
+                        <div class="ai-detected" id="detectedName">💡 Lampe / Beleuchtung</div>
+                        <div class="ai-mode" id="detectedMode">Dauerbetrieb (Kein Auto-Stop)</div>
                     </div>
                 </div>
             </div>
@@ -325,7 +328,7 @@ HTML = """
                 <div class="stat-card stat-time">
                     <div class="stat-label">Laufzeit</div>
                     <div class="stat-val" id="timer">00:00:00</div>
-                    <div class="stat-sub" id="nextCheckSub">Check in --s</div>
+                    <div class="stat-sub">Sekundengenau</div>
                 </div>
             </div>
 
@@ -373,14 +376,11 @@ HTML = """
         let alarmInterval = null;
         const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 
-        let windowSamples = [];
-        let historicalPeakWatt = 0.0;
-        let activePowerObserved = false;
+        let hadPowerPhase = false;
         let isBatteryDevice = false;
-        let manualOverride = false;
-        let unplugCounter = 0; // Zähler für 10-Sekunden-Filter
+        let unplugCounter = 0;
         let isUnplugged = false;
-        let currentClassification = { name: "Warte auf Messung...", icon: "🔍", isBattery: false };
+        let currentProfileKey = "lamp";
 
         function playContinuousTone() {
             try {
@@ -429,29 +429,24 @@ HTML = """
         }
 
         async function saveDeviceProfile(key) {
-            manualOverride = true;
             document.getElementById('deviceModal').style.display = 'none';
-            await sendAction('/train_profile', { key: key, peak_w: historicalPeakWatt });
-            
-            let prof = {
-                'lamp': { name: "💡 Lampe / Beleuchtung", icon: "💡", isBattery: false },
-                'phone': { name: "📱 Smartphone / Tablet", icon: "📱", isBattery: true },
-                'laptop': { name: "💻 Laptop / Monitor", icon: "💻", isBattery: true },
-                'ebike_std': { name: "🚲 E-Bike Ladegerät (Standard)", icon: "🚲", isBattery: true },
-                'ebike_fast': { name: "⚡ E-Bike Schnelllader / PC", icon: "⚡", isBattery: true },
-                'appliance': { name: "🍳 Großgerät / Dauerbetrieb", icon: "🍳", isBattery: false }
-            }[key];
+            let res = await sendAction('/save_device', { key: key });
+            applyProfile(key, res.profile);
+        }
 
-            currentClassification = prof;
-            isBatteryDevice = prof.isBattery;
+        function applyProfile(key, prof) {
+            currentProfileKey = key;
+            isBatteryDevice = prof.is_battery;
             document.getElementById('devIcon').innerText = prof.icon;
-            document.getElementById('detectedName').innerText = prof.name + " (Bestätigt)";
+            document.getElementById('detectedName').innerText = prof.name;
             document.getElementById('detectedMode').innerText = isBatteryDevice ? "🔋 Akku (Auto-Stop bei 100%)" : "💡 Dauerbetrieb (Kein Auto-Stop)";
         }
 
         async function requestSlot() {
             await sendAction('/request_transfer');
             document.getElementById('requestSentText').style.display = 'block';
+            document.getElementById('btnRequestSlot').disabled = true;
+            document.getElementById('btnRequestSlot').style.opacity = '0.6';
         }
 
         async function acceptTransfer() {
@@ -470,29 +465,13 @@ HTML = """
             await logout();
         }
 
-        function evaluateProfile(avgW, peakW) {
-            if (avgW < 2.0 && peakW < 3.0) {
-                return { name: "Standby / Leerlauf", icon: "🔌", isBattery: false };
-            } else if (avgW >= 2.0 && avgW < 35.0) {
-                return { name: "💡 Lampe / 📱 Smartphone", icon: "💡", isBattery: false };
-            } else if (avgW >= 35.0 && avgW < 100.0) {
-                return { name: "💻 Laptop / Monitor", icon: "💻", isBattery: true };
-            } else if (avgW >= 100.0 && avgW < 250.0) {
-                return { name: "🚲 E-Bike Ladegerät (Standard)", icon: "🚲", isBattery: true };
-            } else if (avgW >= 250.0 && avgW < 600.0) {
-                return { name: "⚡ E-Bike Schnelllader / PC", icon: "⚡", isBattery: true };
-            } else {
-                return { name: "🍳 Großverbraucher / Dauerbetrieb", icon: "🍳", isBattery: false };
-            }
-        }
-
         async function logout() {
             isTerminated = true;
             try {
                 let report = await sendAction('/logout');
                 
-                document.getElementById('rDevice').innerText = currentClassification.icon + " " + currentClassification.name;
-                document.getElementById('rMode').innerText = currentClassification.isBattery ? "Akku-Ladeüberwachung" : "Dauerbetrieb";
+                document.getElementById('rDevice').innerText = document.getElementById('detectedName').innerText;
+                document.getElementById('rMode').innerText = isBatteryDevice ? "Akku-Ladeüberwachung" : "Dauerbetrieb";
                 document.getElementById('rTime').innerText = report.time_formatted;
                 document.getElementById('rWh').innerText = report.wh.toFixed(2) + " Wh";
                 document.getElementById('rKwh').innerText = report.kwh.toFixed(4) + " kWh";
@@ -512,23 +491,32 @@ HTML = """
                 let res = await fetch('/status', { cache: 'no-store' });
                 let data = await res.json();
                 
+                // 1. MULTI-USER STATUS
                 if (data.is_busy_for_other) {
                     document.getElementById('mainCard').style.display = 'none';
                     document.getElementById('busyCard').style.display = 'block';
-                    document.getElementById('busyWatt').innerText = data.watt.toFixed(1) + " W";
+                    document.getElementById('busyWatt').innerText = data.global_watt.toFixed(1) + " W";
                     let sec = data.elapsed_seconds;
                     let h = Math.floor(sec / 3600).toString().padStart(2, '0');
                     let m = Math.floor((sec % 3600) / 60).toString().padStart(2, '0');
                     let s = Math.floor(sec % 60).toString().padStart(2, '0');
                     document.getElementById('busyTimer').innerText = `${h}:${m}:${s}`;
-                    return;
+                    return; // Beenden für den wartenden Nutzer
                 } else {
                     document.getElementById('busyCard').style.display = 'none';
                     document.getElementById('mainCard').style.display = 'block';
                 }
 
+                // 2. GELERNTES GERÄTEPROFIL VOM SERVER ÜBERNEHMEN
+                if (data.current_profile && currentProfileKey !== data.current_profile_key) {
+                    applyProfile(data.current_profile_key, data.current_profile);
+                }
+
+                // 3. FREIGABE-ANFRAGE NUR BEIM AKTIVEN NUTZER ANZEIGEN
                 if (data.transfer_requested) {
                     document.getElementById('transferModal').style.display = 'flex';
+                } else {
+                    document.getElementById('transferModal').style.display = 'none';
                 }
 
                 let currentW = data.watt;
@@ -547,31 +535,27 @@ HTML = """
                 let startBtn = document.getElementById('mainStartBtn');
                 
                 if (data.active) {
-                    windowSamples.push(currentW);
-                    if (currentW > historicalPeakWatt) historicalPeakWatt = currentW;
-
-                    if (currentW > 3.0) {
-                        activePowerObserved = true;
+                    if (currentW > 2.0) {
+                        hadPowerPhase = true;
                     }
 
-                    // --- 10-SEKUNDEN UNPLUG ERKENNUNGS-FILTER ---
-                    if (activePowerObserved && currentW < 0.2) {
+                    // --- 10-SEKUNDEN UNPLUG FILTER (NUR WENN DIESE SESSION AKTIV IST) ---
+                    if (hadPowerPhase && currentW < 0.2) {
                         unplugCounter++;
-                        document.getElementById('wattSub').innerText = `Verbindung getrennt? Prüfe (${unplugCounter}/10s)...`;
+                        document.getElementById('wattSub').innerText = `Kabel gezogen? (${unplugCounter}/10s)...`;
                         
-                        // Erst wenn 10 aufeinanderfolgende Sekunden 0 W anliegen:
                         if (unplugCounter >= 10) {
                             isUnplugged = true;
                             unplugCounter = 0;
                             await sendAction('/stop');
                             badge.className = "status-pill status-unplug";
-                            text.innerText = "🔌 Kabel ausgesteckt – Strom pausiert";
-                            document.getElementById('wattSub').innerText = "Warte auf Wiedereinstecken & Start";
-                            startBtn.innerText = "▶️ Kabel wieder drin? Weiterladen";
+                            text.innerText = "🔌 Kabel ausgesteckt – Pausiert";
+                            document.getElementById('wattSub').innerText = "Warte auf Einstecken & Start";
+                            startBtn.innerText = "▶️ Kabel wieder drin? Fortsetzen";
                             return;
                         }
                     } else {
-                        unplugCounter = 0; // Reset, sobald auch nur 1 Watt fließt (Netzschwankung)
+                        unplugCounter = 0;
                         document.getElementById('wattSub').innerText = currentW > 0.5 ? "Fließt stabil" : "Keine Last";
                     }
 
@@ -579,43 +563,18 @@ HTML = """
                     text.innerText = "Aktiv / Strom fließt";
                     startBtn.innerText = "▶️ Läuft bereits";
 
-                    // Re-Klassifizierung alle 60s
-                    let secInMinute = sec % 60;
-                    let nextCheck = 60 - secInMinute;
-                    document.getElementById('nextCheckSub').innerText = `Check in ${nextCheck}s`;
-
-                    if (!manualOverride) {
-                        if (sec >= 30 && (sec === 30 || secInMinute === 0)) {
-                            let avg = windowSamples.reduce((a, b) => a + b, 0) / windowSamples.length;
-                            let peak = Math.max(...windowSamples);
-                            
-                            currentClassification = evaluateProfile(avg, peak);
-                            isBatteryDevice = currentClassification.isBattery;
-
-                            document.getElementById('devIcon').innerText = currentClassification.icon;
-                            document.getElementById('detectedName').innerText = currentClassification.name;
-                            document.getElementById('detectedMode').innerText = isBatteryDevice 
-                                ? "🔋 Akku (Auto-Stop bei 100%)" 
-                                : "💡 Dauerbetrieb (Kein Auto-Stop)";
-                            
-                            windowSamples = [];
-                        } else if (sec < 30) {
-                            document.getElementById('detectedName').innerText = `Analysiere... (${30 - sec}s)`;
-                        }
-                    }
-
-                    // --- 100% VOLLGELADEN BEI AKKUS ---
-                    // Typisch: Netzteil bleibt in Steckdose (zieht 0,4W - 2,0W), lädt aber nicht mehr aktiv
-                    if (isBatteryDevice && historicalPeakWatt > 8.0 && currentW >= 0.3 && currentW < 2.2 && data.wh > 2.0) {
+                    // --- 100% VOLLGELADEN BEI AKKUS (NUR WENN AKKU-MODUS) ---
+                    if (isBatteryDevice && hadPowerPhase && currentW >= 0.3 && currentW < 2.0 && data.wh > 2.0) {
                         await sendAction('/stop');
                         document.getElementById('fullModal').style.display = 'flex';
                         startAudioAlert();
                     }
 
                 } else {
+                    unplugCounter = 0;
                     if (isUnplugged) {
                         badge.className = "status-pill status-unplug";
-                        text.innerText = "🔌 Kabel ausgesteckt – Strom pausiert";
+                        text.innerText = "🔌 Kabel ausgesteckt – Pausiert";
                         startBtn.innerText = "▶️ Kabel wieder drin? Fortsetzen";
                     } else {
                         badge.className = "status-pill status-off";
@@ -624,12 +583,7 @@ HTML = """
                     }
                     
                     if (sec === 0) {
-                        document.getElementById('detectedName').innerText = "Warte auf Start...";
-                        document.getElementById('devIcon').innerText = "🔍";
-                        windowSamples = [];
-                        historicalPeakWatt = 0;
-                        activePowerObserved = false;
-                        manualOverride = false;
+                        hadPowerPhase = false;
                         unplugCounter = 0;
                     }
                 }
@@ -669,8 +623,13 @@ def home():
 @app.route('/start', methods=['POST', 'GET'])
 def start():
     u, uid = get_user_data()
+    # Nur erlauben, wenn kein anderer Nutzer aktiv ist
+    if global_state["active_user_id"] and global_state["active_user_id"] != uid:
+        return jsonify({"status": "busy"})
+        
     global_state["active_user_id"] = uid
-    global_state["last_seen_active"] = time.time()
+    global_state["active_since"] = time.time()
+    global_state["transfer_requested"] = False
     u["active"] = True
     u["last_check"] = time.time()
     cloud_control(turn_on=True)
@@ -685,23 +644,29 @@ def stop():
     cloud_control(turn_on=False)
     return jsonify({"status": "ok"})
 
-@app.route('/train_profile', methods=['POST'])
-def train_profile():
+@app.route('/save_device', methods=['POST'])
+def save_device():
     data = request.get_json() or {}
-    key = data.get("key")
-    peak_w = float(data.get("peak_w", 0.0))
-    if key in learned_profiles and peak_w > 0:
-        learned_profiles[key]["max_w"] = max(learned_profiles[key]["max_w"], peak_w * 1.2)
-    return jsonify({"status": "trained"})
+    key = data.get("key", "lamp")
+    if key in DEVICE_PROFILES:
+        global_state["last_device_key"] = key
+    return jsonify({
+        "status": "saved",
+        "profile": DEVICE_PROFILES.get(global_state["last_device_key"])
+    })
 
 @app.route('/request_transfer', methods=['POST'])
 def request_transfer():
-    global_state["request_transfer"] = True
+    _, uid = get_user_data()
+    if global_state["active_user_id"] and global_state["active_user_id"] != uid:
+        global_state["transfer_requested"] = True
+        global_state["transfer_requester_id"] = uid
     return jsonify({"status": "requested"})
 
 @app.route('/reject_transfer', methods=['POST'])
 def reject_transfer():
-    global_state["request_transfer"] = False
+    global_state["transfer_requested"] = False
+    global_state["transfer_requester_id"] = None
     return jsonify({"status": "rejected"})
 
 @app.route('/logout', methods=['POST', 'GET'])
@@ -710,9 +675,11 @@ def logout():
     u["active"] = False
     cloud_control(turn_on=False)
 
+    # Wenn der aktive Nutzer beendet, Steckdose sofort freigeben
     if global_state["active_user_id"] == uid:
         global_state["active_user_id"] = None
-        global_state["request_transfer"] = False
+        global_state["transfer_requested"] = False
+        global_state["transfer_requester_id"] = None
 
     sec = u["total_seconds"]
     h = str(sec // 3600).zfill(2)
@@ -737,15 +704,18 @@ def status():
     u, uid = get_user_data()
     active_uid = global_state.get("active_user_id")
     
+    # Ist die Station von jemand anderem belegt?
     is_busy = False
-    if active_uid and active_uid != uid and user_sessions.get(active_uid, {}).get("active", False):
-        is_busy = True
+    global_w = 0.0
+    if active_uid and active_uid != uid:
+        if user_sessions.get(active_uid, {}).get("active", False):
+            is_busy = True
+            global_w = user_sessions[active_uid].get("current_watt", 0.0)
 
     if u["active"]:
         now = time.time()
         w = cloud_get_watt()
         u["current_watt"] = w
-        global_state["last_seen_active"] = now
         
         if u["last_check"]:
             dt = now - u["last_check"]
@@ -757,15 +727,20 @@ def status():
     else:
         u["current_watt"] = 0.0
 
+    dev_key = global_state.get("last_device_key", "lamp")
+    
     return jsonify({
         "active": u["active"],
         "watt": u["current_watt"],
+        "global_watt": global_w,
         "wh": u["total_kwh"] * 1000.0,
         "kwh": u["total_kwh"],
         "cost": u["total_kwh"] * STROMPREIS_PER_KWH,
         "elapsed_seconds": u["total_seconds"],
         "is_busy_for_other": is_busy,
-        "transfer_requested": global_state.get("request_transfer", False) and (active_uid == uid)
+        "transfer_requested": global_state.get("transfer_requested", False) and (active_uid == uid),
+        "current_profile_key": dev_key,
+        "current_profile": DEVICE_PROFILES.get(dev_key)
     })
 
 if __name__ == '__main__':
