@@ -62,6 +62,8 @@ def add_security_headers(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, private, max-age=0"
     response.headers["Pragma"] = "no-cache"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
     return response
 
 def check_authenticated():
@@ -98,7 +100,41 @@ def async_cloud_control(turn_on=True):
             pass
     threading.Thread(target=_worker, daemon=True).start()
 
-# ROBUSTE LAST-KLASSIFIZIERUNG (Erkennt Smartphone ab 3.5 W zuverlässig)
+# ROBUSTER LIVE-METRIK-ABFRAGER FÜR ALLE SHELLY PLUG GENERATIONEN
+def fetch_live_cloud_metrics():
+    payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID}
+    try:
+        res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=2.5).json()
+        if res.get("isok"):
+            status = res.get("data", {}).get("device_status", {})
+            watt = 0.0
+            amp = 0.0
+            volt = 230.0
+
+            # Gen 2 / Plus / Gen 3
+            if "switch:0" in status:
+                sw = status["switch:0"]
+                watt = float(sw.get("apower", 0.0))
+                amp = float(sw.get("current", 0.0))
+                volt = float(sw.get("voltage", 230.0))
+            # Gen 1 Geräte
+            elif "meters" in status and len(status["meters"]) > 0:
+                m = status["meters"][0]
+                watt = float(m.get("power", 0.0))
+                amp = float(m.get("current", 0.0)) if "current" in m else (watt / 230.0 if watt > 0 else 0.0)
+                volt = float(m.get("voltage", 230.0)) if "voltage" in m else 230.0
+            elif "relays" in status and len(status["relays"]) > 0:
+                watt = float(status["relays"][0].get("power", 0.0))
+                amp = watt / 230.0 if watt > 0 else 0.0
+
+            global_state["last_watt"] = watt
+            global_state["last_amp"] = amp
+            global_state["last_volt"] = volt
+            return watt, amp, volt
+    except Exception:
+        pass
+    return global_state["last_watt"], global_state["last_amp"], global_state["last_volt"]
+
 def classify_power_profile(samples):
     if not samples:
         return "phone"
@@ -117,78 +153,6 @@ def classify_power_profile(samples):
         return "ebike_fast"
     else:
         return "appliance"
-
-def get_user_elapsed_seconds(u):
-    if u["active"] and u.get("start_timestamp"):
-        return u["accumulated_seconds"] + (time.time() - u["start_timestamp"])
-    return u["accumulated_seconds"]
-
-# AUTARKER HINTERGRUND-WORKER (ZÄHLT DURCHGEHEND, KEIN STOPP NACH 30s)
-def background_meter_worker():
-    last_loop = time.time()
-    while True:
-        try:
-            now = time.time()
-            dt = now - last_loop
-            last_loop = now
-            if dt < 0 or dt > 5:
-                dt = 1.0
-
-            active_uid = global_state.get("active_user_id")
-            if active_uid and user_sessions.get(active_uid, {}).get("active", False):
-                u = user_sessions[active_uid]
-                
-                payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID}
-                res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=2.0).json()
-                
-                watt = 0.0
-                amp = 0.0
-                volt = 230.0
-
-                if res.get("isok"):
-                    status = res.get("data", {}).get("device_status", {})
-                    if "switch:0" in status:
-                        sw = status["switch:0"]
-                        watt = float(sw.get("apower", 0.0))
-                        amp = float(sw.get("current", 0.0))
-                        volt = float(sw.get("voltage", 230.0))
-                    elif "meters" in status and len(status["meters"]) > 0:
-                        m = status["meters"][0]
-                        watt = float(m.get("power", 0.0))
-                        amp = float(m.get("current", 0.0)) if "current" in m else (watt / 230.0 if watt > 0 else 0.0)
-                        volt = float(m.get("voltage", 230.0)) if "voltage" in m else 230.0
-                    elif "relays" in status and len(status["relays"]) > 0:
-                        watt = float(status["relays"][0].get("power", 0.0))
-                        amp = watt / 230.0 if watt > 0 else 0.0
-
-                global_state["last_watt"] = watt
-                global_state["last_amp"] = amp
-                global_state["last_volt"] = volt
-
-                u["current_watt"] = watt
-                u["current_ampere"] = amp
-                u["current_voltage"] = volt
-
-                # Kontinuierliche Energie-Integration
-                u["accumulated_kwh"] += (watt * dt) / 3600000.0
-
-                elapsed = get_user_elapsed_seconds(u)
-
-                # 30-Sekunden Analyse sammeln (Strom läuft ganz normal weiter!)
-                if elapsed < 30.0 and not u.get("manually_selected"):
-                    if watt > 0.5:
-                        u["analysis_samples"].append(watt)
-                elif elapsed >= 30.0 and not u.get("analysis_completed") and not u.get("manually_selected"):
-                    u["device_key"] = classify_power_profile(u["analysis_samples"])
-                    u["analysis_completed"] = True
-            else:
-                global_state["last_watt"] = 0.0
-                global_state["last_amp"] = 0.0
-        except Exception:
-            pass
-        time.sleep(1.0)
-
-threading.Thread(target=background_meter_worker, daemon=True).start()
 
 def generate_pdf_invoice(report_data):
     html_invoice = f"""
@@ -499,6 +463,29 @@ HTML_PAGE = """
         </div>
     </div>
 
+    <!-- 80% AKKU POP-UP (OPTIMALER LADEZUSTAND) -->
+    <div id="eightyModal" class="modal-overlay">
+        <div class="modal-box" style="border: 2px solid var(--accent-primary);">
+            <div style="font-size: 48px; margin-bottom: 8px;">🔋⚡</div>
+            <h2 style="font-size: 19px; color: var(--accent-primary); margin-bottom: 6px;">Akku zu 80% geladen!</h2>
+            <p style="font-size: 13px; color: var(--text-main); margin-bottom: 12px;">
+                Der optimale Akkuzustand ist erreicht. Ausstecken schont deinen Akku und spart Energie!
+            </p>
+            <button class="btn-start" style="background: var(--accent-green); margin-bottom: 8px;" onclick="logout()">✅ Jetzt beenden & Quittung</button>
+            <button class="btn-stop" onclick="dismissEightyModal()">Weiterladen bis 100%</button>
+        </div>
+    </div>
+
+    <!-- 100% AKKU VOLL POP-UP -->
+    <div id="fullModal" class="modal-overlay">
+        <div class="modal-box" style="border: 2px solid var(--accent-green);">
+            <div style="font-size: 48px; margin-bottom: 8px;">🔋✨</div>
+            <h2 style="font-size: 20px; color: var(--accent-green); margin-bottom: 6px;">Akku 100% Vollgeladen!</h2>
+            <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 12px;">Der Stromfluss wurde automatisch gestoppt. Kein weiterer Strombedarf.</p>
+            <button class="btn-start" style="background: var(--accent-green);" onclick="logout()">🧾 Quittung & Rechnung anzeigen</button>
+        </div>
+    </div>
+
     <div class="container">
         <!-- BESETZT-KARTE -->
         <div class="card busy-card" id="busyCard">
@@ -644,6 +631,7 @@ HTML_PAGE = """
         let lastReport = null;
         let transferModalOpen = false;
         let currentProfileKey = "lamp";
+        let eightyModalDismissed = false;
 
         let stationToken = 'SEC-STATION-2026-X99Q-ALPHA-77';
         localStorage.setItem('station_token', stationToken);
@@ -705,6 +693,11 @@ HTML_PAGE = """
             }
         }
 
+        function dismissEightyModal() {
+            eightyModalDismissed = true;
+            document.getElementById('eightyModal').style.display = 'none';
+        }
+
         async function requestSlot() {
             await sendAction('/request_transfer');
             document.getElementById('requestSentText').style.display = 'block';
@@ -739,6 +732,8 @@ HTML_PAGE = """
                 
                 document.getElementById('mainCard').style.display = 'none';
                 document.getElementById('busyCard').style.display = 'none';
+                document.getElementById('fullModal').style.display = 'none';
+                document.getElementById('eightyModal').style.display = 'none';
                 document.getElementById('receiptCard').style.display = 'block';
             } catch(e) {}
         }
@@ -776,7 +771,6 @@ HTML_PAGE = """
             window.open('/download_invoice', '_blank');
         }
 
-        // 1-SEKUNDEN KONTINUIERLICHER STATUSABGLEICH
         async function fetchSyncData() {
             if (isTerminated) return;
             try {
@@ -827,7 +821,6 @@ HTML_PAGE = """
                 document.getElementById('cost').innerText = data.cost.toFixed(5);
                 document.getElementById('microCost').innerText = (data.cost * 100.0).toFixed(3);
 
-                // Analyseanzeige während der ersten 30s
                 if (data.active && sec < 30 && !data.manually_selected) {
                     let remain = 30 - sec;
                     document.getElementById('aiStatusTitle').innerText = "Analyse läuft...";
@@ -838,13 +831,18 @@ HTML_PAGE = """
                     document.getElementById('aiStatusTitle').innerText = "Manuell gewählt";
                 }
 
-                // Akku-Ladezustand & Restzeit
                 if (data.current_profile && data.current_profile.is_battery) {
                     let cap = data.current_profile.capacity_wh || 20.0;
-                    document.getElementById('batteryPercentText').innerText = data.battery_pct.toFixed(1) + "%";
-                    document.getElementById('batteryBarFill').style.width = data.battery_pct.toFixed(1) + "%";
+                    let pct = data.battery_pct;
+                    document.getElementById('batteryPercentText').innerText = pct.toFixed(1) + "%";
+                    document.getElementById('batteryBarFill').style.width = pct.toFixed(1) + "%";
                     document.getElementById('batteryWhLoaded').innerText = `${data.wh.toFixed(2)} / ${cap.toFixed(0)} Wh`;
                     document.getElementById('batteryTimeRemaining').innerText = `Restzeit: ${data.remaining_time_str}`;
+
+                    // 80% Pop-up Trigger
+                    if (pct >= 80.0 && pct < 99.0 && !eightyModalDismissed && !data.battery_full_triggered) {
+                        document.getElementById('eightyModal').style.display = 'flex';
+                    }
                 }
 
                 if (data.active) {
@@ -854,6 +852,12 @@ HTML_PAGE = """
                 } else {
                     document.getElementById('statusBadge').className = "status-pill status-off";
                     document.getElementById('statusText').innerText = "Pausiert / Bereit";
+                }
+
+                // 100% Pop-up Trigger
+                if (data.battery_full_triggered) {
+                    document.getElementById('eightyModal').style.display = 'none';
+                    document.getElementById('fullModal').style.display = 'flex';
                 }
 
             } catch(e) {}
@@ -874,9 +878,9 @@ def get_user_data():
         user_sessions[uid] = {
             "active": False,
             "terminated": False,
-            "accumulated_kwh": 0.0,
-            "accumulated_seconds": 0.0,
-            "start_timestamp": None,
+            "total_kwh": 0.0,
+            "total_seconds": 0.0,
+            "last_check": None,
             "current_watt": 0.0,
             "current_ampere": 0.0,
             "current_voltage": 230.0,
@@ -884,6 +888,8 @@ def get_user_data():
             "analysis_samples": [],
             "analysis_completed": False,
             "manually_selected": False,
+            "battery_full_triggered": False,
+            "already_saturated_detected": False,
             "last_report": None
         }
     return user_sessions[uid], uid
@@ -942,7 +948,7 @@ def start():
     global_state["transfer_requested"] = False
     global_state["transfer_requester_id"] = None
     u["active"] = True
-    u["start_timestamp"] = time.time()
+    u["last_check"] = time.time()
     async_cloud_control(turn_on=True)
     return jsonify({"status": "ok"})
 
@@ -953,11 +959,8 @@ def stop():
     if u.get("terminated", False) or global_state.get("active_user_id") != uid:
         return jsonify({"status": "forbidden"}), 403
 
-    if u["active"]:
-        u["accumulated_seconds"] = get_user_elapsed_seconds(u)
-        u["active"] = False
-        u["start_timestamp"] = None
-
+    u["active"] = False
+    u["last_check"] = None
     u["current_watt"] = 0.0
     u["current_ampere"] = 0.0
     async_cloud_control(turn_on=False)
@@ -1001,11 +1004,7 @@ def reject_transfer():
 @require_physical_auth
 def logout():
     u, uid = get_user_data()
-    if u["active"]:
-        u["accumulated_seconds"] = get_user_elapsed_seconds(u)
-        u["active"] = False
-        u["start_timestamp"] = None
-
+    u["active"] = False
     u["terminated"] = True
     async_cloud_control(turn_on=False)
 
@@ -1014,7 +1013,7 @@ def logout():
         global_state["transfer_requested"] = False
         global_state["transfer_requester_id"] = None
 
-    sec = int(u["accumulated_seconds"])
+    sec = int(u["total_seconds"])
     h = str(sec // 3600).zfill(2)
     m = str((sec % 3600) // 60).zfill(2)
     s = str(sec % 60).zfill(2)
@@ -1024,9 +1023,9 @@ def logout():
     report = {
         "invoice_id": invoice_num,
         "time_formatted": f"{h}:{m}:{s}",
-        "wh": u["accumulated_kwh"] * 1000.0,
-        "kwh": u["accumulated_kwh"],
-        "cost": u["accumulated_kwh"] * STROMPREIS_PER_KWH
+        "wh": u["total_kwh"] * 1000.0,
+        "kwh": u["total_kwh"],
+        "cost": u["total_kwh"] * STROMPREIS_PER_KWH
     }
     u["last_report"] = report
 
@@ -1111,14 +1110,64 @@ def status():
             is_busy = True
             global_w = global_state["last_watt"]
 
+    # ECHTE LIVE-MESSUNG
+    if u["active"]:
+        now = time.time()
+        w, a, v = fetch_live_cloud_metrics()
+        
+        u["current_watt"] = w
+        u["current_ampere"] = a
+        u["current_voltage"] = v
+        
+        if u.get("last_check"):
+            dt = now - u["last_check"]
+            if 0 < dt < 10:
+                u["total_seconds"] += dt
+                u["total_kwh"] += (w * dt) / 3600000.0
+        u["last_check"] = now
+
+        # 30-Sekunden Analyse sammeln (Unterbrechungsfrei)
+        if u["total_seconds"] < 30 and not u.get("manually_selected"):
+            if w > 0.3:
+                u["analysis_samples"].append(w)
+        elif u["total_seconds"] >= 30 and not u.get("analysis_completed") and not u.get("manually_selected"):
+            u["device_key"] = classify_power_profile(u["analysis_samples"])
+            u["analysis_completed"] = True
+
+        # SOFORTIGE ERKENNUNG BEI BEREITS VOLLEN/80% AKKUS BEIM EINSTECKEN
+        prof = DEVICE_PROFILES.get(u["device_key"], DEVICE_PROFILES["lamp"])
+        if prof.get("is_battery"):
+            # Sättigungsphase / Akku bereits voll (0.4W bis 2.5W bei Smartphone)
+            if 0.4 <= w < 2.5 and u["total_seconds"] > 10:
+                u["already_saturated_detected"] = True
+            if w >= 2.5:
+                u["already_saturated_detected"] = False
+
+            # Voller Akku Abschaltung
+            if u["total_seconds"] > 25 and 0.2 <= w < 1.4:
+                u["battery_full_triggered"] = True
+                u["active"] = False
+                async_cloud_control(turn_on=False)
+    else:
+        u["last_check"] = None
+        u["current_watt"] = 0.0
+        u["current_ampere"] = 0.0
+        u["current_voltage"] = 230.0
+
     dev_key = u.get("device_key", "lamp")
     prof = DEVICE_PROFILES.get(dev_key, DEVICE_PROFILES["lamp"])
     
-    # Exakte Zeit- & Energieberechnung
-    elapsed = get_user_elapsed_seconds(u)
-    wh = u["accumulated_kwh"] * 1000.0
+    # Akku-Prozent & Restzeitberechnung
+    wh = u["total_kwh"] * 1000.0
     cap = prof.get("capacity_wh", 20.0)
-    battery_pct = min(100.0, (wh / cap) * 100.0) if prof.get("is_battery") and cap > 0 else 0.0
+    
+    if prof.get("is_battery") and cap > 0:
+        if u.get("already_saturated_detected"):
+            battery_pct = 85.0 + min(15.0, (wh / 4.0) * 15.0)
+        else:
+            battery_pct = min(100.0, (wh / cap) * 100.0)
+    else:
+        battery_pct = 0.0
     
     remaining_str = "--"
     curr_w = u.get("current_watt", 0.0)
@@ -1141,15 +1190,16 @@ def status():
         "voltage": u.get("current_voltage", 230.0),
         "global_watt": global_w,
         "wh": wh,
-        "kwh": u["accumulated_kwh"],
-        "cost": u["accumulated_kwh"] * STROMPREIS_PER_KWH,
-        "elapsed_seconds": int(elapsed),
+        "kwh": u["total_kwh"],
+        "cost": u["total_kwh"] * STROMPREIS_PER_KWH,
+        "elapsed_seconds": int(u["total_seconds"]),
         "is_busy_for_other": is_busy,
         "transfer_requested": global_state.get("transfer_requested", False) and (active_uid == uid),
         "current_profile_key": dev_key,
         "current_profile": prof,
         "battery_pct": battery_pct,
         "remaining_time_str": remaining_str,
+        "battery_full_triggered": u.get("battery_full_triggered", False),
         "analysis_completed": u.get("analysis_completed", False),
         "manually_selected": u.get("manually_selected", False),
         "session_terminated": False
