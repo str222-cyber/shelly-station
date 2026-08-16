@@ -1,4 +1,4 @@
-from flask import Flask, render_template_string, jsonify, session, request, send_file, abort
+from flask import Flask, render_template_string, jsonify, session, request, send_file, redirect
 from werkzeug.middleware.proxy_fix import ProxyFix
 import requests
 import time
@@ -28,7 +28,7 @@ app.config.update(
 
 # --- SECRETS & TOKENS ---
 STATION_PHYSICAL_TOKEN = "SEC-STATION-2026-X99Q-ALPHA-77"
-ADMIN_DASHBOARD_TOKEN = "SEC-ADMIN-MASTER-2026-OMEGA" # Für den Betreiber QR Code
+ADMIN_DASHBOARD_TOKEN = "SEC-ADMIN-MASTER-2026-OMEGA"
 
 # --- SHELLY CLOUD KONFIGURATION ---
 SHELLY_CLOUD_URL = "https://shelly-274-eu.shelly.cloud"
@@ -43,7 +43,7 @@ SMTP_USER = ""
 SMTP_PASSWORD = ""
 
 AI_MODEL_FILE = "ai_learned_models.json"
-HISTORY_FILE = "charge_history.json" # NEU: Datenbank für den Admin
+HISTORY_FILE = "charge_history.json" 
 
 DEFAULT_AI_PROFILES = {
     "lamp": {"avg_w": 1.2, "peak_w": 2.0, "variance": 0.1, "count": 1},
@@ -63,7 +63,6 @@ DEVICE_PROFILES = {
     "appliance": {"name": "🍳 Großgerät / Dauerbetrieb", "icon": "🍳", "is_battery": False, "capacity_wh": 0}
 }
 
-# --- DATENBANK FUNKTIONEN ---
 def load_ai_models():
     if os.path.exists(AI_MODEL_FILE):
         try:
@@ -160,8 +159,7 @@ def estimate_current_soc(profile_key, samples):
     return 0.0
 
 def save_sub_session(u, uid):
-    """Speichert das aktuell angesteckte Gerät in den Warenkorb des Users"""
-    if u["total_kwh"] > 0.0001:  # Nur speichern wenn wirklich nennenswert Strom geflossen ist
+    if u["total_kwh"] > 0.0001: 
         record = {
             "session_id": str(uuid.uuid4())[:8],
             "user_id": uid,
@@ -174,9 +172,8 @@ def save_sub_session(u, uid):
             "duration_sec": u["total_seconds"]
         }
         u["completed_sub_sessions"].append(record)
-        append_to_history(record) # Für den Admin sichern
+        append_to_history(record) 
 
-    # Reset für das nächste Gerät
     u["total_kwh"] = 0.0
     u["total_seconds"] = 0.0
     u["analysis_samples"] = []
@@ -232,7 +229,8 @@ def background_meter_worker():
                         u["detection_mode"], u["show_start_prompt"] = False, False
                         async_cloud_control(turn_on=False)
                         continue
-                    u["show_start_prompt"] = watt > 0.5
+                    # Sensible Einsteck-Erkennung: Schon 0.2A oder 0.5W weisen auf Einrasten hin
+                    u["show_start_prompt"] = (watt > 0.5 or amp > 0.01)
                     continue 
 
                 if u.get("active", False):
@@ -262,20 +260,32 @@ def background_meter_worker():
                             if est_soc > current_calc_soc + 5.0: u["estimated_soc_0"] = est_soc - (((u.get("total_kwh", 0.0) * 1000.0) / max(1,cap)) * 100.0)
                         if u["total_seconds"] >= 40.0: u["analysis_completed"] = True
 
-                    # MULTI-SESSION AUSSTECK-ERKENNUNG
-                    if watt > 0.5: u["had_power_draw"], u["zero_power_counter"] = True, 0.0
-                    if u.get("had_power_draw") and watt <= 0.15:
-                        u["zero_power_counter"] += dt
-                        if u["zero_power_counter"] >= 65.0:  
-                            # Gerät ausgesteckt! Sub-Session beenden und für neues Gerät bereit machen
-                            u["active"] = False
-                            async_cloud_control(turn_on=False)
-                            save_sub_session(u, uid)
-                            u["detection_mode"] = True # Schaltet in Modus "Warten auf nächstes Gerät"
-                    elif watt > 0.15:
-                        u["zero_power_counter"] = 0.0
+                    # --- SOFTWARE-KLINKEN-SENSOR (NEU) ---
+                    if watt > 0.5 or amp > 0.01: 
+                        u["had_power_draw"], u["zero_power_counter"] = True, 0.0
+                        
+                    if u.get("had_power_draw"):
+                        # HARTER DISCONNECT: Ampere exakt Null (Stromkreis mechanisch offen!)
+                        if watt <= 0.1 and amp <= 0.005:
+                            u["zero_power_counter"] += dt
+                            if u["zero_power_counter"] >= 10.0: # Nach nur 10s harter Abbruch
+                                u["active"], u["unplugged_detected"], u["had_power_draw"] = False, True, False
+                                async_cloud_control(turn_on=False)
+                                save_sub_session(u, uid)
+                                u["detection_mode"] = True
+                        
+                        # WEICHER DISCONNECT: Handys bei 100% oder Lampen aus (Standby)
+                        elif watt <= 0.2:
+                            u["zero_power_counter"] += dt
+                            if u["zero_power_counter"] >= 65.0:  
+                                u["active"], u["unplugged_detected"], u["had_power_draw"] = False, True, False
+                                async_cloud_control(turn_on=False)
+                                save_sub_session(u, uid)
+                                u["detection_mode"] = True
+                        else:
+                            u["zero_power_counter"] = 0.0
 
-                    # 80% / 100%
+                    # 80% / 100% Limitierung
                     prof = DEVICE_PROFILES.get(u.get("device_key"), {})
                     if prof.get("is_battery", False) and u["total_seconds"] > 40.0:
                         current_pct = u.get("estimated_soc_0", 0.0) + (((u["total_kwh"] * 1000.0) / prof.get("capacity_wh", 20.0)) * 100.0)
@@ -433,7 +443,6 @@ HTML_PAGE = """
         .rate-badge { background: #f1f5f9; color: var(--text-muted); font-size: 12px; padding: 4px 10px; border-radius: 20px; font-weight: 600; }
         .security-badge { background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 12px; padding: 5px 10px; font-size: 11px; color: #065f46; font-weight: 600; margin-bottom: 12px; display: inline-flex; align-items: center; gap: 6px; }
         
-        /* Warenkorb UI */
         .cart-box { background: #f1f5f9; border: 1px dashed #cbd5e1; border-radius: 14px; padding: 10px; margin-bottom: 12px; text-align: left; display: none; }
         .cart-item { display: flex; justify-content: space-between; font-size: 12px; color: var(--text-main); padding: 4px 0; border-bottom: 1px solid #e2e8f0; }
         .cart-item:last-child { border: none; }
@@ -875,214 +884,3 @@ HTML_PAGE = """
     </script>
 </body>
 </html>
-"""
-
-def get_user_data():
-    uid = request.headers.get("X-User-Id", session.get("user_id", str(uuid.uuid4())))
-    session["user_id"] = uid
-    if uid not in user_sessions:
-        user_sessions[uid] = {
-            "active": False, "terminated": False, "unplugged_detected": False, "had_power_draw": False,
-            "zero_power_counter": 0.0, "total_kwh": 0.0, "total_seconds": 0.0,
-            "current_watt": 0.0, "smoothed_watt": 0.0, "current_ampere": 0.0, "current_voltage": 230.0,
-            "device_key": "phone", "analysis_samples": [], "analysis_completed": False, "manually_selected": False,
-            "estimated_soc_0": 0.0, "eighty_percent_triggered": False, "last_report": None,
-            "detection_mode": False, "show_start_prompt": False, "last_seen": time.time(), "session_peak_watt": 0.0,
-            "recent_samples": [], "completed_sub_sessions": [] # HIER WERDEN MULTIPLE GERÄTE GESPEICHERT
-        }
-    return user_sessions[uid], uid
-
-@app.route('/')
-def home():
-    if request.args.get("token") == STATION_PHYSICAL_TOKEN:
-        session["authenticated_on_site"] = True
-        session["station_token"] = STATION_PHYSICAL_TOKEN
-        session.setdefault("user_id", str(uuid.uuid4()))
-    if not check_authenticated(): return render_template_string(HTML_ACCESS_DENIED), 403
-    get_user_data()
-    return render_template_string(HTML_PAGE)
-
-@app.route('/scan/<token>')
-def scan_qr_entry(token):
-    if token != STATION_PHYSICAL_TOKEN: return render_template_string(HTML_ACCESS_DENIED), 403
-    session["authenticated_on_site"] = True
-    session["station_token"] = STATION_PHYSICAL_TOKEN
-    get_user_data()
-    return render_template_string(HTML_PAGE)
-
-@app.route('/init_detection', methods=['POST'])
-@require_physical_auth
-def init_detection():
-    ensure_worker()
-    u, _ = get_user_data()
-    if not u.get("active") and not u.get("terminated"):
-        u["detection_mode"] = True
-        async_cloud_control(turn_on=True)
-    return jsonify({"status": "ok"})
-
-@app.route('/start', methods=['POST'])
-@require_physical_auth
-def start():
-    ensure_worker()
-    u, uid = get_user_data()
-    if u.get("terminated", False): return jsonify({"status": "forbidden"}), 403
-    global_state.update({"active_user_id": uid})
-    u.update({"active": True, "unplugged_detected": False, "zero_power_counter": 0.0, "detection_mode": False, "show_start_prompt": False})
-    async_cloud_control(turn_on=True)
-    return jsonify({"status": "ok"})
-
-@app.route('/stop', methods=['POST'])
-@require_physical_auth
-def stop():
-    ensure_worker()
-    u, uid = get_user_data()
-    u["active"] = False
-    u["detection_mode"] = False
-    u["show_start_prompt"] = False
-    async_cloud_control(turn_on=False)
-    return jsonify({"status": "ok"})
-
-@app.route('/save_device', methods=['POST'])
-@require_physical_auth
-def save_device():
-    u, uid = get_user_data()
-    key = (request.get_json() or {}).get("key", "lamp")
-    if key in DEVICE_PROFILES:
-        u.update({"device_key": key, "manually_selected": True, "analysis_completed": True})
-        if u.get("recent_samples"):
-            save_ai_models(load_ai_models()) 
-            u["estimated_soc_0"] = estimate_current_soc(key, u["recent_samples"])
-    return jsonify({"status": "saved", "profile": DEVICE_PROFILES.get(u["device_key"])})
-
-@app.route('/logout', methods=['POST'])
-@require_physical_auth
-def logout():
-    u, uid = get_user_data()
-    u["active"] = False
-    u["detection_mode"] = False
-    if (request.get_json() or {}).get("final", False): u["terminated"] = True
-    async_cloud_control(turn_on=False)
-    
-    # Speichere das aktuelle Gerät noch in den Warenkorb
-    save_sub_session(u, uid)
-    
-    # Erstelle Gesamt-Report
-    items = []
-    total_wh = 0.0
-    total_cost = 0.0
-    for s in u["completed_sub_sessions"]:
-        items.append({"name": s["device_name"], "wh": s["wh"], "cost": s["cost"]})
-        total_wh += s["wh"]
-        total_cost += s["cost"]
-        
-    report = {
-        "invoice_id": f"RE-{time.strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}",
-        "items": items,
-        "total_cost": total_cost,
-        "total_wh": total_wh
-    }
-    u["last_report"] = report
-    return jsonify(report)
-
-@app.route('/new_session', methods=['POST'])
-@require_physical_auth
-def new_session():
-    u, uid = get_user_data()
-    u.update({"terminated": False, "active": False, "total_kwh": 0.0, "total_seconds": 0.0, "analysis_samples": [], "recent_samples": [], "session_peak_watt": 0.0, "analysis_completed": False, "manually_selected": False, "eighty_percent_triggered": False, "completed_sub_sessions": []})
-    return jsonify({"status": "ok"})
-
-@app.route('/download_invoice', methods=['GET'])
-@require_physical_auth
-def download_invoice():
-    u, _ = get_user_data()
-    report = u.get("last_report")
-    return send_file(generate_pdf_invoice(report), mimetype="application/pdf", as_attachment=True, download_name=f"{report.get('invoice_id')}.pdf")
-
-@app.route('/send_email_invoice', methods=['POST'])
-@require_physical_auth
-def send_email_invoice():
-    data = request.get_json() or {}
-    if "@" not in data.get("email", ""): return jsonify({"status": "error", "message": "Ungültige E-Mail-Adresse"})
-    report = data.get("report", {})
-    try:
-        msg = MIMEMultipart()
-        msg["From"], msg["To"], msg["Subject"] = SMTP_USER, data["email"], f"Stromquittung ({report.get('invoice_id')})"
-        msg.attach(MIMEText(f"Vielen Dank für die Nutzung der Smart Power Station.", "plain", "utf-8"))
-        pdf = MIMEApplication(generate_pdf_invoice(report).read(), _subtype="pdf")
-        pdf.add_header('Content-Disposition', 'attachment', filename=f"{report.get('invoice_id')}.pdf")
-        msg.attach(pdf)
-        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=8)
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASSWORD)
-        server.send_message(msg)
-        server.quit()
-        return jsonify({"status": "ok"})
-    except Exception as e:
-        return jsonify({"status": "error", "message": "Fehler beim Versand."})
-
-@app.route('/status')
-@require_physical_auth
-def status():
-    ensure_worker()
-    u, uid = get_user_data()
-    u["last_seen"] = time.time()
-
-    if u.get("terminated", False): return jsonify({"session_terminated": True, "is_busy_for_other": False})
-    
-    dev_key = u.get("device_key", "phone")
-    prof = DEVICE_PROFILES.get(dev_key, DEVICE_PROFILES["phone"])
-    
-    wh, cap = u["total_kwh"] * 1000.0, prof.get("capacity_wh", 20.0)
-    battery_pct = min(100.0, u.get("estimated_soc_0", 0.0) + ((wh / max(1, cap)) * 100.0)) if prof.get("is_battery") else 0.0
-    
-    curr_w = u.get("smoothed_watt", 0.0)
-    remaining_str = "--"
-    charge_phase = "Bereit"
-    rem_wh = 0.0
-    predicted_cost = 0.0
-    
-    pred_1h_wh = 0.0
-    pred_1h_cost = 0.0
-    pred_24h_wh = 0.0
-    pred_24h_cost = 0.0
-    
-    if prof.get("is_battery"):
-        if battery_pct >= 95.0: charge_phase = "Erhaltungsladung"
-        elif battery_pct >= 80.0: charge_phase = "Sättigung (CV)"
-        elif battery_pct >= 30.0: charge_phase = "Normalladung (CC)"
-        else: charge_phase = "Schnellladung (Bulk)"
-
-        if battery_pct >= 100.0: remaining_str = "100% Voll"
-        elif curr_w > 1.0:
-            rem_mins = int((((100.0 - battery_pct) / 100.0) * cap) / curr_w * 60)
-            remaining_str = f"ca. {rem_mins//60}h {rem_mins%60}m" if rem_mins >= 60 else f"ca. {rem_mins} Min."
-            
-        rem_wh = max(0.0, cap * (100.0 - battery_pct) / 100.0)
-        predicted_cost = (u["total_kwh"] + (rem_wh / 1000.0)) * STROMPREIS_PER_KWH
-    else:
-        pred_1h_wh = curr_w * 1.0
-        pred_1h_cost = (pred_1h_wh / 1000.0) * STROMPREIS_PER_KWH
-        pred_24h_wh = curr_w * 24.0
-        pred_24h_cost = (pred_24h_wh / 1000.0) * STROMPREIS_PER_KWH
-
-    # Warenkorb für UI bereithalten
-    cart_items = [{"name": x["device_name"], "cost": x["cost"]} for x in u.get("completed_sub_sessions", [])]
-
-    return jsonify({
-        "active": u["active"],
-        "unplugged_detected": u.get("unplugged_detected", False),
-        "watt": curr_w, "current_ampere": u.get("current_ampere", 0.0), "voltage": u.get("current_voltage", 230.0),
-        "wh": wh, "cost": u["total_kwh"] * STROMPREIS_PER_KWH,
-        "elapsed_seconds": int(u["total_seconds"]),
-        "current_profile_key": dev_key, "current_profile": prof,
-        "battery_pct": battery_pct, "remaining_time_str": remaining_str,
-        "charge_phase": charge_phase, "rem_wh": rem_wh, "predicted_cost": predicted_cost,
-        "pred_1h_wh": pred_1h_wh, "pred_1h_cost": pred_1h_cost, "pred_24h_wh": pred_24h_wh, "pred_24h_cost": pred_24h_cost,
-        "analysis_completed": u.get("analysis_completed", False), "analysis_threshold": 40.0,
-        "manually_selected": u.get("manually_selected", False), "session_terminated": False,
-        "show_start_prompt": u.get("show_start_prompt", False),
-        "cart_items": cart_items
-    })
-
-if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=5000)
