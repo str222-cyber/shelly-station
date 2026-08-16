@@ -42,7 +42,6 @@ SMTP_PASSWORD = ""
 
 AI_MODEL_FILE = "ai_learned_models.json"
 
-# Basis-Cluster für Geräteprofile
 DEFAULT_AI_PROFILES = {
     "lamp": {"avg_w": 1.2, "peak_w": 2.0, "variance": 0.1, "count": 1},
     "phone": {"avg_w": 12.0, "peak_w": 18.0, "variance": 4.5, "count": 1},
@@ -165,7 +164,6 @@ def fetch_live_cloud_metrics():
         pass
     return global_state["last_watt"], global_state["last_amp"], global_state["last_volt"]
 
-# --- AI KLASSIFIKATION & LERN-ALGORITHMUS (KNN / Feature Distance) ---
 def extract_features(samples):
     if not samples:
         return 0.0, 0.0, 0.0
@@ -182,7 +180,6 @@ def ai_classify_samples(samples):
     best_key = "lamp"
     min_dist = float("inf")
     for key, model in learned_models.items():
-        # Euklidische Distanz im normierten Feature-Raum
         d_avg = (avg_w - model["avg_w"]) / (model["avg_w"] + 5.0)
         d_peak = (peak_w - model["peak_w"]) / (model["peak_w"] + 5.0)
         d_var = (var_w - model["variance"]) / (model["variance"] + 2.0)
@@ -198,8 +195,6 @@ def ai_learn_from_feedback(correct_key, samples):
     avg_w, peak_w, var_w = extract_features(samples)
     m = learned_models[correct_key]
     n = m.get("count", 1)
-    
-    # Exponentieller gleitender Durchschnitt für kontinuierliches Lernen
     learning_rate = 1.0 / min(n + 1, 10)
     m["avg_w"] = (1.0 - learning_rate) * m["avg_w"] + learning_rate * avg_w
     m["peak_w"] = (1.0 - learning_rate) * m["peak_w"] + learning_rate * peak_w
@@ -486,6 +481,9 @@ HTML_PAGE = """
         }
 
         .busy-card { display: none; text-align: center; }
+
+        /* NEUE WARTE-KARTE BEI PAUSIERUNG */
+        .pause-wait-card { display: none; text-align: center; }
     </style>
 </head>
 <body>
@@ -512,7 +510,7 @@ HTML_PAGE = """
             <p style="font-size: 13px; color: var(--text-main); margin-bottom: 14px;">
                 Ein anderer Nutzer hat den QR-Code gescannt und möchte laden. Möchtest du die Steckdose jetzt überlassen?
             </p>
-            <button class="btn-start" style="background: var(--accent-green); margin-bottom: 8px;" onclick="acceptTransfer()">✅ Ja, überlassen & Zusammenfassung</button>
+            <button class="btn-start" style="background: var(--accent-green); margin-bottom: 8px;" onclick="acceptTransfer()">✅ Ja, überlassen</button>
             <button class="btn-stop" onclick="rejectTransfer()">Nein, ich nutze weiter</button>
         </div>
     </div>
@@ -534,7 +532,24 @@ HTML_PAGE = """
             </div>
         </div>
 
-        <!-- HAUPTKARTE -->
+        <!-- WARTE-KARTE FÜR PAUSIERTEN NUTZER 1 -->
+        <div class="card pause-wait-card" id="pauseWaitCard">
+            <div style="font-size: 48px; margin-bottom: 10px;">⏸️⏳</div>
+            <div class="title" style="margin-bottom: 6px;">Sitzung pausiert</div>
+            <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 16px;">
+                Deine bisherige Messung ist gesichert. Die Steckdose wird derzeit von einem anderen Nutzer verwendet.
+            </p>
+            <div style="background: #f1f5f9; padding: 12px; border-radius: 14px; margin-bottom: 16px; text-align: left; font-size: 13px;">
+                Bisheriger Verbrauch: <b id="pauseWh">0.0000 Wh</b><br>
+                Bisherige Kosten: <b id="pauseCost">0.00000 €</b>
+            </div>
+            <p style="font-size: 12px; color: var(--accent-primary); font-weight: 600; margin-bottom: 12px;">
+                Sobald die Station wieder frei ist, kannst du hier direkt fortsetzen.
+            </p>
+            <button class="btn-finish" onclick="finalizeTermination()">🛑 Jetzt doch endgültig beenden & abrechnen</button>
+        </div>
+
+        <!-- HAUPTKARTE (NUR AKTIV BEIM ECHTEN BESITZER) -->
         <div class="card" id="mainCard">
             <div class="header">
                 <span class="title">⚡ Smart Power Hub</span>
@@ -628,7 +643,7 @@ HTML_PAGE = """
             </div>
         </div>
 
-        <!-- QUITTUNG / NUTZERWECHSEL OPTIONEN -->
+        <!-- QUITTUNG NACH ÜBERGABE -->
         <div class="card receipt-card" id="receiptCard">
             <div class="receipt-header">
                 <div style="font-size: 40px; margin-bottom: 4px;">🧾</div>
@@ -651,16 +666,17 @@ HTML_PAGE = """
                 <div id="emailFeedback" style="display:none; font-size:12px; font-weight:600; margin-top:8px;"></div>
             </div>
 
-            <!-- WAHLMÖGLICHKEIT NACH NUTZERWECHSEL -->
+            <!-- WAHLMÖGLICHKEIT BEIM NUTZERWECHSEL -->
             <div style="margin-top: 16px; display: flex; flex-direction: column; gap: 8px;">
-                <button class="btn-stop" style="background: #e0f2fe; color: #0369a1; border-color: #bae6fd;" onclick="resumeAfterOtherUser()">⏳ Nur pausieren (Warten bis anderer Nutzer fertig ist)</button>
-                <button class="btn-finish" style="font-size: 14px;" onclick="finalizeTermination()">🛑 Sitzung endgültig beenden & Finales PDF</button>
+                <button class="btn-stop" style="background: #e0f2fe; color: #0369a1; border-color: #bae6fd;" onclick="setWaitingMode()">⏳ Sitzung pausieren (Warten bis anderer Nutzer fertig ist)</button>
+                <button class="btn-finish" style="font-size: 14px;" onclick="finalizeTermination()">🛑 Endgültig beenden & Finales PDF</button>
             </div>
         </div>
     </div>
 
     <script>
         let isTerminated = false;
+        let isWaitingForResume = false;
         let lastReport = null;
         let transferModalOpen = false;
         let currentProfileKey = "lamp";
@@ -756,8 +772,10 @@ HTML_PAGE = """
                 document.getElementById('rKwh').innerText = report.kwh.toFixed(6) + " kWh";
                 document.getElementById('rCost').innerText = report.cost.toFixed(5) + " €";
                 
+                // HAUPTKARTE KOMPLETT ABSCHALTEN
                 document.getElementById('mainCard').style.display = 'none';
                 document.getElementById('busyCard').style.display = 'none';
+                document.getElementById('pauseWaitCard').style.display = 'none';
                 document.getElementById('receiptCard').style.display = 'block';
 
                 if (finalTerminate) {
@@ -767,15 +785,26 @@ HTML_PAGE = """
             } catch(e) {}
         }
 
-        async function finalizeTermination() {
-            isTerminated = true;
-            await sendAction('/finalize');
-            document.getElementById('receiptSubtitle').innerText = "Sitzung endgültig abgeschlossen";
+        function setWaitingMode() {
+            isWaitingForResume = true;
+            document.getElementById('receiptCard').style.display = 'none';
+            document.getElementById('mainCard').style.display = 'none';
+            document.getElementById('busyCard').style.display = 'none';
+            
+            if (lastReport) {
+                document.getElementById('pauseWh').innerText = lastReport.wh.toFixed(4) + " Wh";
+                document.getElementById('pauseCost').innerText = lastReport.cost.toFixed(5) + " €";
+            }
+            document.getElementById('pauseWaitCard').style.display = 'block';
         }
 
-        function resumeAfterOtherUser() {
-            document.getElementById('receiptCard').style.display = 'none';
-            fetchSyncData();
+        async function finalizeTermination() {
+            isTerminated = true;
+            isWaitingForResume = false;
+            await sendAction('/finalize');
+            document.getElementById('pauseWaitCard').style.display = 'none';
+            document.getElementById('receiptSubtitle').innerText = "Sitzung endgültig abgeschlossen";
+            document.getElementById('receiptCard').style.display = 'block';
         }
 
         async function sendInvoiceEmail() {
@@ -811,6 +840,7 @@ HTML_PAGE = """
             window.open('/download_invoice', '_blank');
         }
 
+        // 1-SEKUNDEN STATUSABGLEICH
         async function fetchSyncData() {
             if (isTerminated) return;
             try {
@@ -825,8 +855,25 @@ HTML_PAGE = """
                     return;
                 }
 
+                // WENN NUTZER 2 DIE STECKDOSE ÜBERNOMMEN HAT: HAUPTBILDSCHIRM FÜR NUTZER 1 VOLLSTÄNDIG DEAKTIVIEREN
+                if (data.is_paused_by_transfer && !isWaitingForResume && document.getElementById('receiptCard').style.display !== 'block') {
+                    await logout(false);
+                    return;
+                }
+
+                if (isWaitingForResume) {
+                    if (!data.is_busy_for_other) {
+                        // Steckdose wieder frei -> Nutzer 1 kann fortsetzen
+                        isWaitingForResume = false;
+                        document.getElementById('pauseWaitCard').style.display = 'none';
+                        document.getElementById('mainCard').style.display = 'block';
+                    }
+                    return;
+                }
+
                 if (data.is_busy_for_other) {
                     document.getElementById('mainCard').style.display = 'none';
+                    document.getElementById('receiptCard').style.display = 'none';
                     document.getElementById('busyCard').style.display = 'block';
                     document.getElementById('busyWatt').innerText = data.global_watt.toFixed(3) + " W";
                     return;
@@ -907,6 +954,7 @@ def get_user_data():
         user_sessions[uid] = {
             "active": False,
             "terminated": False,
+            "paused_by_transfer": False,
             "total_kwh": 0.0,
             "total_seconds": 0.0,
             "start_timestamp": None,
@@ -971,10 +1019,21 @@ def start():
         if other_user.get("active", False) and not other_user.get("terminated", False):
             return jsonify({"status": "busy"})
         
+    # Wenn ein neuer Nutzer übernimmt: Vorherigen Nutzer hart pausieren
+    if active_uid and active_uid != uid:
+        prev_user = user_sessions.get(active_uid)
+        if prev_user:
+            if prev_user["active"] and prev_user.get("start_timestamp"):
+                prev_user["total_seconds"] = time.time() - prev_user["start_timestamp"]
+            prev_user["active"] = False
+            prev_user["start_timestamp"] = None
+            prev_user["paused_by_transfer"] = True
+
     global_state["active_user_id"] = uid
     global_state["transfer_requested"] = False
     global_state["transfer_requester_id"] = None
     u["active"] = True
+    u["paused_by_transfer"] = False
     u["start_timestamp"] = time.time() - u["total_seconds"]
     async_cloud_control(turn_on=True)
     return jsonify({"status": "ok"})
@@ -1010,7 +1069,6 @@ def save_device():
         u["manually_selected"] = True
         u["analysis_completed"] = True
         
-        # USER FEEDBACK: Die AI lernt die gemessenen Samples für dieses Profil
         if u.get("analysis_samples"):
             ai_learn_from_feedback(key, u["analysis_samples"])
 
@@ -1049,6 +1107,9 @@ def logout():
 
     if final_terminate:
         u["terminated"] = True
+        u["paused_by_transfer"] = False
+    else:
+        u["paused_by_transfer"] = True
 
     async_cloud_control(turn_on=False)
 
@@ -1080,6 +1141,7 @@ def logout():
 def finalize():
     u, _ = get_user_data()
     u["terminated"] = True
+    u["paused_by_transfer"] = False
     return jsonify({"status": "finalized"})
 
 @app.route('/download_invoice', methods=['GET'])
@@ -1161,8 +1223,8 @@ def status():
             is_busy = True
             global_w = global_state["last_watt"]
 
-    # EXAKTE LIVE-MESSUNG & AI-FEATURE-EXTRAKTION
-    if u["active"]:
+    # LIVE-MESSUNG NUR BEIM ECHTEN BESITZER
+    if u["active"] and active_uid == uid:
         now = time.time()
         w, a, v = fetch_live_cloud_metrics()
         
@@ -1175,7 +1237,6 @@ def status():
 
         u["total_kwh"] += (w * 1.0) / 3600000.0
 
-        # AI-Lernphase in den ersten 30s
         if u["total_seconds"] < 30 and not u.get("manually_selected"):
             if w > 0.5:
                 u["analysis_samples"].append(w)
@@ -1209,7 +1270,7 @@ def status():
         remaining_str = "100% Voll"
 
     return jsonify({
-        "active": u["active"],
+        "active": u["active"] and (active_uid == uid),
         "watt": u.get("current_watt", 0.0),
         "current_ampere": u.get("current_ampere", 0.0),
         "voltage": u.get("current_voltage", 230.0),
@@ -1219,6 +1280,7 @@ def status():
         "cost": u["total_kwh"] * STROMPREIS_PER_KWH,
         "elapsed_seconds": int(u["total_seconds"]),
         "is_busy_for_other": is_busy,
+        "is_paused_by_transfer": u.get("paused_by_transfer", False) and (active_uid != uid),
         "transfer_requested": global_state.get("transfer_requested", False) and (active_uid == uid),
         "current_profile_key": dev_key,
         "current_profile": prof,
