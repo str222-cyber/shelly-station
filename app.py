@@ -1,9 +1,9 @@
 from flask import Flask, render_template_string, jsonify, session, request, send_file, redirect
+from werkzeug.middleware.proxy_fix import ProxyFix
 import requests
 import time
 import threading
 import uuid
-import secrets
 import smtplib
 import io
 from functools import wraps
@@ -14,11 +14,13 @@ from weasyprint import HTML
 
 app = Flask(__name__)
 
-# --- SICHERHEITS- & SESSION-KONFIGURATION ---
-app.secret_key = "shelly_fixed_secure_key_str222_2026_x99"
+# ProxyFix für Render.com (Erlaubt HTTPS-Cookies hinter dem Render Load-Balancer)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+
+# Fester Session-Schlüssel
+app.secret_key = "shelly_smart_hub_stable_rocksolid_key_2026"
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SECURE=True,
     SESSION_COOKIE_SAMESITE="Lax",
     PERMANENT_SESSION_LIFETIME=14400
 )
@@ -63,18 +65,20 @@ def add_security_headers(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, private, max-age=0"
     response.headers["Pragma"] = "no-cache"
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
     return response
 
+# HYBRIDE AUTHENTIFIZIERUNG: Session Cookie + Header Token
 def check_authenticated():
+    header_token = request.headers.get("X-Station-Token")
+    if header_token == STATION_PHYSICAL_TOKEN:
+        return True
     return session.get("authenticated_on_site") is True and session.get("station_token") == STATION_PHYSICAL_TOKEN
 
 def require_physical_auth(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if not check_authenticated():
-            return jsonify({"status": "unauthorized", "message": "Bitte QR-Code scannen."}), 401
+            return jsonify({"status": "unauthorized", "message": "Bitte QR-Code vor Ort scannen."}), 401
         return f(*args, **kwargs)
     return decorated_function
 
@@ -112,14 +116,19 @@ def classify_power_profile(avg_w, peak_w):
     else:
         return "appliance"
 
-# ZENTRALER AUTARKER HINTERGRUND-MESSWORKER
+def get_user_elapsed_seconds(u):
+    if u["active"] and u.get("start_timestamp"):
+        return u["accumulated_seconds"] + (time.time() - u["start_timestamp"])
+    return u["accumulated_seconds"]
+
+# AUTARKER SERVER-HINTERGRUND-WORKER (Zählt unabhängig vom Smartphone weiter)
 def background_meter_worker():
-    last_t = time.time()
+    last_loop = time.time()
     while True:
         try:
             now = time.time()
-            dt = now - last_t
-            last_t = now
+            dt = now - last_loop
+            last_loop = now
             if dt < 0 or dt > 5:
                 dt = 1.0
 
@@ -158,32 +167,34 @@ def background_meter_worker():
                 u["current_ampere"] = amp
                 u["current_voltage"] = volt
 
-                # Kontinuierliche Integration von Zeit & Energie
-                u["total_seconds"] += dt
-                u["total_kwh"] += (watt * dt) / 3600000.0
+                # Kontinuierliche kWh-Integration
+                u["accumulated_kwh"] += (watt * dt) / 3600000.0
+
+                elapsed = get_user_elapsed_seconds(u)
 
                 # 30-Sekunden Analyse sammeln (KEIN Unterbrechen der Zählung!)
-                if u["total_seconds"] < 30.0 and not u.get("manually_selected"):
+                if elapsed < 30.0 and not u.get("manually_selected"):
                     u["analysis_samples"].append(watt)
-                elif u["total_seconds"] >= 30.0 and not u.get("analysis_completed") and not u.get("manually_selected"):
+                elif elapsed >= 30.0 and not u.get("analysis_completed") and not u.get("manually_selected"):
                     if len(u["analysis_samples"]) > 0:
                         avg_w = sum(u["analysis_samples"]) / len(u["analysis_samples"])
                         peak_w = max(u["analysis_samples"])
                         u["device_key"] = classify_power_profile(avg_w, peak_w)
                     u["analysis_completed"] = True
 
-                # Akku 100% Erkennung nur bei echter Akku-Nutzung
+                # Akku 100% Erkennung
                 prof = DEVICE_PROFILES.get(u["device_key"], {})
                 if prof.get("is_battery", False):
                     if watt > 6.0:
                         u["had_charging_phase"] = True
                     
-                    # Wenn Akku nach aktiver Phase für min. 30s im Standby verharrt
-                    if u["had_charging_phase"] and 0.3 <= watt < 1.8 and (u["total_kwh"] * 1000.0) > 3.0:
+                    if u["had_charging_phase"] and 0.3 <= watt < 1.8 and (u["accumulated_kwh"] * 1000.0) > 3.0:
                         u["full_standby_counter"] += 1
-                        if u["full_standby_counter"] >= 25:
+                        if u["full_standby_counter"] >= 30:
                             u["battery_full_triggered"] = True
+                            u["accumulated_seconds"] = get_user_elapsed_seconds(u)
                             u["active"] = False
+                            u["start_timestamp"] = None
                             async_cloud_control(turn_on=False)
                     else:
                         u["full_standby_counter"] = 0
@@ -661,6 +672,11 @@ HTML_PAGE = """
         let transferModalOpen = false;
         let currentProfileKey = "lamp";
 
+        // Speichere den Sicherheitstoken im lokalen Speicher
+        const urlParams = new URLSearchParams(window.location.search);
+        let stationToken = 'SEC-STATION-2026-X99Q-ALPHA-77';
+        localStorage.setItem('station_token', stationToken);
+
         function updateTimerUI(sec) {
             let h = Math.floor(sec / 3600).toString().padStart(2, '0');
             let m = Math.floor((sec % 3600) / 60).toString().padStart(2, '0');
@@ -672,27 +688,30 @@ HTML_PAGE = """
             try {
                 let res = await fetch(url, {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'X-Station-Token': stationToken
+                    },
                     body: JSON.stringify(data)
                 });
                 return await res.json();
             } catch(e) { return {}; }
         }
 
-        function startSession() {
+        async function startSession() {
             if (isTerminated) return;
             document.getElementById('statusBadge').className = "status-pill status-on";
             document.getElementById('statusText').innerText = "Aktiv / Strom fließt";
-            sendAction('/start');
-            setTimeout(fetchSyncData, 150);
+            await sendAction('/start');
+            setTimeout(fetchSyncData, 100);
         }
 
-        function pauseSession() {
+        async function pauseSession() {
             if (isTerminated) return;
             document.getElementById('statusBadge').className = "status-pill status-off";
             document.getElementById('statusText').innerText = "Pausiert / Bereit";
-            sendAction('/stop');
-            setTimeout(fetchSyncData, 150);
+            await sendAction('/stop');
+            setTimeout(fetchSyncData, 100);
         }
 
         async function saveDeviceProfile(key) {
@@ -791,7 +810,10 @@ HTML_PAGE = """
         async function fetchSyncData() {
             if (isTerminated) return;
             try {
-                let res = await fetch('/status', { cache: 'no-store' });
+                let res = await fetch('/status', { 
+                    cache: 'no-store',
+                    headers: { 'X-Station-Token': stationToken }
+                });
                 let data = await res.json();
 
                 if (data.session_terminated) {
@@ -886,8 +908,9 @@ def get_user_data():
         user_sessions[uid] = {
             "active": False,
             "terminated": False,
-            "total_kwh": 0.0,
-            "total_seconds": 0.0,
+            "accumulated_kwh": 0.0,
+            "accumulated_seconds": 0.0,
+            "start_timestamp": None,
             "current_watt": 0.0,
             "current_ampere": 0.0,
             "current_voltage": 230.0,
@@ -956,6 +979,7 @@ def start():
     global_state["transfer_requested"] = False
     global_state["transfer_requester_id"] = None
     u["active"] = True
+    u["start_timestamp"] = time.time()
     async_cloud_control(turn_on=True)
     return jsonify({"status": "ok"})
 
@@ -966,7 +990,11 @@ def stop():
     if u.get("terminated", False) or global_state.get("active_user_id") != uid:
         return jsonify({"status": "forbidden"}), 403
 
-    u["active"] = False
+    if u["active"]:
+        u["accumulated_seconds"] = get_user_elapsed_seconds(u)
+        u["active"] = False
+        u["start_timestamp"] = None
+
     u["current_watt"] = 0.0
     u["current_ampere"] = 0.0
     async_cloud_control(turn_on=False)
@@ -1010,7 +1038,11 @@ def reject_transfer():
 @require_physical_auth
 def logout():
     u, uid = get_user_data()
-    u["active"] = False
+    if u["active"]:
+        u["accumulated_seconds"] = get_user_elapsed_seconds(u)
+        u["active"] = False
+        u["start_timestamp"] = None
+
     u["terminated"] = True
     async_cloud_control(turn_on=False)
 
@@ -1019,7 +1051,7 @@ def logout():
         global_state["transfer_requested"] = False
         global_state["transfer_requester_id"] = None
 
-    sec = int(u["total_seconds"])
+    sec = int(u["accumulated_seconds"])
     h = str(sec // 3600).zfill(2)
     m = str((sec % 3600) // 60).zfill(2)
     s = str(sec % 60).zfill(2)
@@ -1029,9 +1061,9 @@ def logout():
     report = {
         "invoice_id": invoice_num,
         "time_formatted": f"{h}:{m}:{s}",
-        "wh": u["total_kwh"] * 1000.0,
-        "kwh": u["total_kwh"],
-        "cost": u["total_kwh"] * STROMPREIS_PER_KWH
+        "wh": u["accumulated_kwh"] * 1000.0,
+        "kwh": u["accumulated_kwh"],
+        "cost": u["accumulated_kwh"] * STROMPREIS_PER_KWH
     }
     u["last_report"] = report
 
@@ -1119,8 +1151,9 @@ def status():
     dev_key = u.get("device_key", "lamp")
     prof = DEVICE_PROFILES.get(dev_key, DEVICE_PROFILES["lamp"])
     
-    # Akku & Restzeit Berechnung
-    wh = u["total_kwh"] * 1000.0
+    # Exakte Zeit- & Energieberechnung
+    elapsed = get_user_elapsed_seconds(u)
+    wh = u["accumulated_kwh"] * 1000.0
     cap = prof.get("capacity_wh", 50.0)
     battery_pct = min(100.0, (wh / cap) * 100.0) if prof.get("is_battery") and cap > 0 else 0.0
     
@@ -1145,9 +1178,9 @@ def status():
         "voltage": u.get("current_voltage", 230.0),
         "global_watt": global_w,
         "wh": wh,
-        "kwh": u["total_kwh"],
-        "cost": u["total_kwh"] * STROMPREIS_PER_KWH,
-        "elapsed_seconds": int(u["total_seconds"]),
+        "kwh": u["accumulated_kwh"],
+        "cost": u["accumulated_kwh"] * STROMPREIS_PER_KWH,
+        "elapsed_seconds": int(elapsed),
         "is_busy_for_other": is_busy,
         "transfer_requested": global_state.get("transfer_requested", False) and (active_uid == uid),
         "current_profile_key": dev_key,
