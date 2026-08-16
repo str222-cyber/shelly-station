@@ -10,7 +10,7 @@ from email.mime.application import MIMEApplication
 from weasyprint import HTML
 
 app = Flask(__name__)
-app.secret_key = "shelly_smart_hub_stable_10s_smooth_2026"
+app.secret_key = "shelly_smart_hub_instant_user_switch_2026"
 
 # --- SHELLY CLOUD KONFIGURATION ---
 SHELLY_CLOUD_URL = "https://shelly-274-eu.shelly.cloud"
@@ -32,7 +32,8 @@ global_state = {
     "last_device_key": "lamp",
     "last_watt": 0.0,
     "last_amp": 0.0,
-    "last_volt": 230.0
+    "last_volt": 230.0,
+    "last_fetch_time": 0
 }
 
 user_sessions = {}
@@ -57,7 +58,7 @@ def cloud_control(turn_on=True):
     turn_str = "on" if turn_on else "off"
     payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID, "turn": turn_str, "channel": 0}
     try:
-        requests.post(f"{SHELLY_CLOUD_URL}/device/relay/control", data=payload, timeout=3.0)
+        requests.post(f"{SHELLY_CLOUD_URL}/device/relay/control", data=payload, timeout=2.5)
     except:
         pass
 
@@ -68,14 +69,18 @@ def cloud_control(turn_on=True):
         "params": {"id": 0, "on": turn_on}
     }
     try:
-        requests.post(f"{SHELLY_CLOUD_URL}/device/rpc", json=rpc_payload, timeout=3.0)
+        requests.post(f"{SHELLY_CLOUD_URL}/device/rpc", json=rpc_payload, timeout=2.5)
     except:
         pass
 
 def fetch_live_cloud_metrics():
+    now = time.time()
+    if now - global_state["last_fetch_time"] < 1.5:
+        return global_state["last_watt"], global_state["last_amp"], global_state["last_volt"]
+
     payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID}
     try:
-        res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=3.0).json()
+        res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=2.5).json()
         if res.get("isok"):
             status = res.get("data", {}).get("device_status", {})
             watt = 0.0
@@ -99,6 +104,7 @@ def fetch_live_cloud_metrics():
             global_state["last_watt"] = watt
             global_state["last_amp"] = amp
             global_state["last_volt"] = volt
+            global_state["last_fetch_time"] = now
             return watt, amp, volt
     except:
         pass
@@ -220,6 +226,7 @@ HTML_PAGE = """
         }
         .status-on { background: #ecfdf5; color: #065f46; }
         .status-off { background: #f1f5f9; color: var(--text-muted); }
+        .status-unplug { background: #fef3c7; color: #92400e; }
         .status-dot { width: 8px; height: 8px; border-radius: 50%; }
         .status-on .status-dot { background: var(--accent-green); box-shadow: 0 0 8px rgba(16,185,129,0.6); }
         .status-off .status-dot { background: #94a3b8; }
@@ -346,12 +353,13 @@ HTML_PAGE = """
         </div>
     </div>
 
+    <!-- ANFRAGE MODAL BEI NUTZER 1 -->
     <div id="transferModal" class="modal-overlay">
         <div class="modal-box" style="border: 2px solid var(--accent-amber);">
             <div style="font-size: 40px; margin-bottom: 6px;">👋🔔</div>
             <h3 style="color: var(--accent-amber); margin-bottom: 6px;">Freigabe-Anfrage</h3>
             <p style="font-size: 13px; color: var(--text-main); margin-bottom: 14px;">
-                Ein anderer Nutzer hat den QR-Code gescannt. Möchtest du die Steckdose jetzt überlassen?
+                Ein anderer Nutzer hat den QR-Code gescannt und möchte laden. Möchtest du die Steckdose jetzt überlassen?
             </p>
             <button class="btn-start" style="background: var(--accent-green); margin-bottom: 8px;" onclick="acceptTransfer()">✅ Ja, beenden & freigeben</button>
             <button class="btn-stop" onclick="rejectTransfer()">Nein, ich nutze weiter</button>
@@ -359,7 +367,7 @@ HTML_PAGE = """
     </div>
 
     <div class="container">
-        <!-- BESETZT-KARTE -->
+        <!-- BESETZT-KARTE FÜR NUTZER 2 -->
         <div class="card busy-card" id="busyCard">
             <div style="font-size: 48px; margin-bottom: 10px;">⏳🔒</div>
             <div class="title" style="margin-bottom: 6px;">Steckdose aktuell belegt</div>
@@ -497,7 +505,6 @@ HTML_PAGE = """
             document.getElementById('timer').innerText = `${h}:${m}:${s}`;
         }
 
-        // 1. VOLLKOMMEN FLÜSSIGER SEKUNDEN-TIMER (Rein Clientseitig, springt nie zurück)
         function startLocalTimer() {
             if (timerInterval) clearInterval(timerInterval);
             startTimeMs = Date.now() - (totalElapsedSeconds * 1000);
@@ -527,13 +534,13 @@ HTML_PAGE = """
             } catch(e) { return {}; }
         }
 
-        function startSession() {
+        async function startSession() {
             isActive = true;
             document.getElementById('statusBadge').className = "status-pill status-on";
             document.getElementById('statusText').innerText = "Aktiv / Strom fließt";
             startLocalTimer();
-            sendAction('/start');
-            setTimeout(fetch10sData, 300); // Schneller erster Messwert
+            await sendAction('/start');
+            setTimeout(fetchSyncData, 200);
         }
 
         async function saveDeviceProfile(key) {
@@ -624,13 +631,14 @@ HTML_PAGE = """
             window.open('/download_invoice', '_blank');
         }
 
-        // 2. ENTSPANNTES 10-SEKUNDEN POLLING FÜR WATT, AMPERE, VOLT & KOSTEN
-        async function fetch10sData() {
+        // SCHNELLER 2-SEKUNDEN ABGLEICH FÜR NUTZERWECHSEL & MESSWERTE
+        async function fetchSyncData() {
             if (isTerminated) return;
             try {
                 let res = await fetch('/status', { cache: 'no-store' });
                 let data = await res.json();
 
+                // MULTI-USER WECHSEL ANZEIGE
                 if (data.is_busy_for_other) {
                     document.getElementById('mainCard').style.display = 'none';
                     document.getElementById('busyCard').style.display = 'block';
@@ -641,6 +649,7 @@ HTML_PAGE = """
                     document.getElementById('mainCard').style.display = 'block';
                 }
 
+                // FREIGABE-ANFRAGE BEI NUTZER 1
                 if (data.transfer_requested && !transferModalOpen) {
                     transferModalOpen = true;
                     document.getElementById('transferModal').style.display = 'flex';
@@ -679,10 +688,8 @@ HTML_PAGE = """
             } catch(e) {}
         }
 
-        // Starte das 10-Sekunden-Intervall
-        setInterval(fetch10sData, 10000);
-        // Initialer Aufruf beim Laden
-        fetch10sData();
+        setInterval(fetchSyncData, 2000);
+        fetchSyncData();
     </script>
 </body>
 </html>
@@ -714,7 +721,10 @@ def home():
 def start():
     u, uid = get_user_data()
     if global_state["active_user_id"] and global_state["active_user_id"] != uid:
-        return jsonify({"status": "busy"})
+        # Prüfe ob der andere Nutzer noch wirklich aktiv ist
+        other_user = user_sessions.get(global_state["active_user_id"], {})
+        if other_user.get("active", False):
+            return jsonify({"status": "busy"})
         
     global_state["active_user_id"] = uid
     global_state["active_since"] = time.time()
@@ -766,6 +776,7 @@ def logout():
     u["active"] = False
     cloud_control(turn_on=False)
 
+    # Steckdose sofort atomar für den nächsten Nutzer freigeben
     if global_state["active_user_id"] == uid:
         global_state["active_user_id"] = None
         global_state["transfer_requested"] = False
