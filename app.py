@@ -127,7 +127,6 @@ def extract_advanced_features(samples):
     min_w = min(samples)
     var_w = math.sqrt(sum((x - avg_w) ** 2 for x in samples) / len(samples))
     
-    # Trendberechnung (Fällt der Strom ab? = CV Phase des Akkus)
     mid = len(samples) // 2
     trend = 0.0
     if mid > 0:
@@ -140,23 +139,20 @@ def ai_classify_samples(samples):
     avg_w, peak_w, min_w, var_w, trend = extract_advanced_features(samples)
     delta_w = peak_w - min_w
     
-    # 1. Konstante Last (Lampen schwanken fast gar nicht. Handys schwanken durch USB-Handshake)
     if delta_w <= 0.8 and var_w <= 0.4:
         if avg_w < 40.0: return "lamp"
         else: return "appliance"
         
-    # 2. Variable Last (Netzteile / Akkus)
     if peak_w > 250.0: return "ebike_fast"
     elif peak_w > 90.0: return "ebike_std"
-    elif peak_w > 35.0: return "laptop"
+    # VERBESSERUNG: Präzisere Laptop Erkennung
+    elif peak_w >= 28.0 or avg_w >= 25.0: return "laptop"
     else: return "phone"
 
 def estimate_initial_soc(profile_key, samples):
     if not samples: return 0.0
     avg_w, peak_w, min_w, var_w, trend = extract_advanced_features(samples)
     
-    # Trend < -0.3 bedeutet: Der Strom ist in den 45s abgefallen. Das passiert typischerweise
-    # wenn der Akku über 80% ist und das Netzteil drosselt (Constant Voltage Phase).
     is_cv_phase = trend < -0.3
     
     if profile_key == "phone":
@@ -232,7 +228,7 @@ def background_meter_worker():
                     if watt > 0.05:
                         u["total_kwh"] += (watt * dt) / 3600000.0
 
-                    threshold = 45.0 # Auf 45 Sekunden erhöht für optimale Ladekurven-Messung
+                    threshold = 45.0
 
                     if u["total_seconds"] < threshold and not u["manually_selected"]:
                         if watt > 0.1:
@@ -242,11 +238,14 @@ def background_meter_worker():
                         u["estimated_soc_0"] = estimate_initial_soc(u["device_key"], u["analysis_samples"])
                         u["analysis_completed"] = True
 
+                    # VERBESSERUNG: Striktes > 65 Sekunden Timeout für Kabel-Ausstecken
                     if watt > 0.5:
-                        u["had_power_draw"], u["zero_power_counter"] = True, 0.0
+                        u["had_power_draw"] = True
+                        u["zero_power_counter"] = 0.0
+                        
                     if u.get("had_power_draw") and watt <= 0.15:
                         u["zero_power_counter"] += dt
-                        if u["zero_power_counter"] >= 60.0:  
+                        if u["zero_power_counter"] >= 65.0:  # Zählt wirklich > 60s
                             u["active"], u["unplugged_detected"], u["had_power_draw"] = False, True, False
                             async_cloud_control(turn_on=False)
                     elif watt > 0.15:
@@ -514,25 +513,29 @@ HTML_PAGE = """
                     <div class="ai-icon" id="devIcon">📱</div>
                     <div>
                         <div class="ai-detected" id="detectedName">Smartphone (Standard)</div>
-                        <div class="ai-mode" id="detectedMode">AI Lastanalyse...</div>
+                        <div class="ai-mode" id="detectedMode">AI Lastanalyse (45s)...</div>
                     </div>
                 </div>
             </div>
 
-            <!-- AKKU LADESTAND (Anti-Ruckel UI + Ladephase) -->
+            <!-- AKKU LADESTAND NEU: Vorhersage für die fehlenden Wattstunden (Königsdisziplin) -->
             <div class="battery-card" id="batteryCard">
                 <div class="battery-header">
-                    <span style="font-weight: 600;">🔋 Phase: <span id="batteryPhaseText" style="color: var(--text-main);">Wird berechnet...</span></span>
-                    <span id="batteryPercentText" style="font-weight: 700; color: var(--text-main);">---%</span>
+                    <span style="font-weight: 600;">🔋 Phase: <span id="batteryPhaseText" style="color: var(--text-main);">Analysiere...</span></span>
+                    <span id="batteryPercentText" style="font-weight: 700; color: var(--text-main);">0%</span>
                 </div>
-                <div class="battery-bar-wrap"><div class="battery-bar-fill" id="batteryBarFill" style="width:0%;"></div></div>
+                <div class="battery-bar-wrap"><div class="battery-bar-fill" id="batteryBarFill"></div></div>
                 <div class="battery-meta">
-                    <span>Kapazität: <span id="batteryWhLoaded">0.0 / 0 Wh</span></span>
-                    <span id="batteryTimeRemaining">Restzeit: wird berechnet...</span>
+                    <span>Geladen: <span id="batteryWhLoaded">0.0 / 0 Wh</span></span>
+                    <span id="batteryRemWhBox" style="display:none; color: #15803d; font-weight: bold;">Noch nötig: <span id="batteryRemWh">0.0</span> Wh</span>
+                </div>
+                <div class="battery-meta" style="margin-top: 2px;">
+                    <span></span>
+                    <span id="batteryTimeRemaining">Restzeit: --</span>
                 </div>
             </div>
 
-            <!-- NETZDATEN GRID (Symmetrisch) -->
+            <!-- NETZDATEN GRID -->
             <div class="grid-2">
                 <div class="stat-card stat-volt">
                     <div class="stat-label">Spannung (U)</div>
@@ -546,7 +549,7 @@ HTML_PAGE = """
                 </div>
             </div>
 
-            <!-- LEISTUNG & LAUFZEIT GRID (Symmetrisch) -->
+            <!-- LEISTUNG & LAUFZEIT GRID -->
             <div class="grid-2">
                 <div class="stat-card stat-watt">
                     <div class="stat-label">Wirkleistung (P)</div>
@@ -560,12 +563,12 @@ HTML_PAGE = """
                 </div>
             </div>
             
-            <!-- INFO BOX (Elegant unter dem Grid integriert) -->
+            <!-- INFO BOX -->
             <div style="background: #f8fafc; border: 1px solid var(--border-color); border-radius: 14px; padding: 12px; margin-bottom: 12px; text-align: left; font-size: 11px; color: var(--text-muted); line-height: 1.4;">
-                <b style="color: var(--text-main);">ℹ️ Warum schwankt die Wirkleistung?</b><br>Moderne Ladegeräte kommunizieren permanent mit dem Akku. Um Überhitzung zu vermeiden, taktet und pulsiert das USB-Netzteil den Strom sekündlich. Diese realen Mikroschwankungen misst das System live mit.
+                <b style="color: var(--text-main);">ℹ️ Info zu schwankenden Watt-Werten:</b> Moderne Ladegeräte kommunizieren permanent mit dem Akku. Um Überhitzung zu vermeiden, taktet und pulsiert das Netzteil den Strom. Diese realen Mikroschwankungen misst das System live mit.
             </div>
 
-            <!-- ENERGIE & KOSTEN GRID (Symmetrisch) -->
+            <!-- ENERGIE & KOSTEN GRID NEU: Live Vorhersage (Königsdisziplin) -->
             <div class="grid-2">
                 <div class="stat-card">
                     <div class="stat-label">Verbrauch</div>
@@ -575,7 +578,10 @@ HTML_PAGE = """
                 <div class="stat-card stat-cost" style="background: #f0fdf4; border-color: #bbf7d0;">
                     <div class="stat-label" style="color: #166534;">Kosten (€)</div>
                     <div class="stat-val"><span id="cost">0.00000</span> €</div>
-                    <div class="stat-sub"><span id="microCost">0.00</span> Cent</div>
+                    <div class="stat-sub" id="predictedCostBox" style="margin-top: 4px; color: #166534; font-weight: bold; display: none;">
+                        100% Prognose: <span id="predictedCost">0.0000</span> €
+                    </div>
+                    <div class="stat-sub" id="microCostBox"><span id="microCost">0.00</span> Cent</div>
                 </div>
             </div>
 
@@ -749,6 +755,11 @@ HTML_PAGE = """
             document.getElementById('detectedName').innerText = prof.name;
             document.getElementById('detectedMode').innerText = prof.is_battery ? "🔋 Akku-Ladeüberwachung" : "💡 Dauerbetrieb";
             document.getElementById('batteryCard').style.display = prof.is_battery ? 'block' : 'none';
+            if (!prof.is_battery) {
+                document.getElementById('batteryRemWhBox').style.display = 'none';
+                document.getElementById('predictedCostBox').style.display = 'none';
+                document.getElementById('microCostBox').style.display = 'block';
+            }
         }
 
         function dismissEightyModal() { eightyModalDismissed = true; document.getElementById('eightyModal').style.display = 'none'; }
@@ -892,6 +903,20 @@ HTML_PAGE = """
                 document.getElementById('mwh').innerText = (data.wh * 1000.0).toFixed(1);
                 document.getElementById('cost').innerText = data.cost.toFixed(5);
                 document.getElementById('microCost').innerText = (data.cost * 100.0).toFixed(3);
+
+                // KÖNIGSDISZIPLIN: Vorhersage für Wh und Kosten (nur wenn Akku/Analyse abgeschlossen)
+                if (data.current_profile && data.current_profile.is_battery && (data.elapsed_seconds >= data.analysis_threshold || data.manually_selected)) {
+                    document.getElementById('batteryRemWh').innerText = data.rem_wh.toFixed(1);
+                    document.getElementById('batteryRemWhBox').style.display = 'inline';
+                    
+                    document.getElementById('predictedCost').innerText = data.predicted_cost.toFixed(4);
+                    document.getElementById('predictedCostBox').style.display = 'block';
+                    document.getElementById('microCostBox').style.display = 'none';
+                } else {
+                    document.getElementById('batteryRemWhBox').style.display = 'none';
+                    document.getElementById('predictedCostBox').style.display = 'none';
+                    document.getElementById('microCostBox').style.display = 'block';
+                }
 
                 // ANTI-RUCKEL UI LOGIK FÜR DIE ERSTEN 45 SEKUNDEN
                 if (data.active && data.elapsed_seconds < data.analysis_threshold && !data.manually_selected) {
@@ -1153,9 +1178,11 @@ def status():
     curr_w = u.get("smoothed_watt", 0.0)
     remaining_str = "--"
     charge_phase = "Bereit"
+    rem_wh = 0.0
+    predicted_cost = 0.0
     
     if prof.get("is_battery"):
-        # Ladephase berechnen für die UI
+        # Ladephase berechnen
         if battery_pct >= 95.0: charge_phase = "Erhaltungsladung"
         elif battery_pct >= 80.0: charge_phase = "Sättigung (CV)"
         elif battery_pct >= 30.0: charge_phase = "Normalladung (CC)"
@@ -1165,6 +1192,10 @@ def status():
         elif curr_w > 1.0:
             rem_mins = int((((100.0 - battery_pct) / 100.0) * cap) / curr_w * 60)
             remaining_str = f"ca. {rem_mins//60}h {rem_mins%60}m" if rem_mins >= 60 else f"ca. {rem_mins} Min."
+            
+        # KÖNIGSDISZIPLIN: Vorhersage für fehlende Wh und totale Kosten
+        rem_wh = max(0.0, cap * (100.0 - battery_pct) / 100.0)
+        predicted_cost = (u["total_kwh"] + (rem_wh / 1000.0)) * STROMPREIS_PER_KWH
 
     return jsonify({
         "active": u["active"] and not is_busy,
@@ -1181,9 +1212,11 @@ def status():
         "current_profile_key": dev_key, "current_profile": prof,
         "battery_pct": battery_pct, "remaining_time_str": remaining_str,
         "charge_phase": charge_phase,
+        "rem_wh": rem_wh,
+        "predicted_cost": predicted_cost,
         "battery_full_triggered": u.get("battery_full_triggered", False),
         "analysis_completed": u.get("analysis_completed", False),
-        "analysis_threshold": 45.0, # FEST 45 SEKUNDEN FÜR BESSERE ANALYSE
+        "analysis_threshold": 45.0,
         "manually_selected": u.get("manually_selected", False),
         "session_terminated": False,
         "show_start_prompt": u.get("show_start_prompt", False)
