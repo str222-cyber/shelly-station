@@ -44,8 +44,8 @@ AI_MODEL_FILE = "ai_learned_models.json"
 
 DEFAULT_AI_PROFILES = {
     "lamp": {"avg_w": 1.2, "peak_w": 2.0, "variance": 0.1, "count": 1},
-    "phone": {"name": "📱 Smartphone / Tablet", "avg_w": 18.0, "peak_w": 25.0, "variance": 3.5, "count": 1},
-    "laptop": {"name": "💻 Laptop / Monitor", "avg_w": 55.0, "peak_w": 80.0, "variance": 15.0, "count": 1},
+    "phone": {"name": "📱 Smartphone / Tablet", "avg_w": 12.0, "peak_w": 18.0, "variance": 4.5, "count": 1},
+    "laptop": {"name": "💻 Laptop / Monitor", "avg_w": 45.0, "peak_w": 65.0, "variance": 12.0, "count": 1},
     "ebike_std": {"name": "🚲 E-Bike Akku Standard", "avg_w": 140.0, "peak_w": 170.0, "variance": 8.0, "count": 1},
     "ebike_fast": {"name": "⚡ E-Bike Schnelllader / PC", "avg_w": 350.0, "peak_w": 420.0, "variance": 15.0, "count": 1},
     "appliance": {"name": "🍳 Großgerät / Dauerbetrieb", "avg_w": 850.0, "peak_w": 1200.0, "variance": 50.0, "count": 1}
@@ -285,8 +285,17 @@ def background_meter_worker():
                     elif watt > 0.1:
                         u["zero_power_counter"] = 0.0
 
+                    # Automatisches Abschalten bei 80% / 100% für Akkus
                     prof = DEVICE_PROFILES.get(u["device_key"], {})
                     if prof.get("is_battery", False) and u["total_seconds"] > threshold:
+                        wh = u["total_kwh"] * 1000.0
+                        cap = prof.get("capacity_wh", 20.0)
+                        base_soc = u.get("estimated_soc_0", 0.0)
+                        current_pct = base_soc + ((wh / cap) * 100.0)
+
+                        if current_pct >= 80.0 and not u.get("eighty_percent_triggered", False):
+                            u["eighty_percent_triggered"] = True
+
                         if watt > 6.0:
                             u["had_charging_phase"] = True
                         
@@ -355,6 +364,32 @@ def generate_pdf_invoice(report_data):
     HTML(string=html_invoice).write_pdf(pdf_buffer)
     pdf_buffer.seek(0)
     return pdf_buffer
+
+HTML_ACCESS_DENIED = """
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="utf-8">
+    <title>Zugriff Verweigert</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: white; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; text-align: center; padding: 20px; }
+        .box { background: #1e293b; padding: 30px; border-radius: 20px; border: 1px solid #334155; max-width: 360px; }
+        .icon { font-size: 50px; margin-bottom: 15px; }
+        h2 { font-size: 20px; margin-bottom: 10px; color: #f87171; }
+        p { font-size: 14px; color: #94a3b8; line-height: 1.5; }
+    </style>
+</head>
+<body>
+    <div class="box">
+        <div class="icon">🔒🚫</div>
+        <h2>Sicherheits-Sperre</h2>
+        <p>Ein direkter Web-Aufruf über das Internet ist nicht gestattet.</p>
+        <p style="margin-top: 12px; color: #e2e8f0; font-weight: 600;">Bitte scanne den QR-Code auf dem Laptop-Bildschirm oder an der Ladestation.</p>
+    </div>
+</body>
+</html>
+"""
 
 HTML_PAGE = """
 <!DOCTYPE html>
@@ -595,9 +630,9 @@ HTML_PAGE = """
             <div style="font-size: 48px; margin-bottom: 8px;">🔋⚡</div>
             <h2 style="font-size: 19px; color: var(--accent-primary); margin-bottom: 6px;">Akku zu 80% geladen!</h2>
             <p style="font-size: 13px; color: var(--text-main); margin-bottom: 12px;">
-                Der optimale Akkuzustand ist erreicht. Ausstecken schont deinen Akku und spart Energie!
+                Der optimale Akkuzustand ist erreicht und der Stromfluss wurde automatisch gestoppt, um deinen Akku zu schonen!
             </p>
-            <button class="btn-start" style="background: var(--accent-green); margin-bottom: 8px;" onclick="logout(true)">✅ Jetzt beenden & Quittung</button>
+            <button class="btn-start" style="background: var(--accent-green); margin-bottom: 8px;" onclick="logout(true)">✅ Quittung & Rechnung anzeigen</button>
             <button class="btn-stop" onclick="dismissEightyModal()">Weiterladen bis 100%</button>
         </div>
     </div>
@@ -607,7 +642,7 @@ HTML_PAGE = """
         <div class="modal-box" style="border: 2px solid var(--accent-green);">
             <div style="font-size: 48px; margin-bottom: 8px;">🔋✨</div>
             <h2 style="font-size: 20px; color: var(--accent-green); margin-bottom: 6px;">Akku 100% Vollgeladen!</h2>
-            <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 12px;">Der Stromfluss wurde automatisch gestoppt. Kein weiterer Strombedarf.</p>
+            <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 12px;">Der Akku ist voll. Der Stromfluss wurde automatisch gestoppt.</p>
             <button class="btn-start" style="background: var(--accent-green);" onclick="logout(true)">🧾 Quittung & Rechnung anzeigen</button>
         </div>
     </div>
@@ -763,7 +798,7 @@ HTML_PAGE = """
                 <div id="emailFeedback" style="display:none; font-size:12px; font-weight:600; margin-top:8px;"></div>
             </div>
 
-            <!-- NEU: SCHLIESSEN & NEUEN VORGANG STARTEN BUTTON -->
+            <!-- SCHLIESSEN & NEU STARTEN BUTTON -->
             <div style="margin-top: 16px; display: flex; flex-direction: column; gap: 8px;">
                 <button class="btn-start" style="background: var(--accent-green); font-size: 15px;" onclick="startNewSessionCompletely()">❌ Schließen & Neue Sitzung starten</button>
                 <div id="transferChoiceBox" style="display: flex; flex-direction: column; gap: 8px;">
@@ -902,7 +937,6 @@ HTML_PAGE = """
             } catch(e) {}
         }
 
-        // NEU: Schließt die Quittung, generiert neue User-ID und startet völlig neu
         async function startNewSessionCompletely() {
             await sendAction('/new_session');
             localStorage.removeItem('hub_user_id');
@@ -1121,6 +1155,7 @@ def get_user_data():
             "estimated_soc_0": 0.0,
             "already_saturated_detected": False,
             "battery_full_triggered": False,
+            "eighty_percent_triggered": False,
             "last_report": None
         }
     return user_sessions[uid], uid
@@ -1161,14 +1196,8 @@ def start():
     ensure_worker()
     u, uid = get_user_data()
     
-    # Sitzung zurücksetzen falls sie vorher terminiert war
     if u.get("terminated", False):
-        u["terminated"] = False
-        u["total_kwh"] = 0.0
-        u["total_seconds"] = 0.0
-        u["analysis_samples"] = []
-        u["analysis_completed"] = False
-        u["manually_selected"] = False
+        return jsonify({"status": "forbidden"}), 403
 
     active_uid = global_state.get("active_user_id")
     if active_uid and active_uid != uid:
@@ -1328,6 +1357,7 @@ def new_session():
     u["analysis_completed"] = False
     u["manually_selected"] = False
     u["battery_full_triggered"] = False
+    u["eighty_percent_triggered"] = False
     return jsonify({"status": "ok"})
 
 @app.route('/download_invoice', methods=['GET'])
