@@ -3,7 +3,6 @@ import requests
 import time
 import threading
 import uuid
-import secrets
 import smtplib
 import io
 from functools import wraps
@@ -14,13 +13,13 @@ from weasyprint import HTML
 
 app = Flask(__name__)
 
-# --- SICHERHEITS- & SESSION-KONFIGURATION ---
-app.secret_key = "shelly_smart_hub_screen_scan_auth_2026"
+# Fester, starker Session-Key (verhindert Session-Verluste bei Server-Neustarts)
+app.secret_key = "shelly_fixed_secure_key_str222_2026_x99"
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SECURE=True,
-    SESSION_COOKIE_SAMESITE="Lax",  # Erlaubt reibungslose Übergabe aus der Smartphone-Kamera
-    PERMANENT_SESSION_LIFETIME=14400 # 4 Stunden Gültigkeit
+    SESSION_COOKIE_SAMESITE="Lax",
+    PERMANENT_SESSION_LIFETIME=14400
 )
 
 # GEHEIMER VOR-ORT TOKEN
@@ -67,7 +66,6 @@ def add_security_headers(response):
     response.headers["X-Frame-Options"] = "DENY"
     return response
 
-# SICHERHEITS-GUARD: Prüft, ob der QR-Code gescannt wurde
 def check_authenticated():
     return session.get("authenticated_on_site") is True and session.get("station_token") == STATION_PHYSICAL_TOKEN
 
@@ -79,7 +77,6 @@ def require_physical_auth(f):
         return f(*args, **kwargs)
     return decorated_function
 
-# ASYNCHRONER SCHALTBEFEHL (0ms Wartezeit für UI)
 def async_cloud_control(turn_on=True):
     def _worker():
         turn_str = "on" if turn_on else "off"
@@ -100,7 +97,6 @@ def async_cloud_control(turn_on=True):
             pass
     threading.Thread(target=_worker, daemon=True).start()
 
-# AUTOMATISCHE LASTPROFIL-KLASSIFIZIERUNG
 def classify_power_profile(avg_w, peak_w):
     if avg_w < 3.0 and peak_w < 6.0:
         return "lamp"
@@ -115,79 +111,37 @@ def classify_power_profile(avg_w, peak_w):
     else:
         return "appliance"
 
-# AUTARKER SERVER-MESSWORKER (Läuft unabhängig von Standby / Screensaver)
-def background_sensor_poller():
-    last_poll = time.time()
-    while True:
-        try:
-            now = time.time()
-            dt = now - last_poll
-            last_poll = now
+def fetch_live_cloud_metrics():
+    payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID}
+    try:
+        res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=2.0).json()
+        if res.get("isok"):
+            status = res.get("data", {}).get("device_status", {})
+            watt = 0.0
+            amp = 0.0
+            volt = 230.0
 
-            active_uid = global_state.get("active_user_id")
-            if active_uid and user_sessions.get(active_uid, {}).get("active", False):
-                u = user_sessions[active_uid]
-                
-                payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID}
-                res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=2.0).json()
-                
-                watt = 0.0
-                amp = 0.0
-                volt = 230.0
+            if "switch:0" in status:
+                sw = status["switch:0"]
+                watt = float(sw.get("apower", 0.0))
+                amp = float(sw.get("current", 0.0))
+                volt = float(sw.get("voltage", 230.0))
+            elif "meters" in status and len(status["meters"]) > 0:
+                m = status["meters"][0]
+                watt = float(m.get("power", 0.0))
+                amp = float(m.get("current", 0.0)) if "current" in m else (watt / 230.0 if watt > 0 else 0.0)
+                volt = float(m.get("voltage", 230.0)) if "voltage" in m else 230.0
+            elif "relays" in status and len(status["relays"]) > 0:
+                watt = float(status["relays"][0].get("power", 0.0))
+                amp = watt / 230.0 if watt > 0 else 0.0
 
-                if res.get("isok"):
-                    status = res.get("data", {}).get("device_status", {})
-                    if "switch:0" in status:
-                        sw = status["switch:0"]
-                        watt = float(sw.get("apower", 0.0))
-                        amp = float(sw.get("current", 0.0))
-                        volt = float(sw.get("voltage", 230.0))
-                    elif "meters" in status and len(status["meters"]) > 0:
-                        m = status["meters"][0]
-                        watt = float(m.get("power", 0.0))
-                        amp = float(m.get("current", 0.0)) if "current" in m else (watt / 230.0 if watt > 0 else 0.0)
-                        volt = float(m.get("voltage", 230.0)) if "voltage" in m else 230.0
-
-                global_state["last_watt"] = watt
-                global_state["last_amp"] = amp
-                global_state["last_volt"] = volt
-
-                u["current_watt"] = watt
-                u["current_ampere"] = amp
-                u["current_voltage"] = volt
-
-                if dt > 0:
-                    u["total_seconds"] += dt
-                    u["total_kwh"] += (watt * dt) / 3600000.0
-
-                # 30s-Lernphase sammeln
-                if u["total_seconds"] < 30 and not u["manually_selected"]:
-                    u["analysis_samples"].append(watt)
-                elif u["total_seconds"] >= 30 and not u["analysis_completed"] and not u["manually_selected"]:
-                    if len(u["analysis_samples"]) > 0:
-                        avg_w = sum(u["analysis_samples"]) / len(u["analysis_samples"])
-                        peak_w = max(u["analysis_samples"])
-                        u["device_key"] = classify_power_profile(avg_w, peak_w)
-                    u["analysis_completed"] = True
-
-                # Akku 100% Erkennung
-                prof = DEVICE_PROFILES.get(u["device_key"], {})
-                if prof.get("is_battery", False):
-                    if watt > 5.0:
-                        u["had_charging_phase"] = True
-                    
-                    if u["had_charging_phase"] and 0.4 <= watt < 1.8 and (u["total_kwh"] * 1000.0) > 3.0:
-                        u["battery_full_triggered"] = True
-                        u["active"] = False
-                        async_cloud_control(turn_on=False)
-            else:
-                global_state["last_watt"] = 0.0
-                global_state["last_amp"] = 0.0
-        except Exception:
-            pass
-        time.sleep(1.2)
-
-threading.Thread(target=background_sensor_poller, daemon=True).start()
+            global_state["last_watt"] = watt
+            global_state["last_amp"] = amp
+            global_state["last_volt"] = volt
+            return watt, amp, volt
+    except Exception:
+        pass
+    return global_state["last_watt"], global_state["last_amp"], global_state["last_volt"]
 
 def generate_pdf_invoice(report_data):
     html_invoice = f"""
@@ -504,7 +458,7 @@ HTML_PAGE = """
             <div style="font-size: 48px; margin-bottom: 10px;">⏳🔒</div>
             <div class="title" style="margin-bottom: 6px;">Steckdose aktuell belegt</div>
             <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 16px;">
-                Ein anderer authentifizierter Nutzer lädt gerade aktiv an dieser Station.
+                Ein anderer Nutzer lädt gerade aktiv an dieser Station.
             </p>
             <div style="background: #f1f5f9; padding: 12px; border-radius: 14px; margin-bottom: 16px; text-align: left; font-size: 13px;">
                 Aktuelle Leistung: <b id="busyWatt">0.000 W</b>
@@ -584,7 +538,7 @@ HTML_PAGE = """
                 <div class="stat-card">
                     <div class="stat-label">Laufzeit</div>
                     <div class="stat-val" id="timer">00:00:00</div>
-                    <div class="stat-sub">Autarke Server-Messung</div>
+                    <div class="stat-sub">Server-synchronisiert</div>
                 </div>
             </div>
 
@@ -826,7 +780,6 @@ HTML_PAGE = """
                 document.getElementById('cost').innerText = data.cost.toFixed(5);
                 document.getElementById('microCost').innerText = (data.cost * 100.0).toFixed(3);
 
-                // AKKU-LADEZUSTAND & RESTZEIT
                 if (data.current_profile && data.current_profile.is_battery) {
                     let cap = data.current_profile.capacity_wh || 50.0;
                     let loadedWh = data.wh;
@@ -883,6 +836,7 @@ def get_user_data():
             "terminated": False,
             "total_kwh": 0.0,
             "total_seconds": 0.0,
+            "last_check": None,
             "current_watt": 0.0,
             "current_ampere": 0.0,
             "current_voltage": 230.0,
@@ -898,7 +852,6 @@ def get_user_data():
 
 # --- AUTH-ROUTEN ---
 
-# Öffentliche Root-URL: Prüft Scan-Status
 @app.route('/')
 def home():
     token_param = request.args.get("token")
@@ -918,7 +871,6 @@ def home():
     get_user_data()
     return render_template_string(HTML_PAGE)
 
-# QR-Code Einstiegspunkt: Sofortige Authentifizierung & Anzeige
 @app.route('/scan/<token>')
 def scan_qr_entry(token):
     if token != STATION_PHYSICAL_TOKEN:
@@ -950,6 +902,7 @@ def start():
     global_state["transfer_requested"] = False
     global_state["transfer_requester_id"] = None
     u["active"] = True
+    u["last_check"] = time.time()
     async_cloud_control(turn_on=True)
     return jsonify({"status": "ok"})
 
@@ -961,6 +914,7 @@ def stop():
         return jsonify({"status": "forbidden"}), 403
 
     u["active"] = False
+    u["last_check"] = None
     u["current_watt"] = 0.0
     u["current_ampere"] = 0.0
     async_cloud_control(turn_on=False)
@@ -1108,6 +1062,37 @@ def status():
         if user_sessions.get(active_uid, {}).get("active", False):
             is_busy = True
             global_w = global_state["last_watt"]
+
+    # Direkte Integration der Messwerte im 1-Sekunden-Takt
+    if u["active"]:
+        now = time.time()
+        w, a, v = fetch_live_cloud_metrics()
+        
+        u["current_watt"] = w
+        u["current_ampere"] = a
+        u["current_voltage"] = v
+        
+        if u.get("last_check"):
+            dt = now - u["last_check"]
+            if 0 < dt < 10:
+                u["total_seconds"] += dt
+                u["total_kwh"] += (w * dt) / 3600000.0
+        u["last_check"] = now
+
+        # 30-Sekunden-Lernphase sammeln
+        if u["total_seconds"] < 30 and not u.get("manually_selected"):
+            u["analysis_samples"].append(w)
+        elif u["total_seconds"] >= 30 and not u.get("analysis_completed") and not u.get("manually_selected"):
+            if len(u["analysis_samples"]) > 0:
+                avg_w = sum(u["analysis_samples"]) / len(u["analysis_samples"])
+                peak_w = max(u["analysis_samples"])
+                u["device_key"] = classify_power_profile(avg_w, peak_w)
+            u["analysis_completed"] = True
+    else:
+        u["last_check"] = None
+        u["current_watt"] = 0.0
+        u["current_ampere"] = 0.0
+        u["current_voltage"] = 230.0
 
     dev_key = u.get("device_key", "lamp")
     
