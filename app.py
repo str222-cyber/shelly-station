@@ -4,16 +4,15 @@ import time
 import uuid
 
 app = Flask(__name__)
-app.secret_key = "shelly_smart_learning_multiuser_2026"
+app.secret_key = "shelly_smart_unplug_10s_verified_2026"
 
-# --- SHELLY CLOUD KONFIGURATION ---
+# --- SHELLY CLOUD DATEN ---
 SHELLY_CLOUD_URL = "https://shelly-274-eu.shelly.cloud"
 AUTH_KEY = "NDcwMzFkdWlkF9839F81801CF17665B14F2EED9BDC41514AEAB2C6C041201D306ABBC40BDE2A0AD2F80ACE98C596"
 DEVICE_ID = "08927249a904"
 
 STROMPREIS_PER_KWH = 0.35
 
-# Globaler Status für Multi-User Management
 global_state = {
     "active_user_id": None,
     "waiting_user_id": None,
@@ -23,7 +22,6 @@ global_state = {
 
 user_sessions = {}
 
-# Gelernte Geräteprofile (Watt-Spannen)
 learned_profiles = {
     "lamp": {"name": "💡 Lampe / Beleuchtung", "icon": "💡", "min_w": 2.0, "max_w": 40.0, "is_battery": False},
     "phone": {"name": "📱 Smartphone / Tablet", "icon": "📱", "min_w": 4.0, "max_w": 35.0, "is_battery": True},
@@ -88,7 +86,7 @@ HTML = """
 <html lang="de">
 <head>
     <meta charset="utf-8">
-    <title>Smart Power Station</title>
+    <title>Smart Power Hub</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <style>
         :root {
@@ -114,7 +112,6 @@ HTML = """
         .title { font-size: 18px; font-weight: 700; color: var(--text-main); letter-spacing: -0.3px; }
         .rate-badge { background: #f1f5f9; color: var(--text-muted); font-size: 12px; padding: 4px 10px; border-radius: 20px; font-weight: 600; }
 
-        /* KI & LERNEN BANNER */
         .ai-banner {
             background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
             border: 1px solid var(--border-color);
@@ -132,7 +129,6 @@ HTML = """
         .ai-detected { font-size: 14px; font-weight: 700; color: var(--text-main); }
         .ai-mode { font-size: 11px; color: var(--text-muted); margin-top: 1px; }
 
-        /* STATUS BADGE */
         .status-pill {
             display: inline-flex;
             align-items: center;
@@ -182,7 +178,6 @@ HTML = """
         .btn-stop { background: #f1f5f9; color: var(--text-main); border: 1px solid var(--border-color); }
         .btn-finish { background: #fee2e2; color: var(--accent-red); }
 
-        /* MODAL OVERLAYS */
         .modal-overlay {
             display: none;
             position: fixed;
@@ -206,7 +201,6 @@ HTML = """
         }
         @keyframes popIn { from { transform: scale(0.85); opacity: 0; } to { transform: scale(1); opacity: 1; } }
 
-        /* GERÄTE AUSWAHL LISTE */
         .device-option-btn {
             background: #f8fafc;
             border: 1px solid var(--border-color);
@@ -224,22 +218,20 @@ HTML = """
         }
         .device-option-btn:hover { background: #edf2f7; }
 
-        /* QUITTUNG */
         .receipt-card { display: none; text-align: left; }
         .receipt-header { text-align: center; margin-bottom: 18px; }
         .receipt-row { display: flex; justify-content: space-between; padding: 9px 0; border-bottom: 1px solid var(--border-color); font-size: 14px; }
         .receipt-total { border-top: 2px solid var(--text-main); border-bottom: none; font-size: 17px; font-weight: 700; margin-top: 10px; padding-top: 12px; }
 
-        /* BESETZT ANSICHT */
         .busy-card { display: none; text-align: center; }
     </style>
 </head>
 <body>
-    <!-- MODAL 1: GERTÄT MANUELL TRAINIEREN / ÄNDERN -->
+    <!-- MODAL 1: TRAINIEREN -->
     <div id="deviceModal" class="modal-overlay">
         <div class="modal-box">
-            <h3 style="margin-bottom: 6px;">Gerät auswählen & trainieren</h3>
-            <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">Wähle das tatsächliche Gerät. Das System lernt dieses Profil für die Zukunft.</p>
+            <h3 style="margin-bottom: 6px;">Gerät manuell auswählen</h3>
+            <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">Wähle den Typ. Das System merkt sich das Lastprofil.</p>
             
             <button class="device-option-btn" onclick="saveDeviceProfile('lamp')">💡 Lampe / Beleuchtung (Dauerbetrieb)</button>
             <button class="device-option-btn" onclick="saveDeviceProfile('phone')">📱 Smartphone / Tablet (Akku)</button>
@@ -252,7 +244,7 @@ HTML = """
         </div>
     </div>
 
-    <!-- MODAL 2: ANFRAGE ZWEITER NUTZER -->
+    <!-- MODAL 2: FREIGABE-ANFRAGE -->
     <div id="transferModal" class="modal-overlay">
         <div class="modal-box" style="border: 2px solid var(--accent-amber);">
             <div style="font-size: 40px; margin-bottom: 6px;">👋🔔</div>
@@ -279,7 +271,7 @@ HTML = """
     </div>
 
     <div class="container">
-        <!-- BESETZT-KARTE (FÜR NUTZER 2) -->
+        <!-- BESETZT-KARTE -->
         <div class="card busy-card" id="busyCard">
             <div style="font-size: 48px; margin-bottom: 10px;">⏳🔒</div>
             <div class="title" style="margin-bottom: 6px;">Steckdose aktuell belegt</div>
@@ -296,7 +288,7 @@ HTML = """
             </div>
         </div>
 
-        <!-- HAUPTKARTE (FÜR NUTZER 1) -->
+        <!-- HAUPTKARTE -->
         <div class="card" id="mainCard">
             <div class="header">
                 <span class="title">⚡ Smart Power Hub</span>
@@ -310,22 +302,20 @@ HTML = """
                 </div>
             </div>
 
-            <!-- KI & LERNEN -->
             <div class="ai-banner">
                 <div class="ai-header">
-                    <span class="ai-title">Erkanntes Gerät & Modus</span>
+                    <span class="ai-title">Erkanntes Gerät</span>
                     <button class="btn-edit" onclick="document.getElementById('deviceModal').style.display='flex'">✏️ Ändern / Trainieren</button>
                 </div>
                 <div class="ai-body">
                     <div class="ai-icon" id="devIcon">🔍</div>
                     <div>
                         <div class="ai-detected" id="detectedName">Warte auf Start...</div>
-                        <div class="ai-mode" id="detectedMode">Erkennung aktiv (Check alle 60s)</div>
+                        <div class="ai-mode" id="detectedMode">Check-Intervall: 60s</div>
                     </div>
                 </div>
             </div>
 
-            <!-- LEISTUNG & LAUFZEIT -->
             <div class="grid-2">
                 <div class="stat-card stat-watt">
                     <div class="stat-label">Leistung</div>
@@ -339,7 +329,6 @@ HTML = """
                 </div>
             </div>
 
-            <!-- ENERGIE & KOSTEN -->
             <div class="grid-2">
                 <div class="stat-card">
                     <div class="stat-label">Verbrauch (Wh)</div>
@@ -354,7 +343,7 @@ HTML = """
             </div>
 
             <div class="btn-group">
-                <button class="btn-start" onclick="startSession()">▶️ Start / Fortsetzen</button>
+                <button class="btn-start" id="mainStartBtn" onclick="startSession()">▶️ Start / Fortsetzen</button>
                 <button class="btn-stop" onclick="sendAction('/stop')">⏸️ Pause</button>
                 <button class="btn-finish" onclick="logout()">🧾 Beenden & Abrechnen</button>
             </div>
@@ -386,11 +375,11 @@ HTML = """
 
         let windowSamples = [];
         let historicalPeakWatt = 0.0;
-        let hadHighChargingPhase = false;
+        let activePowerObserved = false;
         let isBatteryDevice = false;
         let manualOverride = false;
-        let unpluggedDetected = false;
-        let currentDeviceKey = "lamp";
+        let unplugCounter = 0; // Zähler für 10-Sekunden-Filter
+        let isUnplugged = false;
         let currentClassification = { name: "Warte auf Messung...", icon: "🔍", isBattery: false };
 
         function playContinuousTone() {
@@ -423,7 +412,8 @@ HTML = """
 
         function startSession() {
             if (audioCtx.state === 'suspended') { audioCtx.resume(); }
-            unpluggedDetected = false;
+            isUnplugged = false;
+            unplugCounter = 0;
             sendAction('/start');
         }
 
@@ -440,10 +430,7 @@ HTML = """
 
         async function saveDeviceProfile(key) {
             manualOverride = true;
-            currentDeviceKey = key;
             document.getElementById('deviceModal').style.display = 'none';
-            
-            // Profil an Server zum Trainieren senden
             await sendAction('/train_profile', { key: key, peak_w: historicalPeakWatt });
             
             let prof = {
@@ -489,7 +476,7 @@ HTML = """
             } else if (avgW >= 2.0 && avgW < 35.0) {
                 return { name: "💡 Lampe / 📱 Smartphone", icon: "💡", isBattery: false };
             } else if (avgW >= 35.0 && avgW < 100.0) {
-                return { name: "💻 Laptop / Bildschirm", icon: "💻", isBattery: true };
+                return { name: "💻 Laptop / Monitor", icon: "💻", isBattery: true };
             } else if (avgW >= 100.0 && avgW < 250.0) {
                 return { name: "🚲 E-Bike Ladegerät (Standard)", icon: "🚲", isBattery: true };
             } else if (avgW >= 250.0 && avgW < 600.0) {
@@ -525,7 +512,6 @@ HTML = """
                 let res = await fetch('/status', { cache: 'no-store' });
                 let data = await res.json();
                 
-                // MULTI-USER CHECK
                 if (data.is_busy_for_other) {
                     document.getElementById('mainCard').style.display = 'none';
                     document.getElementById('busyCard').style.display = 'block';
@@ -541,7 +527,6 @@ HTML = """
                     document.getElementById('mainCard').style.display = 'block';
                 }
 
-                // ANFRAGE DES ANDEREN NUTZERS ERHALTEN?
                 if (data.transfer_requested) {
                     document.getElementById('transferModal').style.display = 'flex';
                 }
@@ -559,30 +544,42 @@ HTML = """
 
                 let badge = document.getElementById('statusBadge');
                 let text = document.getElementById('statusText');
+                let startBtn = document.getElementById('mainStartBtn');
                 
                 if (data.active) {
                     windowSamples.push(currentW);
                     if (currentW > historicalPeakWatt) historicalPeakWatt = currentW;
 
-                    if (historicalPeakWatt > 6.0 && currentW > 5.0) {
-                        hadHighChargingPhase = true;
+                    if (currentW > 3.0) {
+                        activePowerObserved = true;
                     }
 
-                    // 1. UNPLUG-ERKENNUNG (Kabel gezogen -> Strom schlagartig 0)
-                    if (sec > 5 && hadHighChargingPhase && currentW < 0.3) {
-                        unpluggedDetected = true;
-                        await sendAction('/stop');
-                        badge.className = "status-pill status-unplug";
-                        text.innerText = "🔌 Kabel ausgesteckt (Pausiert)";
-                        document.getElementById('wattSub').innerText = "Warte auf Wiedereinstecken";
-                        return;
+                    // --- 10-SEKUNDEN UNPLUG ERKENNUNGS-FILTER ---
+                    if (activePowerObserved && currentW < 0.2) {
+                        unplugCounter++;
+                        document.getElementById('wattSub').innerText = `Verbindung getrennt? Prüfe (${unplugCounter}/10s)...`;
+                        
+                        // Erst wenn 10 aufeinanderfolgende Sekunden 0 W anliegen:
+                        if (unplugCounter >= 10) {
+                            isUnplugged = true;
+                            unplugCounter = 0;
+                            await sendAction('/stop');
+                            badge.className = "status-pill status-unplug";
+                            text.innerText = "🔌 Kabel ausgesteckt – Strom pausiert";
+                            document.getElementById('wattSub').innerText = "Warte auf Wiedereinstecken & Start";
+                            startBtn.innerText = "▶️ Kabel wieder drin? Weiterladen";
+                            return;
+                        }
+                    } else {
+                        unplugCounter = 0; // Reset, sobald auch nur 1 Watt fließt (Netzschwankung)
+                        document.getElementById('wattSub').innerText = currentW > 0.5 ? "Fließt stabil" : "Keine Last";
                     }
 
                     badge.className = "status-pill status-on";
                     text.innerText = "Aktiv / Strom fließt";
-                    document.getElementById('wattSub').innerText = currentW > 0.5 ? "Fließt stabil" : "Keine Last";
+                    startBtn.innerText = "▶️ Läuft bereits";
 
-                    // Re-Klassifizierung alle 60s (wenn nicht manuell überschrieben)
+                    // Re-Klassifizierung alle 60s
                     let secInMinute = sec % 60;
                     let nextCheck = 60 - secInMinute;
                     document.getElementById('nextCheckSub').innerText = `Check in ${nextCheck}s`;
@@ -607,20 +604,23 @@ HTML = """
                         }
                     }
 
-                    // 2. 100% VOLLGELADEN BEI AKKUS
-                    if (isBatteryDevice && hadHighChargingPhase && currentW < 2.0 && data.wh > 2.0 && !unpluggedDetected) {
+                    // --- 100% VOLLGELADEN BEI AKKUS ---
+                    // Typisch: Netzteil bleibt in Steckdose (zieht 0,4W - 2,0W), lädt aber nicht mehr aktiv
+                    if (isBatteryDevice && historicalPeakWatt > 8.0 && currentW >= 0.3 && currentW < 2.2 && data.wh > 2.0) {
                         await sendAction('/stop');
                         document.getElementById('fullModal').style.display = 'flex';
                         startAudioAlert();
                     }
 
                 } else {
-                    if (unpluggedDetected) {
+                    if (isUnplugged) {
                         badge.className = "status-pill status-unplug";
-                        text.innerText = "🔌 Kabel gezogen – Pausiert";
+                        text.innerText = "🔌 Kabel ausgesteckt – Strom pausiert";
+                        startBtn.innerText = "▶️ Kabel wieder drin? Fortsetzen";
                     } else {
                         badge.className = "status-pill status-off";
                         text.innerText = "Pausiert / Bereit";
+                        startBtn.innerText = "▶️ Start / Fortsetzen";
                     }
                     
                     if (sec === 0) {
@@ -628,12 +628,12 @@ HTML = """
                         document.getElementById('devIcon').innerText = "🔍";
                         windowSamples = [];
                         historicalPeakWatt = 0;
-                        hadHighChargingPhase = false;
+                        activePowerObserved = false;
                         manualOverride = false;
+                        unplugCounter = 0;
                     }
                 }
 
-                // Balken
                 let whP = Math.min(100, (data.wh / 500.0) * 100);
                 document.getElementById('whBar').style.width = whP + '%';
 
@@ -691,7 +691,6 @@ def train_profile():
     key = data.get("key")
     peak_w = float(data.get("peak_w", 0.0))
     if key in learned_profiles and peak_w > 0:
-        # Dynamisches Anpassen der gelernten Watt-Grenzen
         learned_profiles[key]["max_w"] = max(learned_profiles[key]["max_w"], peak_w * 1.2)
     return jsonify({"status": "trained"})
 
@@ -738,7 +737,6 @@ def status():
     u, uid = get_user_data()
     active_uid = global_state.get("active_user_id")
     
-    # Ist ein anderer Nutzer gerade aktiv?
     is_busy = False
     if active_uid and active_uid != uid and user_sessions.get(active_uid, {}).get("active", False):
         is_busy = True
