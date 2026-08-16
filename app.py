@@ -44,7 +44,7 @@ AI_MODEL_FILE = "ai_learned_models.json"
 
 DEFAULT_AI_PROFILES = {
     "lamp": {"avg_w": 1.2, "peak_w": 2.0, "variance": 0.1, "count": 1},
-    "phone": {"name": "📱 Smartphone / Tablet", "avg_w": 15.0, "peak_w": 25.0, "variance": 3.5, "count": 1},
+    "phone": {"name": "📱 Smartphone / Tablet", "avg_w": 10.0, "peak_w": 20.0, "variance": 3.0, "count": 1},
     "laptop": {"name": "💻 Laptop / Monitor", "avg_w": 45.0, "peak_w": 75.0, "variance": 12.0, "count": 1},
     "ebike_std": {"name": "🚲 E-Bike Akku Standard", "avg_w": 140.0, "peak_w": 170.0, "variance": 8.0, "count": 1},
     "ebike_fast": {"name": "⚡ E-Bike Schnelllader / PC", "avg_w": 350.0, "peak_w": 420.0, "variance": 15.0, "count": 1},
@@ -81,7 +81,8 @@ def get_total_learned_count():
     return sum(m.get("count", 1) for m in models.values())
 
 def get_analysis_threshold():
-    return 20.0
+    # Exakt 30 Sekunden Stabile Erkennungsphase wie gewünscht
+    return 30.0
 
 learned_models = load_ai_models()
 
@@ -157,11 +158,23 @@ def extract_features(samples):
     return avg_w, peak_w, var_w
 
 def ai_classify_samples(samples):
-    if not samples or max(samples) < 2.0:
+    if not samples:
         return "lamp"
+    
     avg_w, peak_w, var_w = extract_features(samples)
-    current_models = load_ai_models()
 
+    # Intelligente Vorab-Regeln für Handys / Akkus vs Dauerbetrieb
+    if 1.5 <= avg_w < 35.0 or (2.0 <= peak_w < 40.0 and avg_w < 30.0):
+        return "phone"
+    elif 35.0 <= avg_w < 90.0:
+        return "laptop"
+    elif 90.0 <= avg_w < 250.0:
+        return "ebike_std"
+    elif 250.0 <= avg_w < 650.0:
+        return "ebike_fast"
+    
+    # KNN Schwarmwissen Fallback
+    current_models = load_ai_models()
     best_key = "lamp"
     min_dist = float("inf")
     for key, model in current_models.items():
@@ -259,8 +272,9 @@ def background_meter_worker():
 
                     threshold = get_analysis_threshold()
 
+                    # Exakte 30 Sekunden Analysephase
                     if u["total_seconds"] < threshold and not u["manually_selected"]:
-                        if watt > 0.5:
+                        if watt > 0.2:
                             u["analysis_samples"].append(watt)
                     elif u["total_seconds"] >= threshold and not u["analysis_completed"] and not u["manually_selected"]:
                         u["device_key"] = ai_classify_samples(u["analysis_samples"])
@@ -283,6 +297,7 @@ def background_meter_worker():
                     elif watt > 0.05:
                         u["zero_power_counter"] = 0.0
 
+                    # 80% & 100% Erkennung
                     prof = DEVICE_PROFILES.get(u["device_key"], {})
                     if prof.get("is_battery", False) and u["total_seconds"] > threshold:
                         wh = u["total_kwh"] * 1000.0
@@ -705,7 +720,7 @@ HTML_PAGE = """
                     <div class="ai-icon" id="devIcon">💡</div>
                     <div>
                         <div class="ai-detected" id="detectedName">Bereit</div>
-                        <div class="ai-mode" id="detectedMode">AI Lastanalyse (20s)...</div>
+                        <div class="ai-mode" id="detectedMode">AI Lastanalyse (30s)...</div>
                     </div>
                 </div>
             </div>
@@ -797,7 +812,7 @@ HTML_PAGE = """
                 <div id="emailFeedback" style="display:none; font-size:12px; font-weight:600; margin-top:8px;"></div>
             </div>
 
-            <!-- SCHLIESSEN & QR-CODE HINWEIS -->
+            <!-- QR-CODE SCHLIESSEN BUTTON -->
             <div style="margin-top: 16px; display: flex; flex-direction: column; gap: 8px;">
                 <button class="btn-start" style="background: var(--text-main); font-size: 14px; padding: 12px;" onclick="startNewSessionCompletely()">Please restart by scanning the QR code again</button>
                 <div id="transferChoiceBox" style="display: flex; flex-direction: column; gap: 8px;">
@@ -1066,7 +1081,7 @@ HTML_PAGE = """
                 let thresh = data.analysis_threshold;
                 if (data.active && sec < thresh && !data.manually_selected) {
                     let remain = Math.max(0, Math.floor(thresh - sec));
-                    document.getElementById('aiStatusTitle').innerText = `AI Erkennung (20s)`;
+                    document.getElementById('aiStatusTitle').innerText = `AI Erkennung (30s)`;
                     document.getElementById('detectedName').innerText = `Analysiere... (${remain}s)`;
                 } else if (data.analysis_completed && !data.manually_selected) {
                     document.getElementById('aiStatusTitle').innerText = `🤖 AI Erkannt`;
@@ -1219,7 +1234,7 @@ def start():
 def stop():
     ensure_worker()
     u, uid = get_user_data()
-    if u.get("terminated", False) or global_state.get("active_user_id") != uid:
+    if u.get("terminated", False) or global_state.get("active_user_id"] != uid:
         return jsonify({"status": "forbidden"}), 403
 
     u["active"] = False
