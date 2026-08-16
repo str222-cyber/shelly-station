@@ -159,18 +159,24 @@ def estimate_current_soc(profile_key, samples):
     return 0.0
 
 def save_sub_session(u, uid):
+    """Speichert das aktuell geladene Gerät ab, bevor ein neues (oder gleiches) angesteckt wird."""
     if u["total_kwh"] > 0.0001: 
+        prof_name = DEVICE_PROFILES.get(u["device_key"], {}).get("name", "Unbekannt")
+        c_name = u.get("custom_name", "").strip()
+        final_name = f"{c_name} ({prof_name})" if c_name else prof_name
+        
         record = {
             "session_id": str(uuid.uuid4())[:8],
             "user_id": uid,
             "date": time.strftime('%Y-%m-%d'),
             "timestamp": time.strftime('%H:%M:%S'),
             "device_key": u["device_key"],
-            "device_name": DEVICE_PROFILES.get(u["device_key"], {}).get("name", "Unbekannt"),
+            "device_name": final_name,
             "wh": u["total_kwh"] * 1000.0,
             "cost": u["total_kwh"] * STROMPREIS_PER_KWH,
             "duration_sec": u["total_seconds"]
         }
+        if "completed_sub_sessions" not in u: u["completed_sub_sessions"] = []
         u["completed_sub_sessions"].append(record)
         append_to_history(record) 
 
@@ -184,6 +190,7 @@ def save_sub_session(u, uid):
     u["battery_full_triggered"] = False
     u["eighty_percent_triggered"] = False
     u["device_key"] = "phone"
+    u["custom_name"] = ""
     
 def background_meter_worker():
     last_loop = time.time()
@@ -196,7 +203,8 @@ def background_meter_worker():
             active_uid = global_state.get("active_user_id")
             
             for uid, u in user_sessions.items():
-                if not u.get("active", False) and not u.get("detection_mode", False): continue
+                if not u.get("active", False) and not u.get("detection_mode", False) and not u.get("unplugged_detected", False):
+                    continue
                 
                 watt, amp, volt = 0.0, 0.0, 230.0
                 try:
@@ -224,15 +232,24 @@ def background_meter_worker():
 
                 u["session_peak_watt"] = max(u.get("session_peak_watt", 0.0), watt)
 
+                # --- 1. DETECTION MODE (Ganz am Anfang) ---
                 if not u["active"] and u.get("detection_mode", False):
                     if time.time() - u.get("last_seen", time.time()) > 15.0:
                         u["detection_mode"], u["show_start_prompt"] = False, False
                         async_cloud_control(turn_on=False)
                         continue
-                    # Sensible Einsteck-Erkennung: Schon 0.2A oder 0.5W weisen auf Einrasten hin
                     u["show_start_prompt"] = (watt > 0.5 or amp > 0.01)
                     continue 
 
+                # --- 2. UNPLUGGED DETECTED (Warten auf neues Gerät) ---
+                if u.get("unplugged_detected", False) and not u.get("active", False):
+                    if watt > 0.5 or amp > 0.01:
+                        u["show_reconnect_prompt"] = True
+                    else:
+                        u["show_reconnect_prompt"] = False
+                    continue
+
+                # --- 3. AKTIVE SESSION ---
                 if u.get("active", False):
                     u["total_seconds"] += dt
                     if watt > 0.05: u["total_kwh"] += (watt * dt) / 3600000.0
@@ -260,32 +277,23 @@ def background_meter_worker():
                             if est_soc > current_calc_soc + 5.0: u["estimated_soc_0"] = est_soc - (((u.get("total_kwh", 0.0) * 1000.0) / max(1,cap)) * 100.0)
                         if u["total_seconds"] >= 40.0: u["analysis_completed"] = True
 
-                    # --- SOFTWARE-KLINKEN-SENSOR (NEU) ---
+                    # KABEL AUSSTECK ERKENNUNG
                     if watt > 0.5 or amp > 0.01: 
                         u["had_power_draw"], u["zero_power_counter"] = True, 0.0
                         
                     if u.get("had_power_draw"):
-                        # HARTER DISCONNECT: Ampere exakt Null (Stromkreis mechanisch offen!)
                         if watt <= 0.1 and amp <= 0.005:
                             u["zero_power_counter"] += dt
-                            if u["zero_power_counter"] >= 10.0: # Nach nur 10s harter Abbruch
+                            if u["zero_power_counter"] >= 10.0:
+                                # Wir lassen Relais AN, um das nächste Einstecken zu merken!
                                 u["active"], u["unplugged_detected"], u["had_power_draw"] = False, True, False
-                                async_cloud_control(turn_on=False)
-                                save_sub_session(u, uid)
-                                u["detection_mode"] = True
-                        
-                        # WEICHER DISCONNECT: Handys bei 100% oder Lampen aus (Standby)
                         elif watt <= 0.2:
                             u["zero_power_counter"] += dt
                             if u["zero_power_counter"] >= 65.0:  
                                 u["active"], u["unplugged_detected"], u["had_power_draw"] = False, True, False
-                                async_cloud_control(turn_on=False)
-                                save_sub_session(u, uid)
-                                u["detection_mode"] = True
                         else:
                             u["zero_power_counter"] = 0.0
 
-                    # 80% / 100% Limitierung
                     prof = DEVICE_PROFILES.get(u.get("device_key"), {})
                     if prof.get("is_battery", False) and u["total_seconds"] > 40.0:
                         current_pct = u.get("estimated_soc_0", 0.0) + (((u["total_kwh"] * 1000.0) / prof.get("capacity_wh", 20.0)) * 100.0)
@@ -405,7 +413,6 @@ HTML_ADMIN = """
 def admin_dashboard():
     history = load_history()
     today = time.strftime('%Y-%m-%d')
-    
     today_records = [r for r in history if r.get("date") == today]
     
     total_wh = sum(r.get("wh", 0) for r in today_records)
@@ -501,20 +508,35 @@ HTML_PAGE = """
 </head>
 <body>
     
+    <!-- KABEL ERKANNT POP-UP (Start / Neues Gerät) -->
     <div id="plugDetectedModal" class="modal-overlay">
         <div class="modal-box" style="border: 2px solid var(--accent-cyan);">
             <div style="font-size: 48px; margin-bottom: 8px;">🔌⚡</div>
             <h2 style="font-size: 20px; color: var(--accent-cyan); margin-bottom: 6px;">Kabel eingesteckt!</h2>
-            <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 16px;">Möchtest du dieses Gerät jetzt aufladen?</p>
-            <button class="btn-start" style="background: var(--accent-cyan); margin-bottom: 8px;" onclick="confirmStart()">▶️ Ja, Ladevorgang starten</button>
-            <button class="btn-stop" onclick="closeAppEarly()">❌ Nein, abbrechen</button>
+            <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 12px;">Möchtest du dieses Gerät jetzt aufladen?</p>
+            <input type="text" id="customNameStart" placeholder="Gerätename (z.B. Mein iPhone)" class="email-input">
+            <button class="btn-start" style="background: var(--accent-cyan); margin-bottom: 8px;" onclick="confirmStartNew()">▶️ Ladevorgang starten</button>
+            <button class="btn-stop" onclick="closeAppEarly()">❌ Abbrechen</button>
         </div>
     </div>
 
+    <!-- KABEL WIEDER EINGESTECKT (Multi-Session Auswahl) -->
+    <div id="reconnectModal" class="modal-overlay">
+        <div class="modal-box" style="border: 2px solid var(--accent-cyan);">
+            <div style="font-size: 48px; margin-bottom: 8px;">🔄🔌</div>
+            <h2 style="font-size: 20px; color: var(--accent-cyan); margin-bottom: 6px;">Kabel wieder eingesteckt!</h2>
+            <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 12px;">Ist das ein komplett neues Gerät oder möchtest du das vorherige Gerät weiterladen?</p>
+            <input type="text" id="customNameReconnect" placeholder="Name für NEUES Gerät (optional)" class="email-input">
+            <button class="btn-start" style="background: var(--accent-cyan); margin-bottom: 8px;" onclick="confirmStartNewFromReconnect()">▶️ Als NEUES Gerät starten</button>
+            <button class="btn-stop" style="margin-bottom: 8px; border-color: var(--accent-cyan); color: var(--accent-cyan);" onclick="confirmResume()">🔄 Vorheriges fortsetzen</button>
+        </div>
+    </div>
+
+    <!-- GERÄTE MODAL -->
     <div id="deviceModal" class="modal-overlay">
         <div class="modal-box">
             <h3 style="margin-bottom: 6px;">Gerät manuell festlegen</h3>
-            <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">Wähle dein Gerät aus. Das Schwarmwissen der AI lernt dadurch automatisch mit.</p>
+            <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">Wähle dein Gerät aus. Die Prognosen werden sofort optimiert.</p>
             <button class="device-option-btn" onclick="saveDeviceProfile('lamp')">💡 Lampe / Dauerbetrieb</button>
             <button class="device-option-btn" onclick="saveDeviceProfile('phone')">📱 Smartphone / Tablet</button>
             <button class="device-option-btn" onclick="saveDeviceProfile('laptop')">💻 Laptop / Monitor</button>
@@ -525,22 +547,12 @@ HTML_PAGE = """
         </div>
     </div>
 
-    <div id="eightyModal" class="modal-overlay">
-        <div class="modal-box" style="border: 2px solid var(--accent-primary);">
-            <div style="font-size: 48px; margin-bottom: 8px;">🔋⚡</div>
-            <h2 style="font-size: 19px; color: var(--accent-primary); margin-bottom: 6px;">Gerät voll genug geladen (80%)</h2>
-            <p style="font-size: 13px; margin-bottom: 12px;">Der Stromfluss wurde gestoppt. Bitte Gerät abstecken für den Akkuschutz.</p>
-            <button class="btn-start" style="background: var(--accent-green); margin-bottom: 8px;" onclick="document.getElementById('eightyModal').style.display='none'">✅ Okay, verstanden</button>
-            <button class="btn-stop" onclick="dismissEightyModal()">Ignorieren & weiterladen</button>
-        </div>
-    </div>
-
     <div class="container">
         <!-- HAUPTKARTE -->
         <div class="card" id="mainCard">
             <div class="header">
                 <span class="title">⚡ Smart Power Hub</span>
-                <span class="rate-badge">""" + str(STROMPREIS_PER_KWH) + """ €/kWh</span>
+                <span class="rate-badge">{{ strompreis }} €/kWh</span>
             </div>
             
             <div id="statusBadge" class="status-pill status-off">
@@ -628,7 +640,7 @@ HTML_PAGE = """
             </div>
 
             <div class="btn-group">
-                <button class="btn-start" id="mainStartBtn" onclick="startSession()">▶️ Start / Fortsetzen</button>
+                <button class="btn-start" id="mainStartBtn" onclick="resumeSession()">▶️ Start / Fortsetzen</button>
                 <button class="btn-stop" onclick="pauseSession()">⏸️ Pause</button>
                 <button class="btn-finish" onclick="logout(true)">🧾 Gesamtsitzung Beenden & Abrechnen</button>
                 <button class="btn-stop" style="background: #fef2f2; color: var(--accent-red); border-color: #fecaca; margin-top: 8px;" onclick="closeAppEarly()">❌ Fenster komplett schließen</button>
@@ -656,7 +668,7 @@ HTML_PAGE = """
             </div>
 
             <div style="margin-top: 24px; display: flex; flex-direction: column; gap: 10px;">
-                <button onclick="closeApp()" style="background: #ef4444; color: white; font-size: 16px; padding: 16px; font-weight: bold; border-radius: 14px;">❌ App komplett schließen</button>
+                <button onclick="closeApp()" style="background: #ef4444; color: white; font-size: 16px; padding: 16px; font-weight: bold; border-radius: 14px; border: none; cursor: pointer;">❌ App komplett schließen</button>
                 <button class="btn-stop" style="font-size: 14px; padding: 12px;" onclick="startNewSessionCompletely()">🔄 Neuer QR-Scan / Neustart</button>
             </div>
         </div>
@@ -665,8 +677,8 @@ HTML_PAGE = """
     <script>
         let isTerminated = false;
         let lastReport = null;
-        let eightyModalDismissed = false;
         let startPromptShown = false;
+        let reconnectPromptShown = false;
         let stationToken = 'SEC-STATION-2026-X99Q-ALPHA-77';
         
         let userId = localStorage.getItem('hub_user_id');
@@ -686,10 +698,27 @@ HTML_PAGE = """
             document.body.innerHTML = `<div style="display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; text-align:center; background:#0f172a; color:#f8fafc; margin:-18px -12px;"><div style="font-size: 60px; margin-bottom:20px;">🔒</div><h2 style="color: #38bdf8;">Sicher beendet</h2><p>Du kannst das Fenster schließen.</p></div>`;
         }
 
-        async function confirmStart() {
+        async function confirmStartNew() {
+            let name = document.getElementById('customNameStart').value;
             document.getElementById('plugDetectedModal').style.display = 'none';
             startPromptShown = false;
-            await startSession();
+            await sendAction('/start_new', {custom_name: name});
+            fetchSyncData();
+        }
+
+        async function confirmStartNewFromReconnect() {
+            let name = document.getElementById('customNameReconnect').value;
+            document.getElementById('reconnectModal').style.display = 'none';
+            reconnectPromptShown = false;
+            await sendAction('/start_new', {custom_name: name});
+            fetchSyncData();
+        }
+
+        async function confirmResume() {
+            document.getElementById('reconnectModal').style.display = 'none';
+            reconnectPromptShown = false;
+            await sendAction('/resume');
+            fetchSyncData();
         }
 
         function updateTimerUI(sec) {
@@ -706,11 +735,11 @@ HTML_PAGE = """
             } catch(e) { return {}; }
         }
 
-        async function startSession() {
+        async function resumeSession() {
             if (isTerminated) return;
             document.getElementById('statusBadge').className = "status-pill status-on";
             document.getElementById('statusText').innerText = "Aktiv / Strom fließt";
-            await sendAction('/start');
+            await sendAction('/resume');
             fetchSyncData();
         }
 
@@ -725,12 +754,13 @@ HTML_PAGE = """
         async function saveDeviceProfile(key) {
             document.getElementById('deviceModal').style.display = 'none';
             let res = await sendAction('/save_device', { key: key });
-            applyProfile(key, res.profile);
+            applyProfile(key, res.profile, document.getElementById('detectedName').innerText.split('(')[0].trim());
         }
 
-        function applyProfile(key, prof) {
+        function applyProfile(key, prof, custom_name) {
             document.getElementById('devIcon').innerText = prof.icon;
-            document.getElementById('detectedName').innerText = prof.name;
+            let dispName = custom_name ? `${custom_name} (${prof.name})` : prof.name;
+            document.getElementById('detectedName').innerText = dispName;
             document.getElementById('detectedMode').innerText = prof.is_battery ? "🔋 Akku-Ladeüberwachung" : "💡 Dauerbetrieb";
             
             document.getElementById('batteryCard').style.display = prof.is_battery ? 'block' : 'none';
@@ -741,8 +771,6 @@ HTML_PAGE = """
                 document.getElementById('predictedCostBox').style.display = 'none';
             }
         }
-
-        function dismissEightyModal() { eightyModalDismissed = true; document.getElementById('eightyModal').style.display = 'none'; sendAction('/start');}
 
         async function logout(finalTerminate = false) {
             try {
@@ -787,7 +815,7 @@ HTML_PAGE = """
 
                 if (data.session_terminated) { await logout(true); return; }
 
-                if (data.show_start_prompt && !startPromptShown && !data.active) {
+                if (data.show_start_prompt && !startPromptShown && !data.active && !data.show_reconnect_prompt) {
                     document.getElementById('plugDetectedModal').style.display = 'flex';
                     startPromptShown = true;
                 } else if (!data.show_start_prompt && startPromptShown) {
@@ -795,7 +823,15 @@ HTML_PAGE = """
                     startPromptShown = false;
                 }
 
-                // WARENKORB ANZEIGEN WENN GERÄTE BEREITS GELADEN WURDEN
+                // RECONNECT PROMPT FÜR WEITERES GERÄT
+                if (data.show_reconnect_prompt && !reconnectPromptShown && !data.active) {
+                    document.getElementById('reconnectModal').style.display = 'flex';
+                    reconnectPromptShown = true;
+                } else if (!data.show_reconnect_prompt && reconnectPromptShown) {
+                    document.getElementById('reconnectModal').style.display = 'none';
+                    reconnectPromptShown = false;
+                }
+
                 if (data.cart_items && data.cart_items.length > 0) {
                     document.getElementById('cartBox').style.display = 'block';
                     let cHtml = "";
@@ -807,7 +843,7 @@ HTML_PAGE = """
                     document.getElementById('cartBox').style.display = 'none';
                 }
 
-                if (data.current_profile) applyProfile(data.current_profile_key, data.current_profile);
+                if (data.current_profile) applyProfile(data.current_profile_key, data.current_profile, data.custom_name);
 
                 updateTimerUI(data.elapsed_seconds);
 
@@ -828,9 +864,6 @@ HTML_PAGE = """
                     let wh24 = data.pred_24h_wh;
                     document.getElementById('pred24hWh').innerText = wh24 >= 1000 ? (wh24/1000).toFixed(2) + " kWh" : wh24.toFixed(1) + " Wh";
                     document.getElementById('pred24hCost').innerText = data.pred_24h_cost.toFixed(2);
-                } else {
-                    document.getElementById('batteryRemWhBox').style.display = 'none';
-                    document.getElementById('predictedCostBox').style.display = 'none';
                 }
 
                 if (data.active && data.elapsed_seconds < data.analysis_threshold && !data.manually_selected) {
@@ -852,31 +885,20 @@ HTML_PAGE = """
                     document.getElementById('batteryBarFill').style.width = pct.toFixed(1) + "%";
                     document.getElementById('batteryWhLoaded').innerText = `${data.wh.toFixed(1)} / ${data.current_profile.capacity_wh.toFixed(0)} Wh`;
                     document.getElementById('batteryTimeRemaining').innerText = `Restzeit: ${data.remaining_time_str}`;
-
-                    if (pct >= 80.0 && pct < 99.0 && !eightyModalDismissed && !data.battery_full_triggered) {
-                        document.getElementById('eightyModal').style.display = 'flex';
-                    }
                 }
 
                 let badge = document.getElementById('statusBadge');
                 let statusText = document.getElementById('statusText');
-                let startBtn = document.getElementById('mainStartBtn');
 
                 if (data.unplugged_detected) {
                     badge.className = "status-pill status-unplug";
                     statusText.innerText = "🔌 Kabel ausgesteckt";
-                    document.getElementById('wattSub').innerText = "Kein Stromfluss gemessen";
-                    startBtn.innerText = "▶️ Kabel wieder drin? Fortsetzen";
                 } else if (data.active) {
                     badge.className = "status-pill status-on";
                     statusText.innerText = "Aktiv / Strom fließt";
-                    document.getElementById('wattSub').innerText = data.watt > 0.1 ? "Fließt stabil" : "Bereit / Standby";
-                    startBtn.innerText = "▶️ Läuft bereits";
                 } else {
                     badge.className = "status-pill status-off";
-                    statusText.innerText = "Bereit für Gerät";
-                    document.getElementById('wattSub').innerText = "Stecke ein Kabel ein...";
-                    startBtn.innerText = "▶️ Start / Fortsetzen";
+                    statusText.innerText = "Warten auf Gerät";
                 }
             } catch(e) {}
         }
@@ -884,3 +906,237 @@ HTML_PAGE = """
     </script>
 </body>
 </html>
+"""
+
+def get_user_data():
+    uid = request.headers.get("X-User-Id", session.get("user_id", str(uuid.uuid4())))
+    session["user_id"] = uid
+    if uid not in user_sessions:
+        user_sessions[uid] = {
+            "active": False, "terminated": False, "unplugged_detected": False, "had_power_draw": False,
+            "zero_power_counter": 0.0, "total_kwh": 0.0, "total_seconds": 0.0,
+            "current_watt": 0.0, "smoothed_watt": 0.0, "current_ampere": 0.0, "current_voltage": 230.0,
+            "device_key": "phone", "custom_name": "", "analysis_samples": [], "analysis_completed": False, "manually_selected": False,
+            "estimated_soc_0": 0.0, "eighty_percent_triggered": False, "last_report": None,
+            "detection_mode": False, "show_start_prompt": False, "show_reconnect_prompt": False, "last_seen": time.time(), "session_peak_watt": 0.0,
+            "recent_samples": [], "completed_sub_sessions": []
+        }
+    return user_sessions[uid], uid
+
+@app.route('/')
+def home():
+    if request.args.get("token") == STATION_PHYSICAL_TOKEN:
+        session["authenticated_on_site"] = True
+        session["station_token"] = STATION_PHYSICAL_TOKEN
+        session.setdefault("user_id", str(uuid.uuid4()))
+    if not check_authenticated(): return render_template_string(HTML_ACCESS_DENIED), 403
+    get_user_data()
+    return render_template_string(HTML_PAGE, strompreis=STROMPREIS_PER_KWH)
+
+@app.route('/scan/<token>')
+def scan_qr_entry(token):
+    if token != STATION_PHYSICAL_TOKEN: return render_template_string(HTML_ACCESS_DENIED), 403
+    session["authenticated_on_site"] = True
+    session["station_token"] = STATION_PHYSICAL_TOKEN
+    get_user_data()
+    return render_template_string(HTML_PAGE, strompreis=STROMPREIS_PER_KWH)
+
+@app.route('/init_detection', methods=['POST'])
+@require_physical_auth
+def init_detection():
+    ensure_worker()
+    u, _ = get_user_data()
+    if not u.get("active") and not u.get("terminated") and not u.get("unplugged_detected"):
+        u["detection_mode"] = True
+        async_cloud_control(turn_on=True)
+    return jsonify({"status": "ok"})
+
+@app.route('/start_new', methods=['POST'])
+@require_physical_auth
+def start_new():
+    ensure_worker()
+    u, uid = get_user_data()
+    if u.get("terminated", False): return jsonify({"status": "forbidden"}), 403
+    
+    # Vorheriges Gerät in Warenkorb legen, falls vorhanden
+    if u["total_kwh"] > 0:
+        save_sub_session(u, uid)
+        
+    global_state.update({"active_user_id": uid})
+    u.update({"active": True, "unplugged_detected": False, "zero_power_counter": 0.0, "detection_mode": False, "show_start_prompt": False, "show_reconnect_prompt": False})
+    
+    custom_name = (request.get_json() or {}).get("custom_name", "").strip()
+    u["custom_name"] = custom_name[:30]
+    
+    async_cloud_control(turn_on=True)
+    return jsonify({"status": "ok"})
+
+@app.route('/resume', methods=['POST'])
+@require_physical_auth
+def resume():
+    ensure_worker()
+    u, uid = get_user_data()
+    if u.get("terminated", False): return jsonify({"status": "forbidden"}), 403
+    global_state.update({"active_user_id": uid})
+    u.update({"active": True, "unplugged_detected": False, "zero_power_counter": 0.0, "detection_mode": False, "show_start_prompt": False, "show_reconnect_prompt": False})
+    async_cloud_control(turn_on=True)
+    return jsonify({"status": "ok"})
+
+@app.route('/stop', methods=['POST'])
+@require_physical_auth
+def stop():
+    ensure_worker()
+    u, uid = get_user_data()
+    u["active"] = False
+    u["detection_mode"] = False
+    u["show_start_prompt"] = False
+    u["show_reconnect_prompt"] = False
+    async_cloud_control(turn_on=False)
+    return jsonify({"status": "ok"})
+
+@app.route('/save_device', methods=['POST'])
+@require_physical_auth
+def save_device():
+    u, uid = get_user_data()
+    key = (request.get_json() or {}).get("key", "lamp")
+    if key in DEVICE_PROFILES:
+        u.update({"device_key": key, "manually_selected": True, "analysis_completed": True})
+        if u.get("recent_samples"):
+            save_ai_models(load_ai_models()) 
+            u["estimated_soc_0"] = estimate_current_soc(key, u["recent_samples"])
+    return jsonify({"status": "saved", "profile": DEVICE_PROFILES.get(u["device_key"])})
+
+@app.route('/logout', methods=['POST'])
+@require_physical_auth
+def logout():
+    u, uid = get_user_data()
+    u["active"] = False
+    u["detection_mode"] = False
+    u["show_reconnect_prompt"] = False
+    if (request.get_json() or {}).get("final", False): u["terminated"] = True
+    async_cloud_control(turn_on=False)
+    
+    if u["total_kwh"] > 0:
+        save_sub_session(u, uid)
+    
+    items = []
+    total_wh = 0.0
+    total_cost = 0.0
+    for s in u.get("completed_sub_sessions", []):
+        items.append({"name": s["device_name"], "wh": s["wh"], "cost": s["cost"]})
+        total_wh += s["wh"]
+        total_cost += s["cost"]
+        
+    report = {
+        "invoice_id": f"RE-{time.strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}",
+        "items": items,
+        "total_cost": total_cost,
+        "total_wh": total_wh
+    }
+    u["last_report"] = report
+    return jsonify(report)
+
+@app.route('/new_session', methods=['POST'])
+@require_physical_auth
+def new_session():
+    u, uid = get_user_data()
+    u.update({"terminated": False, "active": False, "total_kwh": 0.0, "total_seconds": 0.0, "analysis_samples": [], "recent_samples": [], "session_peak_watt": 0.0, "analysis_completed": False, "manually_selected": False, "eighty_percent_triggered": False, "completed_sub_sessions": [], "custom_name": "", "unplugged_detected": False})
+    return jsonify({"status": "ok"})
+
+@app.route('/download_invoice', methods=['GET'])
+@require_physical_auth
+def download_invoice():
+    u, _ = get_user_data()
+    report = u.get("last_report")
+    if not report: report = {"invoice_id": "RE-SAMPLE", "items": [{"name": "📱 Smartphone / Tablet", "wh": 10.5, "cost": 0.00367}], "total_wh": 10.5, "total_cost": 0.00367}
+    return send_file(generate_pdf_invoice(report), mimetype="application/pdf", as_attachment=True, download_name=f"{report.get('invoice_id')}.pdf")
+
+@app.route('/send_email_invoice', methods=['POST'])
+@require_physical_auth
+def send_email_invoice():
+    data = request.get_json() or {}
+    if "@" not in data.get("email", ""): return jsonify({"status": "error", "message": "Ungültige E-Mail-Adresse"})
+    report = data.get("report", {})
+    try:
+        msg = MIMEMultipart()
+        msg["From"], msg["To"], msg["Subject"] = SMTP_USER, data["email"], f"Stromquittung ({report.get('invoice_id')})"
+        msg.attach(MIMEText(f"Vielen Dank für die Nutzung der Smart Power Station.", "plain", "utf-8"))
+        pdf = MIMEApplication(generate_pdf_invoice(report).read(), _subtype="pdf")
+        pdf.add_header('Content-Disposition', 'attachment', filename=f"{report.get('invoice_id')}.pdf")
+        msg.attach(pdf)
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=8)
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": "Fehler beim Versand."})
+
+@app.route('/status')
+@require_physical_auth
+def status():
+    ensure_worker()
+    u, uid = get_user_data()
+    u["last_seen"] = time.time()
+
+    if u.get("terminated", False): return jsonify({"session_terminated": True})
+    
+    dev_key = u.get("device_key", "phone")
+    prof = DEVICE_PROFILES.get(dev_key, DEVICE_PROFILES["phone"])
+    
+    wh, cap = u["total_kwh"] * 1000.0, prof.get("capacity_wh", 20.0)
+    battery_pct = min(100.0, u.get("estimated_soc_0", 0.0) + ((wh / max(1, cap)) * 100.0)) if prof.get("is_battery") else 0.0
+    
+    curr_w = u.get("smoothed_watt", 0.0)
+    remaining_str = "--"
+    charge_phase = "Bereit"
+    rem_wh = 0.0
+    predicted_cost = 0.0
+    
+    pred_1h_wh = 0.0
+    pred_1h_cost = 0.0
+    pred_24h_wh = 0.0
+    pred_24h_cost = 0.0
+    
+    if prof.get("is_battery"):
+        if battery_pct >= 95.0: charge_phase = "Erhaltungsladung"
+        elif battery_pct >= 80.0: charge_phase = "Sättigung (CV)"
+        elif battery_pct >= 30.0: charge_phase = "Normalladung (CC)"
+        else: charge_phase = "Schnellladung (Bulk)"
+
+        if battery_pct >= 100.0: remaining_str = "100% Voll"
+        elif curr_w > 1.0:
+            rem_mins = int((((100.0 - battery_pct) / 100.0) * cap) / curr_w * 60)
+            remaining_str = f"ca. {rem_mins//60}h {rem_mins%60}m" if rem_mins >= 60 else f"ca. {rem_mins} Min."
+            
+        rem_wh = max(0.0, cap * (100.0 - battery_pct) / 100.0)
+        predicted_cost = (u["total_kwh"] + (rem_wh / 1000.0)) * STROMPREIS_PER_KWH
+    else:
+        pred_1h_wh = curr_w * 1.0
+        pred_1h_cost = (pred_1h_wh / 1000.0) * STROMPREIS_PER_KWH
+        pred_24h_wh = curr_w * 24.0
+        pred_24h_cost = (pred_24h_wh / 1000.0) * STROMPREIS_PER_KWH
+
+    cart_items = [{"name": x["device_name"], "cost": x["cost"]} for x in u.get("completed_sub_sessions", [])]
+
+    return jsonify({
+        "active": u["active"],
+        "unplugged_detected": u.get("unplugged_detected", False),
+        "watt": curr_w, "current_ampere": u.get("current_ampere", 0.0), "voltage": u.get("current_voltage", 230.0),
+        "wh": wh, "cost": u["total_kwh"] * STROMPREIS_PER_KWH,
+        "elapsed_seconds": int(u["total_seconds"]),
+        "current_profile_key": dev_key, "current_profile": prof,
+        "custom_name": u.get("custom_name", ""),
+        "battery_pct": battery_pct, "remaining_time_str": remaining_str,
+        "charge_phase": charge_phase, "rem_wh": rem_wh, "predicted_cost": predicted_cost,
+        "pred_1h_wh": pred_1h_wh, "pred_1h_cost": pred_1h_cost, "pred_24h_wh": pred_24h_wh, "pred_24h_cost": pred_24h_cost,
+        "analysis_completed": u.get("analysis_completed", False), "analysis_threshold": 40.0,
+        "manually_selected": u.get("manually_selected", False), "session_terminated": False,
+        "show_start_prompt": u.get("show_start_prompt", False),
+        "show_reconnect_prompt": u.get("show_reconnect_prompt", False),
+        "cart_items": cart_items
+    })
+
+if __name__ == '__main__':
+    app.run(host="0.0.0.0", port=5000)
