@@ -11,7 +11,7 @@ from email.mime.application import MIMEApplication
 from weasyprint import HTML
 
 app = Flask(__name__)
-app.secret_key = "shelly_smart_hub_instant_latency_free_2026"
+app.secret_key = "shelly_smart_hub_strict_user_isolation_2026"
 
 # --- SHELLY CLOUD KONFIGURATION ---
 SHELLY_CLOUD_URL = "https://shelly-274-eu.shelly.cloud"
@@ -25,6 +25,7 @@ SMTP_PORT = 587
 SMTP_USER = ""
 SMTP_PASSWORD = ""
 
+# Globaler Zustand mit strenger Besitz-Trennung
 global_state = {
     "active_user_id": None,
     "active_since": 0,
@@ -37,6 +38,7 @@ global_state = {
     "last_fetch_time": 0
 }
 
+# Speichert alle Nutzersitzungen getrennt
 user_sessions = {}
 
 DEVICE_PROFILES = {
@@ -55,7 +57,6 @@ def add_universal_headers(response):
     response.headers["Pragma"] = "no-cache"
     return response
 
-# ASYNCHRONER SCHALTBEFEHL: Blockiert den Webserver nicht mehr!
 def async_cloud_control(turn_on=True):
     def _worker():
         turn_str = "on" if turn_on else "off"
@@ -229,6 +230,7 @@ HTML_PAGE = """
         }
         .status-on { background: #ecfdf5; color: #065f46; }
         .status-off { background: #f1f5f9; color: var(--text-muted); }
+        .status-unplug { background: #fef3c7; color: #92400e; }
         .status-dot { width: 8px; height: 8px; border-radius: 50%; }
         .status-on .status-dot { background: var(--accent-green); box-shadow: 0 0 8px rgba(16,185,129,0.6); }
         .status-off .status-dot { background: #94a3b8; }
@@ -341,6 +343,7 @@ HTML_PAGE = """
     </style>
 </head>
 <body>
+    <!-- MODAL: GERTÄT AUSWÄHLEN -->
     <div id="deviceModal" class="modal-overlay">
         <div class="modal-box">
             <h3 style="margin-bottom: 6px;">Gerät festlegen</h3>
@@ -355,7 +358,7 @@ HTML_PAGE = """
         </div>
     </div>
 
-    <!-- ANFRAGE MODAL BEI NUTZER 1 -->
+    <!-- ANFRAGE-POPUP BEI NUTZER 1 -->
     <div id="transferModal" class="modal-overlay">
         <div class="modal-box" style="border: 2px solid var(--accent-amber);">
             <div style="font-size: 40px; margin-bottom: 6px;">👋🔔</div>
@@ -385,7 +388,7 @@ HTML_PAGE = """
             </div>
         </div>
 
-        <!-- HAUPTKARTE -->
+        <!-- HAUPTKARTE DES AKTIVEN NUTZERS -->
         <div class="card" id="mainCard">
             <div class="header">
                 <span class="title">⚡ Smart Power Hub</span>
@@ -462,7 +465,7 @@ HTML_PAGE = """
             </div>
         </div>
 
-        <!-- QUITTUNG -->
+        <!-- QUITTUNG (FINALER ZUSTAND NACH DEM BEENDEN) -->
         <div class="card receipt-card" id="receiptCard">
             <div class="receipt-header">
                 <div style="font-size: 40px; margin-bottom: 4px;">🧾</div>
@@ -485,7 +488,9 @@ HTML_PAGE = """
                 <div id="emailFeedback" style="display:none; font-size:12px; font-weight:600; margin-top:8px;"></div>
             </div>
 
-            <button class="btn-start" style="margin-top:16px; background:var(--text-main);" onclick="window.location.reload()">🔄 Neue Sitzung / Erneut verbinden</button>
+            <div style="margin-top: 20px; font-size: 12px; color: var(--text-muted);">
+                ℹ️ Um die Steckdose erneut zu nutzen, scanne bitte den QR-Code an der Station neu.
+            </div>
         </div>
     </div>
 
@@ -536,8 +541,8 @@ HTML_PAGE = """
             } catch(e) { return {}; }
         }
 
-        // SOFORTIGE REAKTION BEI START (0ms Wartezeit im UI)
         function startSession() {
+            if (isTerminated) return;
             isActive = true;
             document.getElementById('statusBadge').className = "status-pill status-on";
             document.getElementById('statusText').innerText = "Aktiv / Strom fließt";
@@ -546,8 +551,8 @@ HTML_PAGE = """
             setTimeout(fetchSyncData, 150);
         }
 
-        // SOFORTIGE REAKTION BEI PAUSE (0ms Wartezeit im UI)
         function pauseSession() {
+            if (isTerminated) return;
             isActive = false;
             stopLocalTimer();
             document.getElementById('statusBadge').className = "status-pill status-off";
@@ -576,6 +581,7 @@ HTML_PAGE = """
             document.getElementById('btnRequestSlot').style.opacity = '0.6';
         }
 
+        // NUTZER 1 BESTÄTIGT ÜBERGABE -> SOFORTIGER HARD-FREEZE & QUITTUNG
         async function acceptTransfer() {
             transferModalOpen = false;
             document.getElementById('transferModal').style.display = 'none';
@@ -603,12 +609,11 @@ HTML_PAGE = """
                 document.getElementById('rKwh').innerText = report.kwh.toFixed(6) + " kWh";
                 document.getElementById('rCost').innerText = report.cost.toFixed(5) + " €";
                 
+                // HAUPTKARTE VOLLSTÄNDIG ENTFERNEN
                 document.getElementById('mainCard').style.display = 'none';
                 document.getElementById('busyCard').style.display = 'none';
                 document.getElementById('receiptCard').style.display = 'block';
-            } catch(e) {
-                isTerminated = false;
-            }
+            } catch(e) {}
         }
 
         async function sendInvoiceEmail() {
@@ -644,14 +649,20 @@ HTML_PAGE = """
             window.open('/download_invoice', '_blank');
         }
 
-        // 1-SEKUNDEN SCHNELLER STATUSABGLEICH
+        // STATUS-POLLING: Stoppt sofort, wenn Nutzer 1 abgemeldet ist!
         async function fetchSyncData() {
             if (isTerminated) return;
             try {
                 let res = await fetch('/status', { cache: 'no-store' });
                 let data = await res.json();
 
-                // MULTI-USER WECHSEL: Sofortige Ansichts-Umschaltung
+                // Falls die Session serverseitig abgelaufen oder übergeben wurde
+                if (data.session_terminated) {
+                    await logout();
+                    return;
+                }
+
+                // BESETZT-ANSICHT FÜR NUTZER 2
                 if (data.is_busy_for_other) {
                     document.getElementById('mainCard').style.display = 'none';
                     document.getElementById('busyCard').style.display = 'block';
@@ -714,6 +725,7 @@ def get_user_data():
     if uid not in user_sessions:
         user_sessions[uid] = {
             "active": False,
+            "terminated": False,
             "total_kwh": 0.0,
             "total_seconds": 0,
             "last_check": None,
@@ -726,16 +738,25 @@ def get_user_data():
 
 @app.route('/')
 def home():
+    # Bei jedem Neuladen oder frischem QR-Scan wird eine neue, saubere Session erzeugt
+    if "user_id" in session:
+        old_uid = session["user_id"]
+        # Falls die alte Session bereits beendet war, Session-Cookie erneuern
+        if user_sessions.get(old_uid, {}).get("terminated", False):
+            session.clear()
     get_user_data()
     return render_template_string(HTML_PAGE)
 
 @app.route('/start', methods=['POST', 'GET'])
 def start():
     u, uid = get_user_data()
+    if u.get("terminated", False):
+        return jsonify({"status": "forbidden", "message": "Session beendet"}), 403
+
     active_uid = global_state.get("active_user_id")
     if active_uid and active_uid != uid:
         other_user = user_sessions.get(active_uid, {})
-        if other_user.get("active", False):
+        if other_user.get("active", False) and not other_user.get("terminated", False):
             return jsonify({"status": "busy"})
         
     global_state["active_user_id"] = uid
@@ -749,7 +770,10 @@ def start():
 
 @app.route('/stop', methods=['POST', 'GET'])
 def stop():
-    u, _ = get_user_data()
+    u, uid = get_user_data()
+    if u.get("terminated", False) or global_state.get("active_user_id") != uid:
+        return jsonify({"status": "forbidden"}), 403
+
     u["active"] = False
     u["last_check"] = None
     u["current_watt"] = 0.0
@@ -759,6 +783,10 @@ def stop():
 
 @app.route('/save_device', methods=['POST'])
 def save_device():
+    u, uid = get_user_data()
+    if u.get("terminated", False) or global_state.get("active_user_id") != uid:
+        return jsonify({"status": "forbidden"}), 403
+
     data = request.get_json() or {}
     key = data.get("key", "lamp")
     if key in DEVICE_PROFILES:
@@ -786,8 +814,10 @@ def reject_transfer():
 def logout():
     u, uid = get_user_data()
     u["active"] = False
+    u["terminated"] = True  # Session für immer sperren
     async_cloud_control(turn_on=False)
 
+    # Steckdose sofort freigeben
     if global_state["active_user_id"] == uid:
         global_state["active_user_id"] = None
         global_state["transfer_requested"] = False
@@ -840,7 +870,7 @@ def send_email_invoice():
     if not SMTP_USER or not SMTP_PASSWORD:
         return jsonify({
             "status": "error",
-            "message": "Hinweis: Es sind noch keine SMTP-Zugangsdaten in app.py hinterlegt. Nutze bitte '📥 PDF direkt herunterladen'."
+            "message": "Hinweis: Keine SMTP-Zugangsdaten konfiguriert. Bitte '📥 PDF direkt herunterladen' nutzen."
         })
 
     pdf_buffer = generate_pdf_invoice(report)
@@ -868,13 +898,17 @@ def send_email_invoice():
     except Exception as e:
         return jsonify({
             "status": "error",
-            "message": f"Versand fehlgeschlagen ({str(e)}). Bitte lade das PDF direkt über den Download-Button herunter."
+            "message": f"Versand fehlgeschlagen ({str(e)}). Bitte lade das PDF direkt herunter."
         })
 
 @app.route('/status')
 def status():
     u, uid = get_user_data()
     active_uid = global_state.get("active_user_id")
+
+    # Falls diese Session beendet wurde
+    if u.get("terminated", False):
+        return jsonify({"session_terminated": True, "is_busy_for_other": False})
     
     is_busy = False
     global_w = 0.0
@@ -918,7 +952,8 @@ def status():
         "is_busy_for_other": is_busy,
         "transfer_requested": global_state.get("transfer_requested", False) and (active_uid == uid),
         "current_profile_key": dev_key,
-        "current_profile": DEVICE_PROFILES.get(dev_key)
+        "current_profile": DEVICE_PROFILES.get(dev_key),
+        "session_terminated": False
     })
 
 if __name__ == '__main__':
