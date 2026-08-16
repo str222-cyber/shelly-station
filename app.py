@@ -42,11 +42,11 @@ SMTP_PASSWORD = ""
 
 AI_MODEL_FILE = "ai_learned_models.json"
 
-# Basis-Muster
+# Angepasste Start-Cluster für moderne Schnelllader
 DEFAULT_AI_PROFILES = {
     "lamp": {"avg_w": 1.2, "peak_w": 2.0, "variance": 0.1, "count": 1},
-    "phone": {"name": "📱 Smartphone / Tablet", "avg_w": 12.0, "peak_w": 18.0, "variance": 4.5, "count": 1},
-    "laptop": {"name": "💻 Laptop / Monitor", "avg_w": 45.0, "peak_w": 65.0, "variance": 12.0, "count": 1},
+    "phone": {"name": "📱 Smartphone / Tablet", "avg_w": 18.0, "peak_w": 25.0, "variance": 3.5, "count": 1},
+    "laptop": {"name": "💻 Laptop / Monitor", "avg_w": 55.0, "peak_w": 80.0, "variance": 15.0, "count": 1},
     "ebike_std": {"name": "🚲 E-Bike Akku Standard", "avg_w": 140.0, "peak_w": 170.0, "variance": 8.0, "count": 1},
     "ebike_fast": {"name": "⚡ E-Bike Schnelllader / PC", "avg_w": 350.0, "peak_w": 420.0, "variance": 15.0, "count": 1},
     "appliance": {"name": "🍳 Großgerät / Dauerbetrieb", "avg_w": 850.0, "peak_w": 1200.0, "variance": 50.0, "count": 1}
@@ -83,7 +83,6 @@ def get_total_learned_count():
 
 def get_analysis_threshold():
     count = get_total_learned_count()
-    # Startet bei 180s (3 Minuten). Pro gelerntem Profil wird es 10s schneller, min. 30s.
     threshold = 180.0 - (count * 10.0)
     return max(30.0, threshold)
 
@@ -100,7 +99,6 @@ global_state = {
 
 user_sessions = {}
 
-# Sichert den Zähler-Thread gegen den Server-Tod ab
 WORKER_STARTED = False
 WORKER_LOCK = threading.Lock()
 
@@ -153,6 +151,7 @@ def async_cloud_control(turn_on=True):
             pass
     threading.Thread(target=_worker, daemon=True).start()
 
+# --- KI FEATURE EXTRAKTION ---
 def extract_features(samples):
     if not samples:
         return 0.0, 0.0, 0.0
@@ -197,6 +196,32 @@ def ai_learn_from_feedback(correct_key, samples):
     
     save_ai_models(current_models)
 
+# --- PHYSIKALISCHE LADEKURVEN-SCHÄTZUNG (SOC0) ---
+def estimate_initial_soc(profile_key, avg_w):
+    """
+    Schätzt den Start-Ladezustand (%) anhand der inititalen Stromaufnahme ab.
+    """
+    if profile_key == "phone":
+        if avg_w >= 16.0: return 10.0   # Fast Charge (CC Phase) -> Leer
+        elif avg_w >= 10.0: return 50.0 # Mittlere Ladeleistung -> Halbvoll
+        elif avg_w >= 5.0: return 75.0  # (CV Phase Einstieg) -> Fast voll
+        elif avg_w >= 1.5: return 90.0  # Sättigung
+        else: return 100.0              # Standby
+    elif profile_key == "laptop":
+        if avg_w >= 45.0: return 15.0
+        elif avg_w >= 30.0: return 60.0
+        elif avg_w >= 15.0: return 85.0
+        else: return 95.0
+    elif profile_key == "ebike_std":
+        if avg_w >= 120.0: return 20.0
+        elif avg_w >= 60.0: return 75.0
+        else: return 95.0
+    elif profile_key == "ebike_fast":
+        if avg_w >= 280.0: return 20.0
+        elif avg_w >= 100.0: return 80.0
+        else: return 95.0
+    return 0.0
+
 # ------------------------------------------------------------------------------
 # ZENTRALER HERZSCHLAG (Absolut ausfallsicher & stabil)
 # ------------------------------------------------------------------------------
@@ -215,7 +240,6 @@ def background_meter_worker():
             if active_uid and active_uid in user_sessions:
                 u = user_sessions[active_uid]
                 
-                # Cloud immer abfragen, wenn aktiv
                 watt, amp, volt = 0.0, 0.0, 230.0
                 try:
                     payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID}
@@ -231,7 +255,6 @@ def background_meter_worker():
                             amp = float(status["meters"][0].get("current", 0.0)) if "current" in status["meters"][0] else (watt / 230.0 if watt > 0 else 0.0)
                             volt = float(status["meters"][0].get("voltage", 230.0)) if "voltage" in status["meters"][0] else 230.0
                 except Exception:
-                    # Fällt auf die letzten Werte zurück, ohne den Zähler zu stoppen!
                     watt = u.get("current_watt", 0.0)
                     amp = u.get("current_ampere", 0.0)
                     volt = u.get("current_voltage", 230.0)
@@ -239,33 +262,45 @@ def background_meter_worker():
                 u["current_watt"] = watt
                 u["current_ampere"] = amp
                 u["current_voltage"] = volt
+                
+                # GLÄTTUNGSFILTER (Anti-Flicker für das UI)
+                if u.get("smoothed_watt") is None:
+                    u["smoothed_watt"] = watt
+                else:
+                    # 80% Alt-Wert, 20% Neu-Wert = Seidenweiche Anzeige
+                    u["smoothed_watt"] = (u["smoothed_watt"] * 0.8) + (watt * 0.2)
+
                 global_state["last_watt"] = watt
                 global_state["last_amp"] = amp
                 global_state["last_volt"] = volt
 
                 if u.get("active", False):
-                    # ZÄHLT IMMER! Garantiert kein Zurücksetzen
+                    # ZÄHLT IMMER NAHTLOS DURCH!
                     u["total_seconds"] += dt
                     u["total_kwh"] += (watt * dt) / 3600000.0
 
                     threshold = get_analysis_threshold()
 
-                    # 1. KI LERN-PHASE (Geräuschlos, ohne die Messung zu behindern)
+                    # 1. KI LERN-PHASE & START-LADEZUSTAND (SOC0) BERECHNUNG
                     if u["total_seconds"] < threshold and not u["manually_selected"]:
                         if watt > 0.5:
                             u["analysis_samples"].append(watt)
                     elif u["total_seconds"] >= threshold and not u["analysis_completed"] and not u["manually_selected"]:
                         u["device_key"] = ai_classify_samples(u["analysis_samples"])
+                        # Schätze Start-Akkuwert physikalisch ab
+                        if u["analysis_samples"]:
+                            avg_w = sum(u["analysis_samples"]) / len(u["analysis_samples"])
+                            u["estimated_soc_0"] = estimate_initial_soc(u["device_key"], avg_w)
                         u["analysis_completed"] = True
 
-                    # 2. SEHR ROBUSTE AUSSTECK-ERKENNUNG
+                    # 2. AUSSTECK-ERKENNUNG (Zieht erst nach echten 15 Sekunden Leerlauf)
                     if watt > 1.0:
                         u["had_power_draw"] = True
                         u["zero_power_counter"] = 0.0
                     
-                    if u["had_power_draw"] and watt <= 0.1:  # Muss quasi absolut 0W sein
+                    if u["had_power_draw"] and watt <= 0.1:
                         u["zero_power_counter"] += dt
-                        if u["zero_power_counter"] >= 30.0:  # Erst nach 30s absoluter Null-Last!
+                        if u["zero_power_counter"] >= 15.0:
                             u["active"] = False
                             u["unplugged_detected"] = True
                             u["had_power_draw"] = False
@@ -279,7 +314,7 @@ def background_meter_worker():
                         if watt > 6.0:
                             u["had_charging_phase"] = True
                         
-                        if u["had_charging_phase"] and 0.2 <= watt < 1.8 and (u["total_kwh"] * 1000.0) > 2.0:
+                        if u["had_charging_phase"] and 0.2 <= watt < 1.8 and (u["total_kwh"] * 1000.0) > 1.0:
                             u["battery_full_counter"] += dt
                             if u["battery_full_counter"] >= 30.0:
                                 u["battery_full_triggered"] = True
@@ -345,6 +380,32 @@ def generate_pdf_invoice(report_data):
     HTML(string=html_invoice).write_pdf(pdf_buffer)
     pdf_buffer.seek(0)
     return pdf_buffer
+
+HTML_ACCESS_DENIED = """
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="utf-8">
+    <title>Zugriff Verweigert</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: white; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; text-align: center; padding: 20px; }
+        .box { background: #1e293b; padding: 30px; border-radius: 20px; border: 1px solid #334155; max-width: 360px; }
+        .icon { font-size: 50px; margin-bottom: 15px; }
+        h2 { font-size: 20px; margin-bottom: 10px; color: #f87171; }
+        p { font-size: 14px; color: #94a3b8; line-height: 1.5; }
+    </style>
+</head>
+<body>
+    <div class="box">
+        <div class="icon">🔒🚫</div>
+        <h2>Sicherheits-Sperre</h2>
+        <p>Ein direkter Web-Aufruf über das Internet ist nicht gestattet.</p>
+        <p style="margin-top: 12px; color: #e2e8f0; font-weight: 600;">Bitte scanne den QR-Code auf dem Laptop-Bildschirm oder an der Ladestation.</p>
+    </div>
+</body>
+</html>
+"""
 
 HTML_PAGE = """
 <!DOCTYPE html>
@@ -555,7 +616,7 @@ HTML_PAGE = """
     <div id="deviceModal" class="modal-overlay">
         <div class="modal-box">
             <h3 style="margin-bottom: 6px;">Gerät manuell festlegen</h3>
-            <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">Wähle dein Gerät. Die AI lernt deine Auswahl für zukünftige Messungen.</p>
+            <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">Wähle dein Gerät aus. Das Schwarmwissen der AI lernt dadurch automatisch mit.</p>
             <button class="device-option-btn" onclick="saveDeviceProfile('lamp')">💡 Lampe / Dauerbetrieb</button>
             <button class="device-option-btn" onclick="saveDeviceProfile('phone')">📱 Smartphone / Tablet (Akku ~20 Wh)</button>
             <button class="device-option-btn" onclick="saveDeviceProfile('laptop')">💻 Laptop / Monitor (Akku ~65 Wh)</button>
@@ -661,7 +722,7 @@ HTML_PAGE = """
                     <div class="ai-icon" id="devIcon">💡</div>
                     <div>
                         <div class="ai-detected" id="detectedName">Bereit</div>
-                        <div class="ai-mode" id="detectedMode">Automatische AI-Lastanalyse...</div>
+                        <div class="ai-mode" id="detectedMode">Warte auf Start...</div>
                     </div>
                 </div>
             </div>
@@ -968,7 +1029,6 @@ HTML_PAGE = """
                 // Warteraum Logik für Nutzer A
                 if (isWaitingForResume) {
                     if (!data.is_busy_for_other) {
-                        // Steckdose wurde von Nutzer B freigegeben -> Nutzer A kann direkt fortsetzen!
                         isWaitingForResume = false;
                         document.getElementById('pauseWaitCard').style.display = 'none';
                         document.getElementById('mainCard').style.display = 'block';
@@ -1002,7 +1062,7 @@ HTML_PAGE = """
                 let sec = data.elapsed_seconds;
                 updateTimerUI(sec);
 
-                let currentW = data.watt;
+                let currentW = data.watt; // Jetzt seidenweich geglättet vom Server
                 let currentA = data.current_ampere || 0.0;
                 let currentV = data.voltage || 230.0;
 
@@ -1101,13 +1161,14 @@ def get_user_data():
             "total_kwh": 0.0,
             "total_seconds": 0.0,
             "current_watt": 0.0,
+            "smoothed_watt": 0.0,
             "current_ampere": 0.0,
             "current_voltage": 230.0,
             "device_key": "lamp",
             "analysis_samples": [],
             "analysis_completed": False,
             "manually_selected": False,
-            "already_saturated_detected": False,
+            "estimated_soc_0": 0.0,
             "battery_full_triggered": False,
             "last_report": None
         }
@@ -1177,8 +1238,6 @@ def stop():
         return jsonify({"status": "forbidden"}), 403
 
     u["active"] = False
-    u["current_watt"] = 0.0
-    u["current_ampere"] = 0.0
     async_cloud_control(turn_on=False)
     return jsonify({"status": "ok"})
 
@@ -1196,9 +1255,11 @@ def save_device():
         u["manually_selected"] = True
         u["analysis_completed"] = True
         
-        # User-Feedback speist das KI-Gedächtnis
+        # User-Feedback speist das KI-Gedächtnis & Berechnet SOC neu
         if u.get("analysis_samples"):
             ai_learn_from_feedback(key, u["analysis_samples"])
+            avg_w = sum(u["analysis_samples"]) / len(u["analysis_samples"])
+            u["estimated_soc_0"] = estimate_initial_soc(key, avg_w)
 
     return jsonify({
         "status": "saved",
@@ -1387,24 +1448,19 @@ def status():
     wh = u["total_kwh"] * 1000.0
     cap = prof.get("capacity_wh", 20.0)
     
-    curr_w = u.get("current_watt", 0.0)
-    if u["active"] and prof.get("is_battery"):
-        if 0.4 <= curr_w < 3.0 and u["total_seconds"] > 15:
-            u["already_saturated_detected"] = True
-        if curr_w >= 3.0:
-            u["already_saturated_detected"] = False
-
+    # SOC Berechnung mit Startwert + Geladenen Wh
+    base_soc = u.get("estimated_soc_0", 0.0)
     if prof.get("is_battery") and cap > 0:
-        if u.get("already_saturated_detected"):
-            battery_pct = 85.0 + min(15.0, (wh / 4.0) * 15.0)
-        else:
-            battery_pct = min(100.0, (wh / cap) * 100.0)
+        added_pct = (wh / cap) * 100.0
+        battery_pct = min(100.0, base_soc + added_pct)
     else:
         battery_pct = 0.0
     
     remaining_str = "--"
+    curr_w = u.get("smoothed_watt", 0.0)
     if prof.get("is_battery") and curr_w > 1.0 and battery_pct < 100.0:
-        rem_wh = max(0.0, cap - wh)
+        rem_pct = 100.0 - battery_pct
+        rem_wh = (rem_pct / 100.0) * cap
         rem_mins = int((rem_wh / curr_w) * 60)
         if rem_mins >= 60:
             rh = rem_mins // 60
@@ -1418,7 +1474,7 @@ def status():
     return jsonify({
         "active": u["active"] and (active_uid == uid),
         "unplugged_detected": u.get("unplugged_detected", False),
-        "watt": u.get("current_watt", 0.0) if (active_uid == uid) else 0.0,
+        "watt": curr_w if (active_uid == uid) else 0.0, # Liefert den weichen, geglätteten Wert ans Frontend
         "current_ampere": u.get("current_ampere", 0.0),
         "voltage": u.get("current_voltage", 230.0),
         "global_watt": global_w,
