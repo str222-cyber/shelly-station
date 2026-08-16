@@ -25,6 +25,7 @@ app.config.update(
     PERMANENT_SESSION_LIFETIME=14400
 )
 
+# GEHEIMER VOR-ORT TOKEN
 STATION_PHYSICAL_TOKEN = "SEC-STATION-2026-X99Q-ALPHA-77"
 
 # --- SHELLY CLOUD KONFIGURATION ---
@@ -32,7 +33,7 @@ SHELLY_CLOUD_URL = "https://shelly-274-eu.shelly.cloud"
 AUTH_KEY = "NDcwMzFkdWlkF9839F81801CF17665B14F2EED9BDC41514AEAB2C6C041201D306ABBC40BDE2A0AD2F80ACE98C596"
 DEVICE_ID = "08927249a904"
 
-STROMPREIS_PER_KWH = 0.35
+STROMPREIS_PER_KWH = 0.35  # 0,35 € pro kWh
 
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
@@ -41,6 +42,7 @@ SMTP_PASSWORD = ""
 
 AI_MODEL_FILE = "ai_learned_models.json"
 
+# Basis-Muster (wird durch jeden Nutzer verfeinert)
 DEFAULT_AI_PROFILES = {
     "lamp": {"avg_w": 1.2, "peak_w": 2.0, "variance": 0.1, "count": 1},
     "phone": {"name": "📱 Smartphone / Tablet", "avg_w": 12.0, "peak_w": 18.0, "variance": 4.5, "count": 1},
@@ -59,6 +61,7 @@ DEVICE_PROFILES = {
     "appliance": {"name": "🍳 Großgerät / Dauerbetrieb", "icon": "🍳", "is_battery": False, "capacity_wh": 0}
 }
 
+# --- AI SCHWARMWISSEN LADEN & SPEICHERN ---
 def load_ai_models():
     if os.path.exists(AI_MODEL_FILE):
         try:
@@ -75,7 +78,9 @@ def save_ai_models(models):
     except Exception:
         pass
 
-learned_models = load_ai_models()
+def get_total_learned_count():
+    models = load_ai_models()
+    return sum(m.get("count", 1) for m in models.values())
 
 global_state = {
     "active_user_id": None,
@@ -151,14 +156,17 @@ def extract_features(samples):
     var_w = math.sqrt(sum((x - avg_w) ** 2 for x in samples) / len(samples))
     return avg_w, peak_w, var_w
 
+# KI-Klassifizierung mit frisch geladenem Schwarmwissen
 def ai_classify_samples(samples):
     if not samples or max(samples) < 2.0:
         return "lamp"
+    
     avg_w, peak_w, var_w = extract_features(samples)
+    current_models = load_ai_models()
 
     best_key = "lamp"
     min_dist = float("inf")
-    for key, model in learned_models.items():
+    for key, model in current_models.items():
         d_avg = (avg_w - model["avg_w"]) / (model["avg_w"] + 5.0)
         d_peak = (peak_w - model["peak_w"]) / (model["peak_w"] + 5.0)
         d_var = (var_w - model["variance"]) / (model["variance"] + 2.0)
@@ -168,21 +176,28 @@ def ai_classify_samples(samples):
             best_key = key
     return best_key
 
+# Dynamisches Lernen (User Feedback fließt ins globale Wissen ein)
 def ai_learn_from_feedback(correct_key, samples):
-    if not samples or correct_key not in learned_models:
+    if not samples:
+        return
+    current_models = load_ai_models()
+    if correct_key not in current_models:
         return
     avg_w, peak_w, var_w = extract_features(samples)
-    m = learned_models[correct_key]
+    m = current_models[correct_key]
     n = m.get("count", 1)
+    
+    # Exponentieller gleitender Durchschnitt (die KI passt sich stetig an)
     learning_rate = 1.0 / min(n + 1, 10)
     m["avg_w"] = (1.0 - learning_rate) * m["avg_w"] + learning_rate * avg_w
     m["peak_w"] = (1.0 - learning_rate) * m["peak_w"] + learning_rate * peak_w
     m["variance"] = (1.0 - learning_rate) * m["variance"] + learning_rate * var_w
     m["count"] = n + 1
-    save_ai_models(learned_models)
+    
+    save_ai_models(current_models)
 
 # ------------------------------------------------------------------------------
-# ZENTRALER HERZSCHLAG FÜR DEN ZÄHLER (Immun gegen Server-Neustarts)
+# HERZSTÜCK: Der autarke Server-Hintergrund-Prozess (100% Sicher vor Resets)
 # ------------------------------------------------------------------------------
 def background_meter_worker():
     last_loop = time.time()
@@ -191,7 +206,7 @@ def background_meter_worker():
         dt = now - last_loop
         last_loop = now
         
-        # Abfangen von Lags, damit der Zähler nicht springt
+        # Abfangen von Lags
         if dt < 0 or dt > 5:
             dt = 1.0
 
@@ -202,7 +217,6 @@ def background_meter_worker():
                 
                 # Zähler läuft unaufhörlich weiter, sofern Sitzung aktiv!
                 if u.get("active", False):
-                    # Zeit aufaddieren
                     u["total_seconds"] += dt
                     
                     watt = u.get("current_watt", 0.0)
@@ -258,7 +272,7 @@ def background_meter_worker():
                     elif watt >= 0.3:
                         u["zero_power_counter"] = 0.0
 
-                    # 3. AKKU 100% ERKENNUNG
+                    # 3. AKKU 100% ERKENNUNG (Erst nach aktiver Ladephase)
                     prof = DEVICE_PROFILES.get(u["device_key"], {})
                     if prof.get("is_battery", False) and u["total_seconds"] > 60.0:
                         if watt > 6.0:
@@ -270,7 +284,7 @@ def background_meter_worker():
                                 u["battery_full_triggered"] = True
                                 u["active"] = False
                                 async_cloud_control(turn_on=False)
-                        elif watt >= 1.8:
+                        else:
                             u["battery_full_counter"] = 0.0
         except Exception:
             pass
@@ -362,7 +376,7 @@ HTML_PAGE = """
 <html lang="de">
 <head>
     <meta charset="utf-8">
-    <title>Smart Power Hub</title>
+    <title>Smart Power Hub • AI Powered</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <style>
         :root {
@@ -566,7 +580,7 @@ HTML_PAGE = """
     <div id="deviceModal" class="modal-overlay">
         <div class="modal-box">
             <h3 style="margin-bottom: 6px;">Gerät manuell festlegen</h3>
-            <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">Wähle dein Gerät. Die AI lernt deine Auswahl für zukünftige Messungen.</p>
+            <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">Wähle dein Gerät aus. Das Schwarmwissen der AI lernt dadurch automatisch mit.</p>
             <button class="device-option-btn" onclick="saveDeviceProfile('lamp')">💡 Lampe / Dauerbetrieb</button>
             <button class="device-option-btn" onclick="saveDeviceProfile('phone')">📱 Smartphone / Tablet (Akku ~20 Wh)</button>
             <button class="device-option-btn" onclick="saveDeviceProfile('laptop')">💻 Laptop / Monitor (Akku ~65 Wh)</button>
@@ -662,7 +676,7 @@ HTML_PAGE = """
                 </div>
             </div>
 
-            <!-- GERÄTE ERKENNUNG -->
+            <!-- GERÄTE ERKENNUNG (NUN MIT SCHWARMWISSEN) -->
             <div class="ai-banner">
                 <div class="ai-header">
                     <span class="ai-title" id="aiStatusTitle">AI Erkennung</span>
@@ -764,7 +778,6 @@ HTML_PAGE = """
                 <div id="emailFeedback" style="display:none; font-size:12px; font-weight:600; margin-top:8px;"></div>
             </div>
 
-            <!-- WAHLMÖGLICHKEIT BEIM NUTZERWECHSEL -->
             <div id="transferChoiceBox" style="margin-top: 16px; display: flex; flex-direction: column; gap: 8px;">
                 <button class="btn-stop" style="background: #e0f2fe; color: #0369a1; border-color: #bae6fd;" onclick="setWaitingMode()">⏳ Sitzung pausieren (Warten bis anderer Nutzer fertig ist)</button>
                 <button class="btn-finish" style="font-size: 14px;" onclick="finalizeTermination()">🛑 Endgültig beenden & Finales PDF</button>
@@ -1014,18 +1027,18 @@ HTML_PAGE = """
                 document.getElementById('cost').innerText = data.cost.toFixed(5);
                 document.getElementById('microCost').innerText = (data.cost * 100.0).toFixed(3);
 
-                // AI Lern-Feedback
+                // --- AI SCHWARMWISSEN DISPLAY UPDATE ---
                 if (data.active && sec < 30 && !data.manually_selected) {
                     let remain = 30 - sec;
-                    document.getElementById('aiStatusTitle').innerText = "AI lernt Last...";
+                    document.getElementById('aiStatusTitle').innerText = `Schwarm-Analyse (${data.ai_learned_count} Profile)`;
                     document.getElementById('detectedName').innerText = `Analysiere Features... (${remain}s)`;
                 } else if (data.analysis_completed && !data.manually_selected) {
-                    document.getElementById('aiStatusTitle').innerText = "AI Erkannt";
+                    document.getElementById('aiStatusTitle').innerText = `🤖 AI Erkannt (Basis: ${data.ai_learned_count} Messungen)`;
                 } else if (data.manually_selected) {
-                    document.getElementById('aiStatusTitle').innerText = "Vom Nutzer gelernt";
+                    document.getElementById('aiStatusTitle').innerText = `Vom Nutzer angelernt`;
                 }
 
-                // Batterie-Anzeige & Pop-ups
+                // Batterie Update
                 if (data.current_profile && data.current_profile.is_battery) {
                     let cap = data.current_profile.capacity_wh || 20.0;
                     let pct = data.battery_pct;
@@ -1043,7 +1056,6 @@ HTML_PAGE = """
                 let statusText = document.getElementById('statusText');
                 let startBtn = document.getElementById('mainStartBtn');
 
-                // UNPLUG ERKENNUNG
                 if (data.unplugged_detected) {
                     badge.className = "status-pill status-unplug";
                     statusText.innerText = "🔌 Kabel ausgesteckt – Strom gestoppt";
@@ -1144,7 +1156,7 @@ def scan_qr_entry(token):
 @app.route('/start', methods=['POST', 'GET'])
 @require_physical_auth
 def start():
-    ensure_worker() # Stellt sicher, dass der Background-Zähler immer lebt
+    ensure_worker() # Stellt sicher, dass der Background-Zähler immer lebt!
     
     u, uid = get_user_data()
     if u.get("terminated", False):
@@ -1203,6 +1215,7 @@ def save_device():
         u["manually_selected"] = True
         u["analysis_completed"] = True
         
+        # User-Feedback speist das KI-Gedächtnis
         if u.get("analysis_samples"):
             ai_learn_from_feedback(key, u["analysis_samples"])
 
@@ -1356,14 +1369,12 @@ def status():
             is_busy = True
             global_w = global_state["last_watt"]
 
-    # Werte aus Backend holen
     dev_key = u.get("device_key", "lamp")
     prof = DEVICE_PROFILES.get(dev_key, DEVICE_PROFILES["lamp"])
     
     wh = u["total_kwh"] * 1000.0
     cap = prof.get("capacity_wh", 20.0)
     
-    # 80% Ladeerkennung (Schätzung durch Ladekurve)
     curr_w = u.get("current_watt", 0.0)
     if u["active"] and prof.get("is_battery"):
         if 0.4 <= curr_w < 3.0 and u["total_seconds"] > 15:
@@ -1413,7 +1424,8 @@ def status():
         "battery_full_triggered": u.get("battery_full_triggered", False),
         "analysis_completed": u.get("analysis_completed", False),
         "manually_selected": u.get("manually_selected", False),
-        "session_terminated": False
+        "session_terminated": False,
+        "ai_learned_count": get_total_learned_count() # Schwarmwissen Zähler für UI
     })
 
 if __name__ == '__main__':
