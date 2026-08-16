@@ -142,9 +142,13 @@ def estimate_initial_soc(profile_key, samples):
         elif avg_w >= 1.5: return 92.0
         else: return 98.0
     elif profile_key == "laptop":
-        if avg_w >= 45.0: return 15.0
-        elif avg_w >= 25.0: return 60.0
-        else: return 85.0
+        # Verfeinerte und präzisere Laptop Logik
+        if avg_w >= 65.0: return 15.0
+        elif avg_w >= 45.0: return 40.0
+        elif avg_w >= 30.0: return 70.0
+        elif avg_w >= 15.0: return 85.0
+        elif avg_w >= 5.0: return 95.0
+        else: return 99.0
     return 0.0
 
 def background_meter_worker():
@@ -327,8 +331,6 @@ HTML_PAGE = """
     <meta charset="utf-8">
     <title>Smart Power Hub • AI Powered</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <!-- Chart.js importieren -->
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         :root {
             --bg-color: #f8fafc; --card-bg: #ffffff; --text-main: #0f172a;
@@ -339,7 +341,7 @@ HTML_PAGE = """
         * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; padding: 0; }
         body { background-color: var(--bg-color); color: var(--text-main); display: flex; justify-content: center; padding: 18px 12px; min-height: 100vh; }
         .container { width: 100%; max-width: 420px; margin: auto; }
-        .card { background: var(--card-bg); border-radius: 24px; padding: 22px 18px; box-shadow: var(--shadow-md); border: 1px solid var(--border-color); text-align: center; }
+        .card { background: var(--card-bg); border-radius: 24px; padding: 22px 18px; box-shadow: var(--shadow-md); border: 1px solid var(--border-color); text-align: center; margin-bottom: 12px; }
         .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
         .title { font-size: 18px; font-weight: 700; color: var(--text-main); letter-spacing: -0.3px; }
         .rate-badge { background: #f1f5f9; color: var(--text-muted); font-size: 12px; padding: 4px 10px; border-radius: 20px; font-weight: 600; }
@@ -355,7 +357,7 @@ HTML_PAGE = """
         .ai-mode { font-size: 11px; color: var(--text-muted); margin-top: 1px; }
 
         .battery-card { display: none; background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 16px; padding: 12px 14px; margin-bottom: 12px; text-align: left; }
-        .battery-header { display: flex; justify-content: space-between; font-size: 12px; font-weight: 700; color: #166534; margin-bottom: 6px; }
+        .battery-header { display: flex; justify-content: space-between; font-size: 12px; color: #166534; margin-bottom: 6px; }
         .battery-bar-wrap { width: 100%; height: 10px; background: #dcfce7; border-radius: 5px; overflow: hidden; border: 1px solid #86efac; }
         .battery-bar-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #22c55e, #16a34a); transition: width 0.4s ease; }
         .battery-meta { display: flex; justify-content: space-between; font-size: 11px; color: #15803d; margin-top: 5px; font-weight: 600; }
@@ -462,31 +464,6 @@ HTML_PAGE = """
     </div>
 
     <div class="container">
-        <!-- BESETZT-KARTE -->
-        <div class="card busy-card" id="busyCard">
-            <div style="font-size: 48px; margin-bottom: 10px;">⏳🔒</div>
-            <div class="title" style="margin-bottom: 6px;">Steckdose aktuell belegt</div>
-            <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 16px;">Ein anderer Nutzer lädt gerade aktiv an dieser Station.</p>
-            <div style="background: #f1f5f9; padding: 12px; border-radius: 14px; margin-bottom: 16px; text-align: left; font-size: 13px;">
-                Aktuelle Leistung: <b id="busyWatt">0.000 W</b>
-            </div>
-            <button class="btn-start" id="btnRequestSlot" style="background: var(--accent-primary);" onclick="requestSlot()">🔔 Nutzer anfragen (Bescheid geben)</button>
-            <div id="requestSentText" style="display:none; color: var(--accent-green); font-size: 12px; font-weight: 600; margin-top: 10px;">✅ Anfrage gesendet! Der aktive Nutzer wurde benachrichtigt.</div>
-        </div>
-
-        <!-- WARTE-KARTE FÜR PAUSIERTEN NUTZER 1 -->
-        <div class="card pause-wait-card" id="pauseWaitCard">
-            <div style="font-size: 48px; margin-bottom: 10px;">⏸️⏳</div>
-            <div class="title" style="margin-bottom: 6px;">Sitzung pausiert</div>
-            <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 16px;">Deine bisherige Messung ist gesichert. Die Steckdose wird derzeit von einem anderen Nutzer verwendet.</p>
-            <div style="background: #f1f5f9; padding: 12px; border-radius: 14px; margin-bottom: 16px; text-align: left; font-size: 13px;">
-                Bisheriger Verbrauch: <b id="pauseWh">0.0000 Wh</b><br>
-                Bisherige Kosten: <b id="pauseCost">0.00000 €</b>
-            </div>
-            <p style="font-size: 12px; color: var(--accent-primary); font-weight: 600; margin-bottom: 12px;">Sobald die Station wieder frei ist, wirst du automatisch hierher zurückgeleitet und kannst fortsetzen!</p>
-            <button class="btn-finish" onclick="finalizeTermination()">🛑 Jetzt endgültig beenden & abrechnen</button>
-        </div>
-
         <!-- HAUPTKARTE -->
         <div class="card" id="mainCard">
             <div class="header">
@@ -515,15 +492,15 @@ HTML_PAGE = """
                 </div>
             </div>
 
-            <!-- AKKU LADESTAND -->
+            <!-- AKKU LADESTAND NEU: Mit präziser Ladephasen-Messung statt nur Prozent -->
             <div class="battery-card" id="batteryCard">
                 <div class="battery-header">
-                    <span>🔋 Geschätzter Ladefortschritt</span>
-                    <span id="batteryPercentText">0%</span>
+                    <span style="font-weight: 600;">🔋 Zustand: <span id="batteryPhaseText" style="color: var(--text-main);">Analysiere...</span></span>
+                    <span id="batteryPercentText" style="font-weight: 700; color: var(--text-main);">0%</span>
                 </div>
                 <div class="battery-bar-wrap"><div class="battery-bar-fill" id="batteryBarFill"></div></div>
                 <div class="battery-meta">
-                    <span id="batteryWhLoaded">0.0 / 0 Wh</span>
+                    <span>Kapazität: <span id="batteryWhLoaded">0.0 / 0 Wh</span></span>
                     <span id="batteryTimeRemaining">Restzeit: --</span>
                 </div>
             </div>
@@ -542,28 +519,23 @@ HTML_PAGE = """
                 </div>
             </div>
 
-            <!-- LEISTUNG & LAUFZEIT (ORIGINAL WIEDERHERGESTELLT + SPARKLINE) -->
+            <!-- LEISTUNG & LAUFZEIT (ORIGINAL WIEDERHERGESTELLT) -->
             <div class="grid-2">
-                <div class="stat-card stat-watt" style="display:flex; flex-direction:column;">
-                    <div>
-                        <div class="stat-label">Wirkleistung (P)</div>
-                        <div class="stat-val"><span id="watt">0.000</span> W</div>
-                        <div class="stat-sub" id="wattSub" style="margin-bottom: 6px;">Kein Strom</div>
-                    </div>
-                    
-                    <!-- NEUES LIVE-DIAGRAMM (SPARKLINE) INNERHALB DER WATT-KACHEL -->
-                    <div style="position: relative; height: 35px; width: 100%;">
-                        <canvas id="powerChart"></canvas>
-                    </div>
-                    <div style="font-size: 8.5px; color: var(--text-muted); margin-top: 6px; line-height: 1.3;">
-                        <b>ℹ️ Info:</b> Schwankungen sind durch USB-PD Ladetaktsignal völlig normal.
-                    </div>
+                <div class="stat-card stat-watt">
+                    <div class="stat-label">Wirkleistung (P)</div>
+                    <div class="stat-val"><span id="watt">0.000</span> W</div>
+                    <div class="stat-sub" id="wattSub">Kein Strom</div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-label">Laufzeit</div>
-                    <div class="stat-val" id="timer">00:00:00</div>
+                    <div class="stat-val" id="timer" style="color: var(--text-main);">00:00:00</div>
                     <div class="stat-sub">Autarke Server-Messung</div>
                 </div>
+            </div>
+            
+            <!-- INFO BOX (Symmetrisch unterhalb des Grids) -->
+            <div style="background: #f8fafc; border: 1px solid var(--border-color); border-radius: 14px; padding: 12px; margin-bottom: 12px; text-align: left; font-size: 11px; color: var(--text-muted); line-height: 1.4;">
+                <b style="color: var(--text-main);">ℹ️ Info zu schwankenden Watt-Werten:</b> Moderne Ladegeräte kommunizieren permanent mit dem Akku. Um Überhitzung zu vermeiden, taktet und pulsiert das Netzteil den Strom sekündlich. Diese realen Mikroschwankungen misst das System live mit.
             </div>
 
             <!-- ENERGIE & KOSTEN (ORIGINAL WIEDERHERGESTELLT) -->
@@ -573,8 +545,8 @@ HTML_PAGE = """
                     <div class="stat-val" style="color:var(--accent-primary);"><span id="wh">0.0000</span> Wh</div>
                     <div class="stat-sub"><span id="mwh">0.0</span> mWh</div>
                 </div>
-                <div class="stat-card stat-cost">
-                    <div class="stat-label">Kosten (€)</div>
+                <div class="stat-card stat-cost" style="background: #f0fdf4; border-color: #bbf7d0;">
+                    <div class="stat-label" style="color: #166534;">Kosten (€)</div>
                     <div class="stat-val"><span id="cost">0.00000</span> €</div>
                     <div class="stat-sub"><span id="microCost">0.00</span> Cent</div>
                 </div>
@@ -625,6 +597,31 @@ HTML_PAGE = """
                 </div>
             </div>
         </div>
+        
+        <!-- BESETZT-KARTE -->
+        <div class="card busy-card" id="busyCard">
+            <div style="font-size: 48px; margin-bottom: 10px;">⏳🔒</div>
+            <div class="title" style="margin-bottom: 6px;">Steckdose aktuell belegt</div>
+            <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 16px;">Ein anderer Nutzer lädt gerade aktiv an dieser Station.</p>
+            <div style="background: #f1f5f9; padding: 12px; border-radius: 14px; margin-bottom: 16px; text-align: left; font-size: 13px;">
+                Aktuelle Leistung: <b id="busyWatt">0.000 W</b>
+            </div>
+            <button class="btn-start" id="btnRequestSlot" style="background: var(--accent-primary);" onclick="requestSlot()">🔔 Nutzer anfragen (Bescheid geben)</button>
+            <div id="requestSentText" style="display:none; color: var(--accent-green); font-size: 12px; font-weight: 600; margin-top: 10px;">✅ Anfrage gesendet! Der aktive Nutzer wurde benachrichtigt.</div>
+        </div>
+
+        <!-- WARTE-KARTE FÜR PAUSIERTEN NUTZER 1 -->
+        <div class="card pause-wait-card" id="pauseWaitCard">
+            <div style="font-size: 48px; margin-bottom: 10px;">⏸️⏳</div>
+            <div class="title" style="margin-bottom: 6px;">Sitzung pausiert</div>
+            <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 16px;">Deine bisherige Messung ist gesichert. Die Steckdose wird derzeit von einem anderen Nutzer verwendet.</p>
+            <div style="background: #f1f5f9; padding: 12px; border-radius: 14px; margin-bottom: 16px; text-align: left; font-size: 13px;">
+                Bisheriger Verbrauch: <b id="pauseWh">0.0000 Wh</b><br>
+                Bisherige Kosten: <b id="pauseCost">0.00000 €</b>
+            </div>
+            <p style="font-size: 12px; color: var(--accent-primary); font-weight: 600; margin-bottom: 12px;">Sobald die Station wieder frei ist, wirst du automatisch hierher zurückgeleitet und kannst fortsetzen!</p>
+            <button class="btn-finish" onclick="finalizeTermination()">🛑 Jetzt endgültig beenden & abrechnen</button>
+        </div>
     </div>
 
     <script>
@@ -640,49 +637,6 @@ HTML_PAGE = """
         if (!userId) {
             userId = 'usr_' + Math.random().toString(36).substr(2, 9) + Date.now();
             localStorage.setItem('hub_user_id', userId);
-        }
-
-        // --- CHART.JS (DIREKT IN DER WATT-KACHEL) ---
-        let powerChart;
-        let chartData = Array(15).fill(0); 
-        let chartLabels = Array(15).fill('');
-
-        function initChart() {
-            const ctx = document.getElementById('powerChart').getContext('2d');
-            powerChart = new Chart(ctx, {
-                type: 'line',
-                data: {
-                    labels: chartLabels,
-                    datasets: [{
-                        data: chartData,
-                        borderColor: '#2563eb',
-                        backgroundColor: 'rgba(37, 99, 235, 0.15)',
-                        borderWidth: 1.5,
-                        fill: true,
-                        tension: 0.3,
-                        pointRadius: 0
-                    }]
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    animation: { duration: 0 }, 
-                    scales: {
-                        x: { display: false },
-                        y: { display: false, beginAtZero: true } 
-                    },
-                    plugins: { legend: { display: false }, tooltip: { enabled: false } },
-                    layout: { padding: 0 }
-                }
-            });
-        }
-        window.addEventListener('load', initChart);
-
-        function updateChart(newWatt) {
-            if(!powerChart) return;
-            chartData.shift();
-            chartData.push(newWatt);
-            powerChart.update();
         }
 
         // --- POLLING INTERVAL ---
@@ -912,9 +866,6 @@ HTML_PAGE = """
                 document.getElementById('cost').innerText = data.cost.toFixed(5);
                 document.getElementById('microCost').innerText = (data.cost * 100.0).toFixed(3);
 
-                // Update Chart
-                updateChart(data.watt);
-
                 if (data.active && data.elapsed_seconds < data.analysis_threshold && !data.manually_selected) {
                     let remain = Math.max(0, Math.floor(data.analysis_threshold - data.elapsed_seconds));
                     document.getElementById('aiStatusTitle').innerText = `AI Analyse (${data.analysis_threshold}s)`;
@@ -927,9 +878,10 @@ HTML_PAGE = """
 
                 if (data.current_profile && data.current_profile.is_battery) {
                     let pct = data.battery_pct;
-                    document.getElementById('batteryPercentText').innerText = pct.toFixed(1) + "%";
+                    document.getElementById('batteryPhaseText').innerText = data.charge_phase;
+                    document.getElementById('batteryPercentText').innerText = "~" + pct.toFixed(0) + "%";
                     document.getElementById('batteryBarFill').style.width = pct.toFixed(1) + "%";
-                    document.getElementById('batteryWhLoaded').innerText = `${data.wh.toFixed(2)} / ${data.current_profile.capacity_wh.toFixed(0)} Wh`;
+                    document.getElementById('batteryWhLoaded').innerText = `${data.wh.toFixed(1)} / ${data.current_profile.capacity_wh.toFixed(0)} Wh`;
                     document.getElementById('batteryTimeRemaining').innerText = `Restzeit: ${data.remaining_time_str}`;
 
                     if (pct >= 80.0 && pct < 99.0 && !eightyModalDismissed && !data.battery_full_triggered) {
@@ -1164,7 +1116,15 @@ def status():
     
     curr_w = u.get("smoothed_watt", 0.0)
     remaining_str = "--"
+    charge_phase = "Bereit"
+    
     if prof.get("is_battery"):
+        # Ladephase berechnen für die UI
+        if battery_pct >= 95.0: charge_phase = "Erhaltungsladung"
+        elif battery_pct >= 80.0: charge_phase = "Sättigung (CV)"
+        elif battery_pct >= 30.0: charge_phase = "Normalladung (CC)"
+        else: charge_phase = "Schnellladung (Bulk)"
+
         if battery_pct >= 100.0: remaining_str = "100% Voll"
         elif curr_w > 1.0:
             rem_mins = int((((100.0 - battery_pct) / 100.0) * cap) / curr_w * 60)
@@ -1184,6 +1144,7 @@ def status():
         "transfer_requested": global_state.get("transfer_requested") and not is_busy,
         "current_profile_key": dev_key, "current_profile": prof,
         "battery_pct": battery_pct, "remaining_time_str": remaining_str,
+        "charge_phase": charge_phase,
         "battery_full_triggered": u.get("battery_full_triggered", False),
         "analysis_completed": u.get("analysis_completed", False),
         "analysis_threshold": 30.0,
@@ -1194,3 +1155,4 @@ def status():
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=5000)
+    
