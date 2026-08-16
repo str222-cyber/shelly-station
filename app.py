@@ -120,35 +120,62 @@ def async_cloud_control(turn_on=True):
         except: pass
     threading.Thread(target=_worker, daemon=True).start()
 
+def extract_advanced_features(samples):
+    if not samples: return 0.0, 0.0, 0.0, 0.0, 0.0
+    avg_w = sum(samples) / len(samples)
+    peak_w = max(samples)
+    min_w = min(samples)
+    var_w = math.sqrt(sum((x - avg_w) ** 2 for x in samples) / len(samples))
+    
+    # Trendberechnung (Fällt der Strom ab? = CV Phase des Akkus)
+    mid = len(samples) // 2
+    trend = 0.0
+    if mid > 0:
+        trend = (sum(samples[mid:]) / (len(samples) - mid)) - (sum(samples[:mid]) / mid)
+        
+    return avg_w, peak_w, min_w, var_w, trend
+
 def ai_classify_samples(samples):
     if not samples: return "phone" 
-    peak_w = max(samples)
+    avg_w, peak_w, min_w, var_w, trend = extract_advanced_features(samples)
+    delta_w = peak_w - min_w
     
+    # 1. Konstante Last (Lampen schwanken fast gar nicht. Handys schwanken durch USB-Handshake)
+    if delta_w <= 0.8 and var_w <= 0.4:
+        if avg_w < 40.0: return "lamp"
+        else: return "appliance"
+        
+    # 2. Variable Last (Netzteile / Akkus)
     if peak_w > 250.0: return "ebike_fast"
     elif peak_w > 90.0: return "ebike_std"
     elif peak_w > 35.0: return "laptop"
-    elif peak_w >= 0.1: return "phone"
-    return "lamp"
+    else: return "phone"
 
 def estimate_initial_soc(profile_key, samples):
     if not samples: return 0.0
-    avg_w = sum(samples) / len(samples)
+    avg_w, peak_w, min_w, var_w, trend = extract_advanced_features(samples)
+    
+    # Trend < -0.3 bedeutet: Der Strom ist in den 45s abgefallen. Das passiert typischerweise
+    # wenn der Akku über 80% ist und das Netzteil drosselt (Constant Voltage Phase).
+    is_cv_phase = trend < -0.3
     
     if profile_key == "phone":
-        if avg_w >= 20.0: return 15.0
-        elif avg_w >= 12.0: return 40.0
-        elif avg_w >= 8.0: return 60.0
-        elif avg_w >= 4.0: return 80.0
-        elif avg_w >= 1.5: return 92.0
-        else: return 98.0
-    elif profile_key == "laptop":
-        # Verfeinerte und präzisere Laptop Logik
-        if avg_w >= 65.0: return 15.0
-        elif avg_w >= 45.0: return 40.0
-        elif avg_w >= 30.0: return 70.0
-        elif avg_w >= 15.0: return 85.0
-        elif avg_w >= 5.0: return 95.0
+        if is_cv_phase and avg_w < 10.0: return 85.0
+        if avg_w >= 15.0: return 30.0
+        elif avg_w >= 10.0: return 50.0
+        elif avg_w >= 6.0: return 75.0
+        elif avg_w >= 3.0: return 85.0
+        elif avg_w >= 1.0: return 95.0
         else: return 99.0
+        
+    elif profile_key == "laptop":
+        if is_cv_phase and avg_w < 35.0: return 85.0
+        if avg_w >= 60.0: return 20.0
+        elif avg_w >= 40.0: return 50.0
+        elif avg_w >= 25.0: return 75.0
+        elif avg_w >= 10.0: return 88.0
+        else: return 96.0
+        
     return 0.0
 
 def background_meter_worker():
@@ -205,7 +232,7 @@ def background_meter_worker():
                     if watt > 0.05:
                         u["total_kwh"] += (watt * dt) / 3600000.0
 
-                    threshold = 30.0
+                    threshold = 45.0 # Auf 45 Sekunden erhöht für optimale Ladekurven-Messung
 
                     if u["total_seconds"] < threshold and not u["manually_selected"]:
                         if watt > 0.1:
@@ -487,25 +514,25 @@ HTML_PAGE = """
                     <div class="ai-icon" id="devIcon">📱</div>
                     <div>
                         <div class="ai-detected" id="detectedName">Smartphone (Standard)</div>
-                        <div class="ai-mode" id="detectedMode">AI Lastanalyse (30s)...</div>
+                        <div class="ai-mode" id="detectedMode">AI Lastanalyse...</div>
                     </div>
                 </div>
             </div>
 
-            <!-- AKKU LADESTAND NEU: Mit präziser Ladephasen-Messung statt nur Prozent -->
+            <!-- AKKU LADESTAND (Anti-Ruckel UI + Ladephase) -->
             <div class="battery-card" id="batteryCard">
                 <div class="battery-header">
-                    <span style="font-weight: 600;">🔋 Zustand: <span id="batteryPhaseText" style="color: var(--text-main);">Analysiere...</span></span>
-                    <span id="batteryPercentText" style="font-weight: 700; color: var(--text-main);">0%</span>
+                    <span style="font-weight: 600;">🔋 Phase: <span id="batteryPhaseText" style="color: var(--text-main);">Wird berechnet...</span></span>
+                    <span id="batteryPercentText" style="font-weight: 700; color: var(--text-main);">---%</span>
                 </div>
-                <div class="battery-bar-wrap"><div class="battery-bar-fill" id="batteryBarFill"></div></div>
+                <div class="battery-bar-wrap"><div class="battery-bar-fill" id="batteryBarFill" style="width:0%;"></div></div>
                 <div class="battery-meta">
                     <span>Kapazität: <span id="batteryWhLoaded">0.0 / 0 Wh</span></span>
-                    <span id="batteryTimeRemaining">Restzeit: --</span>
+                    <span id="batteryTimeRemaining">Restzeit: wird berechnet...</span>
                 </div>
             </div>
 
-            <!-- NETZDATEN GRID (ORIGINAL WIEDERHERGESTELLT) -->
+            <!-- NETZDATEN GRID (Symmetrisch) -->
             <div class="grid-2">
                 <div class="stat-card stat-volt">
                     <div class="stat-label">Spannung (U)</div>
@@ -519,7 +546,7 @@ HTML_PAGE = """
                 </div>
             </div>
 
-            <!-- LEISTUNG & LAUFZEIT (ORIGINAL WIEDERHERGESTELLT) -->
+            <!-- LEISTUNG & LAUFZEIT GRID (Symmetrisch) -->
             <div class="grid-2">
                 <div class="stat-card stat-watt">
                     <div class="stat-label">Wirkleistung (P)</div>
@@ -533,12 +560,12 @@ HTML_PAGE = """
                 </div>
             </div>
             
-            <!-- INFO BOX (Symmetrisch unterhalb des Grids) -->
+            <!-- INFO BOX (Elegant unter dem Grid integriert) -->
             <div style="background: #f8fafc; border: 1px solid var(--border-color); border-radius: 14px; padding: 12px; margin-bottom: 12px; text-align: left; font-size: 11px; color: var(--text-muted); line-height: 1.4;">
-                <b style="color: var(--text-main);">ℹ️ Info zu schwankenden Watt-Werten:</b> Moderne Ladegeräte kommunizieren permanent mit dem Akku. Um Überhitzung zu vermeiden, taktet und pulsiert das Netzteil den Strom sekündlich. Diese realen Mikroschwankungen misst das System live mit.
+                <b style="color: var(--text-main);">ℹ️ Warum schwankt die Wirkleistung?</b><br>Moderne Ladegeräte kommunizieren permanent mit dem Akku. Um Überhitzung zu vermeiden, taktet und pulsiert das USB-Netzteil den Strom sekündlich. Diese realen Mikroschwankungen misst das System live mit.
             </div>
 
-            <!-- ENERGIE & KOSTEN (ORIGINAL WIEDERHERGESTELLT) -->
+            <!-- ENERGIE & KOSTEN GRID (Symmetrisch) -->
             <div class="grid-2">
                 <div class="stat-card">
                     <div class="stat-label">Verbrauch</div>
@@ -866,17 +893,26 @@ HTML_PAGE = """
                 document.getElementById('cost').innerText = data.cost.toFixed(5);
                 document.getElementById('microCost').innerText = (data.cost * 100.0).toFixed(3);
 
+                // ANTI-RUCKEL UI LOGIK FÜR DIE ERSTEN 45 SEKUNDEN
                 if (data.active && data.elapsed_seconds < data.analysis_threshold && !data.manually_selected) {
                     let remain = Math.max(0, Math.floor(data.analysis_threshold - data.elapsed_seconds));
                     document.getElementById('aiStatusTitle').innerText = `AI Analyse (${data.analysis_threshold}s)`;
                     document.getElementById('detectedName').innerText = `Ladekurve... (${remain}s)`;
+                    
+                    if (data.current_profile && data.current_profile.is_battery) {
+                        document.getElementById('batteryPhaseText').innerText = "KI misst Schwankung...";
+                        document.getElementById('batteryPercentText').innerText = "---%";
+                        document.getElementById('batteryTimeRemaining').innerText = "Restzeit: wird berechnet";
+                        document.getElementById('batteryWhLoaded').innerText = "---";
+                    }
                 } else if (data.analysis_completed && !data.manually_selected) {
                     document.getElementById('aiStatusTitle').innerText = `🤖 AI Erkannt`;
                 } else if (data.manually_selected) {
                     document.getElementById('aiStatusTitle').innerText = `Vom Nutzer angelernt`;
                 }
 
-                if (data.current_profile && data.current_profile.is_battery) {
+                // WENN ANALYSE FERTIG IST -> WERTE ANZEIGEN
+                if (data.current_profile && data.current_profile.is_battery && (data.elapsed_seconds >= data.analysis_threshold || data.manually_selected)) {
                     let pct = data.battery_pct;
                     document.getElementById('batteryPhaseText').innerText = data.charge_phase;
                     document.getElementById('batteryPercentText').innerText = "~" + pct.toFixed(0) + "%";
@@ -1147,7 +1183,7 @@ def status():
         "charge_phase": charge_phase,
         "battery_full_triggered": u.get("battery_full_triggered", False),
         "analysis_completed": u.get("analysis_completed", False),
-        "analysis_threshold": 30.0,
+        "analysis_threshold": 45.0, # FEST 45 SEKUNDEN FÜR BESSERE ANALYSE
         "manually_selected": u.get("manually_selected", False),
         "session_terminated": False,
         "show_start_prompt": u.get("show_start_prompt", False)
@@ -1155,4 +1191,3 @@ def status():
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=5000)
-    
