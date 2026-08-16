@@ -1,6 +1,7 @@
 from flask import Flask, render_template_string, jsonify, session, request, send_file
 import requests
 import time
+import threading
 import uuid
 import smtplib
 import io
@@ -10,7 +11,7 @@ from email.mime.application import MIMEApplication
 from weasyprint import HTML
 
 app = Flask(__name__)
-app.secret_key = "shelly_smart_hub_instant_user_switch_2026"
+app.secret_key = "shelly_smart_hub_instant_latency_free_2026"
 
 # --- SHELLY CLOUD KONFIGURATION ---
 SHELLY_CLOUD_URL = "https://shelly-274-eu.shelly.cloud"
@@ -54,33 +55,35 @@ def add_universal_headers(response):
     response.headers["Pragma"] = "no-cache"
     return response
 
-def cloud_control(turn_on=True):
-    turn_str = "on" if turn_on else "off"
-    payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID, "turn": turn_str, "channel": 0}
-    try:
-        requests.post(f"{SHELLY_CLOUD_URL}/device/relay/control", data=payload, timeout=2.5)
-    except:
-        pass
-
-    rpc_payload = {
-        "auth_key": AUTH_KEY,
-        "id": DEVICE_ID,
-        "method": "Switch.Set",
-        "params": {"id": 0, "on": turn_on}
-    }
-    try:
-        requests.post(f"{SHELLY_CLOUD_URL}/device/rpc", json=rpc_payload, timeout=2.5)
-    except:
-        pass
+# ASYNCHRONER SCHALTBEFEHL: Blockiert den Webserver nicht mehr!
+def async_cloud_control(turn_on=True):
+    def _worker():
+        turn_str = "on" if turn_on else "off"
+        payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID, "turn": turn_str, "channel": 0}
+        try:
+            requests.post(f"{SHELLY_CLOUD_URL}/device/relay/control", data=payload, timeout=2.5)
+        except:
+            pass
+        rpc_payload = {
+            "auth_key": AUTH_KEY,
+            "id": DEVICE_ID,
+            "method": "Switch.Set",
+            "params": {"id": 0, "on": turn_on}
+        }
+        try:
+            requests.post(f"{SHELLY_CLOUD_URL}/device/rpc", json=rpc_payload, timeout=2.5)
+        except:
+            pass
+    threading.Thread(target=_worker, daemon=True).start()
 
 def fetch_live_cloud_metrics():
     now = time.time()
-    if now - global_state["last_fetch_time"] < 1.5:
+    if now - global_state["last_fetch_time"] < 1.0:
         return global_state["last_watt"], global_state["last_amp"], global_state["last_volt"]
 
     payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID}
     try:
-        res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=2.5).json()
+        res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=2.0).json()
         if res.get("isok"):
             status = res.get("data", {}).get("device_status", {})
             watt = 0.0
@@ -226,7 +229,6 @@ HTML_PAGE = """
         }
         .status-on { background: #ecfdf5; color: #065f46; }
         .status-off { background: #f1f5f9; color: var(--text-muted); }
-        .status-unplug { background: #fef3c7; color: #92400e; }
         .status-dot { width: 8px; height: 8px; border-radius: 50%; }
         .status-on .status-dot { background: var(--accent-green); box-shadow: 0 0 8px rgba(16,185,129,0.6); }
         .status-off .status-dot { background: #94a3b8; }
@@ -455,7 +457,7 @@ HTML_PAGE = """
 
             <div class="btn-group">
                 <button class="btn-start" id="mainStartBtn" onclick="startSession()">▶️ Start / Fortsetzen</button>
-                <button class="btn-stop" onclick="sendAction('/stop')">⏸️ Pause</button>
+                <button class="btn-stop" onclick="pauseSession()">⏸️ Pause</button>
                 <button class="btn-finish" onclick="logout()">🧾 Beenden & Abrechnen</button>
             </div>
         </div>
@@ -534,13 +536,24 @@ HTML_PAGE = """
             } catch(e) { return {}; }
         }
 
-        async function startSession() {
+        // SOFORTIGE REAKTION BEI START (0ms Wartezeit im UI)
+        function startSession() {
             isActive = true;
             document.getElementById('statusBadge').className = "status-pill status-on";
             document.getElementById('statusText').innerText = "Aktiv / Strom fließt";
             startLocalTimer();
-            await sendAction('/start');
-            setTimeout(fetchSyncData, 200);
+            sendAction('/start');
+            setTimeout(fetchSyncData, 150);
+        }
+
+        // SOFORTIGE REAKTION BEI PAUSE (0ms Wartezeit im UI)
+        function pauseSession() {
+            isActive = false;
+            stopLocalTimer();
+            document.getElementById('statusBadge').className = "status-pill status-off";
+            document.getElementById('statusText').innerText = "Pausiert / Bereit";
+            sendAction('/stop');
+            setTimeout(fetchSyncData, 150);
         }
 
         async function saveDeviceProfile(key) {
@@ -631,14 +644,14 @@ HTML_PAGE = """
             window.open('/download_invoice', '_blank');
         }
 
-        // SCHNELLER 2-SEKUNDEN ABGLEICH FÜR NUTZERWECHSEL & MESSWERTE
+        // 1-SEKUNDEN SCHNELLER STATUSABGLEICH
         async function fetchSyncData() {
             if (isTerminated) return;
             try {
                 let res = await fetch('/status', { cache: 'no-store' });
                 let data = await res.json();
 
-                // MULTI-USER WECHSEL ANZEIGE
+                // MULTI-USER WECHSEL: Sofortige Ansichts-Umschaltung
                 if (data.is_busy_for_other) {
                     document.getElementById('mainCard').style.display = 'none';
                     document.getElementById('busyCard').style.display = 'block';
@@ -649,7 +662,7 @@ HTML_PAGE = """
                     document.getElementById('mainCard').style.display = 'block';
                 }
 
-                // FREIGABE-ANFRAGE BEI NUTZER 1
+                // ANFRAGE BEI NUTZER 1
                 if (data.transfer_requested && !transferModalOpen) {
                     transferModalOpen = true;
                     document.getElementById('transferModal').style.display = 'flex';
@@ -659,7 +672,6 @@ HTML_PAGE = """
                     applyProfile(data.current_profile_key, data.current_profile);
                 }
 
-                // Messwerte setzen
                 let currentW = data.watt;
                 let currentA = data.current_ampere || 0.0;
                 let currentV = data.voltage || 230.0;
@@ -688,7 +700,7 @@ HTML_PAGE = """
             } catch(e) {}
         }
 
-        setInterval(fetchSyncData, 2000);
+        setInterval(fetchSyncData, 1000);
         fetchSyncData();
     </script>
 </body>
@@ -720,9 +732,9 @@ def home():
 @app.route('/start', methods=['POST', 'GET'])
 def start():
     u, uid = get_user_data()
-    if global_state["active_user_id"] and global_state["active_user_id"] != uid:
-        # Prüfe ob der andere Nutzer noch wirklich aktiv ist
-        other_user = user_sessions.get(global_state["active_user_id"], {})
+    active_uid = global_state.get("active_user_id")
+    if active_uid and active_uid != uid:
+        other_user = user_sessions.get(active_uid, {})
         if other_user.get("active", False):
             return jsonify({"status": "busy"})
         
@@ -732,7 +744,7 @@ def start():
     global_state["transfer_requester_id"] = None
     u["active"] = True
     u["last_check"] = time.time()
-    cloud_control(turn_on=True)
+    async_cloud_control(turn_on=True)
     return jsonify({"status": "ok"})
 
 @app.route('/stop', methods=['POST', 'GET'])
@@ -742,7 +754,7 @@ def stop():
     u["last_check"] = None
     u["current_watt"] = 0.0
     u["current_ampere"] = 0.0
-    cloud_control(turn_on=False)
+    async_cloud_control(turn_on=False)
     return jsonify({"status": "ok"})
 
 @app.route('/save_device', methods=['POST'])
@@ -774,9 +786,8 @@ def reject_transfer():
 def logout():
     u, uid = get_user_data()
     u["active"] = False
-    cloud_control(turn_on=False)
+    async_cloud_control(turn_on=False)
 
-    # Steckdose sofort atomar für den nächsten Nutzer freigeben
     if global_state["active_user_id"] == uid:
         global_state["active_user_id"] = None
         global_state["transfer_requested"] = False
