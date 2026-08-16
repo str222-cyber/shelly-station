@@ -186,14 +186,13 @@ def background_meter_worker():
                 if uid == active_uid:
                     global_state["last_watt"], global_state["last_amp"], global_state["last_volt"] = watt, amp, volt
 
-                # --- LIVE KONTINUIERLICHES FENSTER (Immer die letzten 40 Sekunden) ---
+                # --- LIVE KONTINUIERLICHES FENSTER (Letzte 40 Sekunden) ---
                 if "recent_samples" not in u: u["recent_samples"] = []
                 if watt > 0.1 or len(u["recent_samples"]) > 0:
                     u["recent_samples"].append(watt)
                     if len(u["recent_samples"]) > 40:
                         u["recent_samples"].pop(0)
 
-                # Speichere die absolute Höchstleistung der gesamten Sitzung für Upgrades
                 u["session_peak_watt"] = max(u.get("session_peak_watt", 0.0), watt)
 
                 # --- 1. DETECTION MODE (WARTEN AUF KABEL) ---
@@ -215,35 +214,29 @@ def background_meter_worker():
                         u["total_kwh"] += (watt * dt) / 3600000.0
 
                     # --- KONTINUIERLICHE KI LIVE-ÜBERWACHUNG ---
-                    # Sobald wir mind. 5 Werte haben, analysieren wir in Echtzeit weiter!
                     if len(u["recent_samples"]) >= 5 and not u.get("manually_selected"):
                         peak = u["session_peak_watt"]
                         tiers = {"lamp": 0, "phone": 1, "laptop": 2, "ebike_std": 3, "ebike_fast": 4, "appliance": 0}
                         curr_tier = tiers.get(u.get("device_key", "phone"), 0)
                         
-                        # Gerätetyp-Upgrade-Logik
                         new_key = u.get("device_key", "phone")
                         if peak > 250.0: new_key = "ebike_fast"
                         elif peak > 90.0: new_key = "ebike_std"
-                        elif peak >= 26.0: new_key = "laptop"  # Zieht der Akku EINMAL >26W = Laptop!
+                        elif peak >= 26.0: new_key = "laptop"
                         elif peak >= 0.1: new_key = "phone"
                         else: new_key = "lamp"
                         
-                        # Upgrade durchführen
                         if tiers.get(new_key, 0) > curr_tier:
                             u["device_key"] = new_key
                             
-                        # Dynamische SOC Korrektur
                         est_soc = estimate_current_soc(u["device_key"], u["recent_samples"])
                         cap = DEVICE_PROFILES.get(u["device_key"], {}).get("capacity_wh", 20.0)
                         
                         current_calc_soc = u.get("estimated_soc_0", 0.0) + (((u.get("total_kwh", 0.0) * 1000.0) / cap) * 100.0)
                         
                         if u["total_seconds"] <= 40.0:
-                            # In den ersten 40s darf der Wert flüssig justiert werden
                             u["estimated_soc_0"] = est_soc - (((u.get("total_kwh", 0.0) * 1000.0) / cap) * 100.0)
                         else:
-                            # Danach springen wir nur noch HOCH, falls die KI merkt, der Akku ist voller als gedacht
                             if est_soc > current_calc_soc + 5.0:
                                 u["estimated_soc_0"] = est_soc - (((u.get("total_kwh", 0.0) * 1000.0) / cap) * 100.0)
 
@@ -257,7 +250,7 @@ def background_meter_worker():
                         
                     if u.get("had_power_draw") and watt <= 0.15:
                         u["zero_power_counter"] += dt
-                        if u["zero_power_counter"] >= 65.0:  # Zählt wirklich sicher > 60s
+                        if u["zero_power_counter"] >= 65.0:  
                             u["active"], u["unplugged_detected"], u["had_power_draw"] = False, True, False
                             async_cloud_control(turn_on=False)
                     elif watt > 0.15:
@@ -530,8 +523,13 @@ HTML_PAGE = """
                     </div>
                 </div>
             </div>
+            
+            <!-- NEU: INFO BOX ZUR AI LÄRNSCHWÄCHE -->
+            <div style="background: #fffbeb; border: 1px solid #fde68a; border-radius: 14px; padding: 12px; margin-bottom: 12px; text-align: left; font-size: 11px; color: #92400e; line-height: 1.4;">
+                <b style="color: #b45309;">ℹ️ Hinweis zur AI-Erkennung:</b> Bei bestimmten Ladephasen (z.B. voller Laptop vs. schnellladendes Smartphone) ist eine automatische Unterscheidung schwer, da beide z.B. 20 Watt ziehen. Falls die KI sich irrt, wähle das Gerät bitte über <b>"Ändern"</b> manuell aus. Die Berechnungen passen sich sofort an.
+            </div>
 
-            <!-- AKKU LADESTAND NEU: Vorhersage für fehlende Wattstunden (Königsdisziplin) -->
+            <!-- AKKU LADESTAND -->
             <div class="battery-card" id="batteryCard">
                 <div class="battery-header">
                     <span style="font-weight: 600;">🔋 Phase: <span id="batteryPhaseText" style="color: var(--text-main);">Analysiere...</span></span>
@@ -545,6 +543,23 @@ HTML_PAGE = """
                 <div class="battery-meta" style="margin-top: 2px;">
                     <span></span>
                     <span id="batteryTimeRemaining">Restzeit: --</span>
+                </div>
+            </div>
+
+            <!-- DAUERBETRIEB PROGNOSE (NUR FÜR LAMPEN/ETC SICHTBAR) -->
+            <div id="continuousPrediction" style="display: none; margin-bottom: 12px;">
+                <div style="font-size: 12px; font-weight: 700; color: var(--text-main); margin-bottom: 8px; text-align: left; padding-left: 4px;">🔮 Verbrauchsprognose (Dauerbetrieb)</div>
+                <div class="grid-2">
+                    <div class="stat-card" style="background: #f8fafc; border-color: #e2e8f0; min-height: 60px;">
+                        <div class="stat-label">Nächste 1 Stunde</div>
+                        <div class="stat-val" style="font-size: 15px; color: var(--accent-primary);"><span id="pred1hWh">0.0</span> Wh</div>
+                        <div class="stat-sub"><span id="pred1hCost">0.000</span> €</div>
+                    </div>
+                    <div class="stat-card" style="background: #f8fafc; border-color: #e2e8f0; min-height: 60px;">
+                        <div class="stat-label">Nächste 24 Stunden</div>
+                        <div class="stat-val" style="font-size: 15px; color: var(--accent-primary);"><span id="pred24hWh">0.0</span></div>
+                        <div class="stat-sub"><span id="pred24hCost">0.000</span> €</div>
+                    </div>
                 </div>
             </div>
 
@@ -576,20 +591,20 @@ HTML_PAGE = """
                 </div>
             </div>
             
-            <!-- INFO BOX -->
+            <!-- INFO BOX WATT SCHWANKUNG -->
             <div style="background: #f8fafc; border: 1px solid var(--border-color); border-radius: 14px; padding: 12px; margin-bottom: 12px; text-align: left; font-size: 11px; color: var(--text-muted); line-height: 1.4;">
                 <b style="color: var(--text-main);">ℹ️ Info zu schwankenden Watt-Werten:</b> Moderne Ladegeräte kommunizieren permanent mit dem Akku. Um Überhitzung zu vermeiden, taktet und pulsiert das Netzteil den Strom. Diese realen Mikroschwankungen misst das System live mit.
             </div>
 
-            <!-- ENERGIE & KOSTEN GRID NEU: Live Vorhersage (Königsdisziplin) -->
+            <!-- ENERGIE & KOSTEN GRID -->
             <div class="grid-2">
                 <div class="stat-card">
-                    <div class="stat-label">Verbrauch</div>
+                    <div class="stat-label">Bisheriger Verbrauch</div>
                     <div class="stat-val" style="color:var(--accent-primary);"><span id="wh">0.0000</span> Wh</div>
                     <div class="stat-sub"><span id="mwh">0.0</span> mWh</div>
                 </div>
                 <div class="stat-card stat-cost" style="background: #f0fdf4; border-color: #bbf7d0;">
-                    <div class="stat-label" style="color: #166534;">Kosten (€)</div>
+                    <div class="stat-label" style="color: #166534;">Aktuelle Kosten</div>
                     <div class="stat-val"><span id="cost">0.00000</span> €</div>
                     <div class="stat-sub" id="predictedCostBox" style="margin-top: 4px; color: #166534; font-weight: bold; display: none;">
                         100% Prognose: <span id="predictedCost">0.0000</span> €
@@ -767,7 +782,10 @@ HTML_PAGE = """
             document.getElementById('devIcon').innerText = prof.icon;
             document.getElementById('detectedName').innerText = prof.name;
             document.getElementById('detectedMode').innerText = prof.is_battery ? "🔋 Akku-Ladeüberwachung" : "💡 Dauerbetrieb";
+            
             document.getElementById('batteryCard').style.display = prof.is_battery ? 'block' : 'none';
+            document.getElementById('continuousPrediction').style.display = prof.is_battery ? 'none' : 'block';
+            
             if (!prof.is_battery) {
                 document.getElementById('batteryRemWhBox').style.display = 'none';
                 document.getElementById('predictedCostBox').style.display = 'none';
@@ -917,7 +935,7 @@ HTML_PAGE = """
                 document.getElementById('cost').innerText = data.cost.toFixed(5);
                 document.getElementById('microCost').innerText = (data.cost * 100.0).toFixed(3);
 
-                // KÖNIGSDISZIPLIN: Vorhersage für fehlende Wh und totale Kosten
+                // KÖNIGSDISZIPLIN: Vorhersage für fehlende Wh und totale Kosten (Nur bei Akku)
                 if (data.current_profile && data.current_profile.is_battery && (data.elapsed_seconds >= data.analysis_threshold || data.manually_selected)) {
                     document.getElementById('batteryRemWh').innerText = data.rem_wh.toFixed(1);
                     document.getElementById('batteryRemWhBox').style.display = 'inline';
@@ -925,6 +943,14 @@ HTML_PAGE = """
                     document.getElementById('predictedCost').innerText = data.predicted_cost.toFixed(4);
                     document.getElementById('predictedCostBox').style.display = 'block';
                     document.getElementById('microCostBox').style.display = 'none';
+                } else if (data.current_profile && !data.current_profile.is_battery) {
+                    // KÖNIGSDISZIPLIN TEIL 2: Prognose für Dauerbetrieb (Lampe etc.)
+                    document.getElementById('pred1hWh').innerText = data.pred_1h_wh.toFixed(1);
+                    document.getElementById('pred1hCost').innerText = data.pred_1h_cost.toFixed(4);
+                    
+                    let wh24 = data.pred_24h_wh;
+                    document.getElementById('pred24hWh').innerText = wh24 >= 1000 ? (wh24/1000).toFixed(2) + " kWh" : wh24.toFixed(1) + " Wh";
+                    document.getElementById('pred24hCost').innerText = data.pred_24h_cost.toFixed(2);
                 } else {
                     document.getElementById('batteryRemWhBox').style.display = 'none';
                     document.getElementById('predictedCostBox').style.display = 'none';
@@ -1195,7 +1221,14 @@ def status():
     rem_wh = 0.0
     predicted_cost = 0.0
     
+    # NEU: Prognose Variablen für Dauerbetrieb (Lampe, Großgerät)
+    pred_1h_wh = 0.0
+    pred_1h_cost = 0.0
+    pred_24h_wh = 0.0
+    pred_24h_cost = 0.0
+    
     if prof.get("is_battery"):
+        # Ladephase berechnen für Akkus
         if battery_pct >= 95.0: charge_phase = "Erhaltungsladung"
         elif battery_pct >= 80.0: charge_phase = "Sättigung (CV)"
         elif battery_pct >= 30.0: charge_phase = "Normalladung (CC)"
@@ -1206,9 +1239,14 @@ def status():
             rem_mins = int((((100.0 - battery_pct) / 100.0) * cap) / curr_w * 60)
             remaining_str = f"ca. {rem_mins//60}h {rem_mins%60}m" if rem_mins >= 60 else f"ca. {rem_mins} Min."
             
-        # KÖNIGSDISZIPLIN: Vorhersage für fehlende Wh und totale Kosten
         rem_wh = max(0.0, cap * (100.0 - battery_pct) / 100.0)
         predicted_cost = (u["total_kwh"] + (rem_wh / 1000.0)) * STROMPREIS_PER_KWH
+    else:
+        # KÖNIGSDISZIPLIN TEIL 2: Prognose-Berechnung für Dauerbetrieb
+        pred_1h_wh = curr_w * 1.0
+        pred_1h_cost = (pred_1h_wh / 1000.0) * STROMPREIS_PER_KWH
+        pred_24h_wh = curr_w * 24.0
+        pred_24h_cost = (pred_24h_wh / 1000.0) * STROMPREIS_PER_KWH
 
     return jsonify({
         "active": u["active"] and not is_busy,
@@ -1227,6 +1265,10 @@ def status():
         "charge_phase": charge_phase,
         "rem_wh": rem_wh,
         "predicted_cost": predicted_cost,
+        "pred_1h_wh": pred_1h_wh,
+        "pred_1h_cost": pred_1h_cost,
+        "pred_24h_wh": pred_24h_wh,
+        "pred_24h_cost": pred_24h_cost,
         "battery_full_triggered": u.get("battery_full_triggered", False),
         "analysis_completed": u.get("analysis_completed", False),
         "analysis_threshold": 40.0,
