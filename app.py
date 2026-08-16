@@ -13,11 +13,8 @@ from email.mime.application import MIMEApplication
 from weasyprint import HTML
 
 app = Flask(__name__)
-
-# ProxyFix für Render.com (Erlaubt HTTPS-Cookies hinter dem Render Load-Balancer)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
-# Fester Session-Schlüssel
 app.secret_key = "shelly_smart_hub_stable_rocksolid_key_2026"
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
@@ -52,8 +49,8 @@ global_state = {
 user_sessions = {}
 
 DEVICE_PROFILES = {
-    "lamp": {"name": "💡 Lampe / Beleuchtung", "icon": "💡", "is_battery": False, "capacity_wh": 0},
-    "phone": {"name": "📱 Smartphone / Tablet", "icon": "📱", "is_battery": True, "capacity_wh": 25.0},
+    "lamp": {"name": "💡 Lampe / Dauerbetrieb", "icon": "💡", "is_battery": False, "capacity_wh": 0},
+    "phone": {"name": "📱 Smartphone / Tablet", "icon": "📱", "is_battery": True, "capacity_wh": 20.0},
     "laptop": {"name": "💻 Laptop / Monitor", "icon": "💻", "is_battery": True, "capacity_wh": 65.0},
     "ebike_std": {"name": "🚲 E-Bike Akku Standard", "icon": "🚲", "is_battery": True, "capacity_wh": 500.0},
     "ebike_fast": {"name": "⚡ E-Bike Schnelllader / PC", "icon": "⚡", "is_battery": True, "capacity_wh": 750.0},
@@ -67,7 +64,6 @@ def add_security_headers(response):
     response.headers["Pragma"] = "no-cache"
     return response
 
-# HYBRIDE AUTHENTIFIZIERUNG: Session Cookie + Header Token
 def check_authenticated():
     header_token = request.headers.get("X-Station-Token")
     if header_token == STATION_PHYSICAL_TOKEN:
@@ -102,16 +98,22 @@ def async_cloud_control(turn_on=True):
             pass
     threading.Thread(target=_worker, daemon=True).start()
 
-def classify_power_profile(avg_w, peak_w):
-    if avg_w < 3.0 and peak_w < 6.0:
-        return "lamp"
-    elif 3.0 <= avg_w < 25.0:
+# ROBUSTE LAST-KLASSIFIZIERUNG (Erkennt Smartphone ab 3.5 W zuverlässig)
+def classify_power_profile(samples):
+    if not samples:
         return "phone"
-    elif 25.0 <= avg_w < 85.0:
+    avg_w = sum(samples) / len(samples)
+    peak_w = max(samples)
+
+    if peak_w < 3.0 and avg_w < 2.5:
+        return "lamp"
+    elif 3.0 <= avg_w < 28.0 or (3.0 <= peak_w < 35.0 and avg_w < 28.0):
+        return "phone"
+    elif 28.0 <= avg_w < 90.0:
         return "laptop"
-    elif 85.0 <= avg_w < 240.0:
+    elif 90.0 <= avg_w < 250.0:
         return "ebike_std"
-    elif 240.0 <= avg_w < 650.0:
+    elif 250.0 <= avg_w < 650.0:
         return "ebike_fast"
     else:
         return "appliance"
@@ -121,7 +123,7 @@ def get_user_elapsed_seconds(u):
         return u["accumulated_seconds"] + (time.time() - u["start_timestamp"])
     return u["accumulated_seconds"]
 
-# AUTARKER SERVER-HINTERGRUND-WORKER (Zählt unabhängig vom Smartphone weiter)
+# AUTARKER HINTERGRUND-WORKER (ZÄHLT DURCHGEHEND, KEIN STOPP NACH 30s)
 def background_meter_worker():
     last_loop = time.time()
     while True:
@@ -167,37 +169,18 @@ def background_meter_worker():
                 u["current_ampere"] = amp
                 u["current_voltage"] = volt
 
-                # Kontinuierliche kWh-Integration
+                # Kontinuierliche Energie-Integration
                 u["accumulated_kwh"] += (watt * dt) / 3600000.0
 
                 elapsed = get_user_elapsed_seconds(u)
 
-                # 30-Sekunden Analyse sammeln (KEIN Unterbrechen der Zählung!)
+                # 30-Sekunden Analyse sammeln (Strom läuft ganz normal weiter!)
                 if elapsed < 30.0 and not u.get("manually_selected"):
-                    u["analysis_samples"].append(watt)
+                    if watt > 0.5:
+                        u["analysis_samples"].append(watt)
                 elif elapsed >= 30.0 and not u.get("analysis_completed") and not u.get("manually_selected"):
-                    if len(u["analysis_samples"]) > 0:
-                        avg_w = sum(u["analysis_samples"]) / len(u["analysis_samples"])
-                        peak_w = max(u["analysis_samples"])
-                        u["device_key"] = classify_power_profile(avg_w, peak_w)
+                    u["device_key"] = classify_power_profile(u["analysis_samples"])
                     u["analysis_completed"] = True
-
-                # Akku 100% Erkennung
-                prof = DEVICE_PROFILES.get(u["device_key"], {})
-                if prof.get("is_battery", False):
-                    if watt > 6.0:
-                        u["had_charging_phase"] = True
-                    
-                    if u["had_charging_phase"] and 0.3 <= watt < 1.8 and (u["accumulated_kwh"] * 1000.0) > 3.0:
-                        u["full_standby_counter"] += 1
-                        if u["full_standby_counter"] >= 30:
-                            u["battery_full_triggered"] = True
-                            u["accumulated_seconds"] = get_user_elapsed_seconds(u)
-                            u["active"] = False
-                            u["start_timestamp"] = None
-                            async_cloud_control(turn_on=False)
-                    else:
-                        u["full_standby_counter"] = 0
             else:
                 global_state["last_watt"] = 0.0
                 global_state["last_amp"] = 0.0
@@ -291,7 +274,7 @@ HTML_PAGE = """
 <html lang="de">
 <head>
     <meta charset="utf-8">
-    <title>Smart Power Hub • Authentifiziert</title>
+    <title>Smart Power Hub</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <style>
         :root {
@@ -493,8 +476,8 @@ HTML_PAGE = """
         <div class="modal-box">
             <h3 style="margin-bottom: 6px;">Gerät manuell festlegen</h3>
             <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">Wähle dein Gerät aus. Die Anzeige passt sich automatisch an.</p>
-            <button class="device-option-btn" onclick="saveDeviceProfile('lamp')">💡 Lampe / Beleuchtung (Dauerbetrieb)</button>
-            <button class="device-option-btn" onclick="saveDeviceProfile('phone')">📱 Smartphone / Tablet (Akku ~25 Wh)</button>
+            <button class="device-option-btn" onclick="saveDeviceProfile('lamp')">💡 Lampe / Dauerbetrieb</button>
+            <button class="device-option-btn" onclick="saveDeviceProfile('phone')">📱 Smartphone / Tablet (Akku ~20 Wh)</button>
             <button class="device-option-btn" onclick="saveDeviceProfile('laptop')">💻 Laptop / Monitor (Akku ~65 Wh)</button>
             <button class="device-option-btn" onclick="saveDeviceProfile('ebike_std')">🚲 E-Bike Akku Standard (Akku ~500 Wh)</button>
             <button class="device-option-btn" onclick="saveDeviceProfile('ebike_fast')">⚡ E-Bike Schnelllader (Akku ~750 Wh)</button>
@@ -513,16 +496,6 @@ HTML_PAGE = """
             </p>
             <button class="btn-start" style="background: var(--accent-green); margin-bottom: 8px;" onclick="acceptTransfer()">✅ Ja, beenden & freigeben</button>
             <button class="btn-stop" onclick="rejectTransfer()">Nein, ich nutze weiter</button>
-        </div>
-    </div>
-
-    <!-- 100% AKKU VOLL POP-UP -->
-    <div id="fullModal" class="modal-overlay">
-        <div class="modal-box" style="border: 2px solid var(--accent-green);">
-            <div style="font-size: 48px; margin-bottom: 8px;">🔋✨</div>
-            <h2 style="font-size: 20px; color: var(--accent-green); margin-bottom: 6px;">Akku 100% Vollgeladen!</h2>
-            <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 12px;">Der Stromfluss wurde automatisch beendet.</p>
-            <button class="btn-start" style="background: var(--accent-green);" onclick="logout()">🧾 Quittung & Rechnung anzeigen</button>
         </div>
     </div>
 
@@ -672,8 +645,6 @@ HTML_PAGE = """
         let transferModalOpen = false;
         let currentProfileKey = "lamp";
 
-        // Speichere den Sicherheitstoken im lokalen Speicher
-        const urlParams = new URLSearchParams(window.location.search);
         let stationToken = 'SEC-STATION-2026-X99Q-ALPHA-77';
         localStorage.setItem('station_token', stationToken);
 
@@ -768,7 +739,6 @@ HTML_PAGE = """
                 
                 document.getElementById('mainCard').style.display = 'none';
                 document.getElementById('busyCard').style.display = 'none';
-                document.getElementById('fullModal').style.display = 'none';
                 document.getElementById('receiptCard').style.display = 'block';
             } catch(e) {}
         }
@@ -870,7 +840,7 @@ HTML_PAGE = """
 
                 // Akku-Ladezustand & Restzeit
                 if (data.current_profile && data.current_profile.is_battery) {
-                    let cap = data.current_profile.capacity_wh || 50.0;
+                    let cap = data.current_profile.capacity_wh || 20.0;
                     document.getElementById('batteryPercentText').innerText = data.battery_pct.toFixed(1) + "%";
                     document.getElementById('batteryBarFill').style.width = data.battery_pct.toFixed(1) + "%";
                     document.getElementById('batteryWhLoaded').innerText = `${data.wh.toFixed(2)} / ${cap.toFixed(0)} Wh`;
@@ -884,10 +854,6 @@ HTML_PAGE = """
                 } else {
                     document.getElementById('statusBadge').className = "status-pill status-off";
                     document.getElementById('statusText').innerText = "Pausiert / Bereit";
-                }
-
-                if (data.battery_full_triggered) {
-                    document.getElementById('fullModal').style.display = 'flex';
                 }
 
             } catch(e) {}
@@ -918,9 +884,6 @@ def get_user_data():
             "analysis_samples": [],
             "analysis_completed": False,
             "manually_selected": False,
-            "had_charging_phase": False,
-            "full_standby_counter": 0,
-            "battery_full_triggered": False,
             "last_report": None
         }
     return user_sessions[uid], uid
@@ -1075,8 +1038,8 @@ def download_invoice():
     u, _ = get_user_data()
     report = u.get("last_report") or {
         "invoice_id": "RE-SAMPLE",
-        "device": "💡 Lampe / Beleuchtung",
-        "mode": "Dauerbetrieb",
+        "device": "📱 Smartphone / Tablet",
+        "mode": "Akku-Ladeüberwachung",
         "time_formatted": "00:15:00",
         "wh": 10.5,
         "kwh": 0.0105,
@@ -1091,8 +1054,8 @@ def send_email_invoice():
     data = request.get_json() or {}
     recipient = data.get("email")
     report = data.get("report") or {}
-    report["device"] = data.get("device", "💡 Lampe / Beleuchtung")
-    report["mode"] = data.get("mode", "Dauerbetrieb")
+    report["device"] = data.get("device", "📱 Smartphone / Tablet")
+    report["mode"] = data.get("mode", "Akku-Ladeüberwachung")
 
     if not recipient or "@" not in recipient:
         return jsonify({"status": "error", "message": "Ungültige E-Mail-Adresse"})
@@ -1154,7 +1117,7 @@ def status():
     # Exakte Zeit- & Energieberechnung
     elapsed = get_user_elapsed_seconds(u)
     wh = u["accumulated_kwh"] * 1000.0
-    cap = prof.get("capacity_wh", 50.0)
+    cap = prof.get("capacity_wh", 20.0)
     battery_pct = min(100.0, (wh / cap) * 100.0) if prof.get("is_battery") and cap > 0 else 0.0
     
     remaining_str = "--"
@@ -1187,7 +1150,6 @@ def status():
         "current_profile": prof,
         "battery_pct": battery_pct,
         "remaining_time_str": remaining_str,
-        "battery_full_triggered": u.get("battery_full_triggered", False),
         "analysis_completed": u.get("analysis_completed", False),
         "manually_selected": u.get("manually_selected", False),
         "session_terminated": False
