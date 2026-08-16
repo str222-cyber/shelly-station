@@ -63,29 +63,14 @@ DEVICE_PROFILES = {
 def load_ai_models():
     if os.path.exists(AI_MODEL_FILE):
         try:
-            with open(AI_MODEL_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            pass
+            with open(AI_MODEL_FILE, "r") as f: return json.load(f)
+        except Exception: pass
     return DEFAULT_AI_PROFILES
 
 def save_ai_models(models):
     try:
-        with open(AI_MODEL_FILE, "w") as f:
-            json.dump(models, f, indent=2)
-    except Exception:
-        pass
-
-def get_total_learned_count():
-    return sum(m.get("count", 1) for m in load_ai_models().values())
-
-def get_analysis_threshold(user_session):
-    samples = user_session.get("analysis_samples", [])
-    if len(samples) > 10:
-        avg = sum(samples) / len(samples)
-        if avg < 15.0:
-            return 45.0
-    return 30.0
+        with open(AI_MODEL_FILE, "w") as f: json.dump(models, f, indent=2)
+    except Exception: pass
 
 global_state = {
     "active_user_id": None,
@@ -132,70 +117,36 @@ def async_cloud_control(turn_on=True):
         try:
             requests.post(f"{SHELLY_CLOUD_URL}/device/relay/control", data={"auth_key": AUTH_KEY, "id": DEVICE_ID, "turn": turn_str, "channel": 0}, timeout=2.5)
             requests.post(f"{SHELLY_CLOUD_URL}/device/rpc", json={"auth_key": AUTH_KEY, "id": DEVICE_ID, "method": "Switch.Set", "params": {"id": 0, "on": turn_on}}, timeout=2.5)
-        except:
-            pass
+        except: pass
     threading.Thread(target=_worker, daemon=True).start()
-
-def extract_advanced_features(samples):
-    if not samples: return 0.0, 0.0, 0.0, 0.0, 0.0
-    avg_w = sum(samples) / len(samples)
-    peak_w = max(samples)
-    min_w = min(samples)
-    var_w = math.sqrt(sum((x - avg_w) ** 2 for x in samples) / len(samples))
-    
-    mid = len(samples) // 2
-    trend = 0.0
-    if mid > 0:
-        trend = (sum(samples[mid:]) / (len(samples) - mid)) - (sum(samples[:mid]) / mid)
-        
-    return avg_w, peak_w, min_w, var_w, trend
 
 def ai_classify_samples(samples):
     if not samples: return "lamp"
-    avg_w, peak_w, min_w, var_w, trend = extract_advanced_features(samples)
-    delta_w = peak_w - min_w
-
-    if var_w > 0.8 or delta_w > 1.5:
-        if avg_w < 35.0: return "phone"
-        elif avg_w < 90.0: return "laptop"
-        else: return "ebike_fast"
-            
-    if delta_w <= 0.6:
-        if avg_w < 5.0:
-            if len(samples) > 5 and samples[0] < (avg_w - 0.2):
-                return "phone" 
-            else:
-                return "lamp"
-        elif 5.0 <= avg_w < 35.0:
-            return "phone"
-
-    if 0.5 <= avg_w < 35.0: return "phone"
-    elif 35.0 <= avg_w < 90.0: return "laptop"
-    elif 90.0 <= avg_w < 250.0: return "ebike_std"
-    elif 250.0 <= avg_w < 650.0: return "ebike_fast"
+    avg_w = sum(samples) / len(samples)
     
+    # RADIKALE VEREINFACHUNG: Handys werden nun absolut priorisiert. Keine "Lampen" mehr unter 35W, außer manuell gewählt!
+    if 0.1 <= avg_w <= 35.0: return "phone"
+    elif 35.0 < avg_w <= 90.0: return "laptop"
+    elif 90.0 < avg_w <= 250.0: return "ebike_std"
+    elif 250.0 < avg_w <= 650.0: return "ebike_fast"
     return "appliance"
 
 def estimate_initial_soc(profile_key, samples):
     if not samples: return 0.0
-    avg_w, peak_w, min_w, var_w, trend = extract_advanced_features(samples)
+    avg_w = sum(samples) / len(samples)
     
     if profile_key == "phone":
-        if trend < -0.3 and avg_w < 6.0: return 90.0
-        
-        # Besser kalibriert für die typischen 80% Watt-Werte
-        if avg_w >= 18.0: return 10.0
-        elif avg_w >= 12.0: return 40.0
-        elif avg_w >= 7.0: return 80.0
-        elif avg_w >= 4.0: return 90.0
-        elif avg_w >= 1.0: return 96.0
+        if avg_w >= 20.0: return 10.0
+        elif avg_w >= 15.0: return 30.0
+        elif avg_w >= 10.0: return 50.0
+        elif avg_w >= 5.0: return 75.0
+        elif avg_w >= 2.0: return 85.0   # Exakte Kalibrierung für ein 80% Handy
+        elif avg_w >= 0.5: return 95.0
         else: return 99.0
-        
     elif profile_key == "laptop":
         if avg_w >= 45.0: return 15.0
         elif avg_w >= 25.0: return 60.0
         else: return 85.0
-        
     return 0.0
 
 def background_meter_worker():
@@ -207,9 +158,14 @@ def background_meter_worker():
 
         try:
             active_uid = global_state.get("active_user_id")
-            if active_uid and active_uid in user_sessions:
-                u = user_sessions[active_uid]
+            
+            # Alle User-Sessions verarbeiten (für Ausstecken & Co)
+            for uid, u in user_sessions.items():
+                # Nur Messen, wenn wir aktiv sind, ODER im Detection Mode (Kabel einstecken prüfen)
+                if not u.get("active", False) and not u.get("detection_mode", False):
+                    continue
                 
+                # Messwerte holen
                 watt, amp, volt = 0.0, 0.0, 230.0
                 try:
                     res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data={"auth_key": AUTH_KEY, "id": DEVICE_ID}, timeout=2.0).json()
@@ -229,14 +185,31 @@ def background_meter_worker():
                 u["current_watt"], u["current_ampere"], u["current_voltage"] = watt, amp, volt
                 u["smoothed_watt"] = watt if u.get("smoothed_watt") is None else (u["smoothed_watt"] * 0.8) + (watt * 0.2)
                 
-                global_state["last_watt"], global_state["last_amp"], global_state["last_volt"] = watt, amp, volt
+                if uid == active_uid:
+                    global_state["last_watt"], global_state["last_amp"], global_state["last_volt"] = watt, amp, volt
 
+                # --- 1. DETECTION MODE (WARTEN AUF KABEL) ---
+                if not u["active"] and u.get("detection_mode", False):
+                    # Schutz vor vergessenen Sessions: Wenn Nutzer Browser schließt, geht Relais nach 15s aus
+                    if time.time() - u.get("last_seen", time.time()) > 15.0:
+                        u["detection_mode"] = False
+                        u["show_start_prompt"] = False
+                        async_cloud_control(turn_on=False)
+                        continue
+
+                    if watt > 0.5:
+                        u["show_start_prompt"] = True
+                    else:
+                        u["show_start_prompt"] = False
+                    continue # Restliche Berechnungen überspringen, da noch nicht gestartet!
+
+                # --- 2. AKTIVE SESSION ---
                 if u.get("active", False):
                     u["total_seconds"] += dt
                     if watt > 0.05:
                         u["total_kwh"] += (watt * dt) / 3600000.0
 
-                    threshold = get_analysis_threshold(u)
+                    threshold = 30.0
 
                     if u["total_seconds"] < threshold and not u["manually_selected"]:
                         if watt > 0.1:
@@ -246,12 +219,12 @@ def background_meter_worker():
                         u["estimated_soc_0"] = estimate_initial_soc(u["device_key"], u["analysis_samples"])
                         u["analysis_completed"] = True
 
-                    # EXTREM VERBESSERTE AUSSTECK-ERKENNUNG (60s Toleranz für Handshakes)
+                    # Tolerantere Aussteck-Erkennung (Mindestens 60 Sekunden 0 Watt, wegen USB Handshakes)
                     if watt > 0.5:
                         u["had_power_draw"], u["zero_power_counter"] = True, 0.0
                     if u.get("had_power_draw") and watt <= 0.15:
                         u["zero_power_counter"] += dt
-                        if u["zero_power_counter"] >= 60.0:  # Erhöht auf sichere 60 Sekunden!
+                        if u["zero_power_counter"] >= 60.0:  
                             u["active"], u["unplugged_detected"], u["had_power_draw"] = False, True, False
                             async_cloud_control(turn_on=False)
                     elif watt > 0.15:
@@ -436,6 +409,19 @@ HTML_PAGE = """
     </style>
 </head>
 <body>
+    
+    <!-- KABEL ERKANNT POP-UP -->
+    <div id="plugDetectedModal" class="modal-overlay">
+        <div class="modal-box" style="border: 2px solid var(--accent-cyan);">
+            <div style="font-size: 48px; margin-bottom: 8px;">🔌⚡</div>
+            <h2 style="font-size: 20px; color: var(--accent-cyan); margin-bottom: 6px;">Kabel eingesteckt!</h2>
+            <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 16px;">Wir haben erkannt, dass ein Gerät angeschlossen wurde. Möchtest du den Ladevorgang starten?</p>
+            <button class="btn-start" style="background: var(--accent-cyan); margin-bottom: 8px;" onclick="confirmStart()">▶️ Ja, Ladevorgang starten</button>
+            <button class="btn-stop" onclick="closeAppEarly()">❌ Nein, abbrechen</button>
+        </div>
+    </div>
+
+    <!-- GERÄTE MODAL -->
     <div id="deviceModal" class="modal-overlay">
         <div class="modal-box">
             <h3 style="margin-bottom: 6px;">Gerät manuell festlegen</h3>
@@ -596,7 +582,6 @@ HTML_PAGE = """
                 <button class="btn-stop" onclick="pauseSession()">⏸️ Pause</button>
                 <button class="btn-finish" onclick="logout(true)">🧾 Beenden & Abrechnen</button>
                 
-                <!-- NEUER BUTTON ZUM KOMPLETTEN SCHLIESSEN OHNE STROM -->
                 <button class="btn-stop" style="background: #fef2f2; color: var(--accent-red); border-color: #fecaca; margin-top: 8px;" onclick="closeAppEarly()">❌ Fenster komplett schließen</button>
             </div>
         </div>
@@ -645,6 +630,7 @@ HTML_PAGE = """
         let lastReport = null;
         let transferModalOpen = false;
         let eightyModalDismissed = false;
+        let startPromptShown = false;
         let stationToken = 'SEC-STATION-2026-X99Q-ALPHA-77';
         
         let userId = localStorage.getItem('hub_user_id');
@@ -653,22 +639,30 @@ HTML_PAGE = """
             localStorage.setItem('hub_user_id', userId);
         }
 
-        // --- SCHLIESSEN VON DER HAUPTSEITE OHNE STARTEN ---
+        // --- POLLING INTERVAL ---
+        let syncInterval = setInterval(fetchSyncData, 1000);
+
+        // --- DIREKT BEIM START DETECTION MODE AUSLÖSEN ---
+        sendAction('/init_detection');
+
+        // --- NEUER 1-KLICK SCHLIESSEN BUTTON VOR START ---
         function closeAppEarly() {
+            clearInterval(syncInterval); // STOPPT POLLING SOFORT!
             try { window.open('','_self').close(); } catch (e) {}
             document.body.innerHTML = `
                 <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; text-align:center; background:#0f172a; color:#f8fafc; margin: -18px -12px;">
                     <div style="font-size: 60px; margin-bottom:20px;">🚪</div>
                     <h2 style="margin-bottom: 10px; color: #38bdf8;">Abgebrochen</h2>
-                    <p style="color: #94a3b8; max-width:280px; font-size: 15px; line-height: 1.5;">Kein Stromfluss gestartet. Bitte scanne den QR-Code erneut, falls du doch laden möchtest.<br><br>Du kannst dieses Fenster nun schließen.</p>
+                    <p style="color: #94a3b8; max-width:280px; font-size: 15px; line-height: 1.5;">Kein Stromfluss gestartet.<br><br>Bitte scanne den QR-Code erneut, falls du doch laden möchtest.</p>
                 </div>
             `;
             document.body.style.background = '#0f172a';
-            sendAction('/new_session');
+            sendAction('/stop'); // Relais sicherheitshalber abschalten
         }
 
-        // --- SCHLIESSEN NACH DER ABRECHNUNG ---
+        // --- 1-KLICK SCHLIESSEN NACH ABRECHNUNG ---
         function closeApp() {
+            clearInterval(syncInterval); // STOPPT POLLING SOFORT!
             try { window.open('','_self').close(); } catch (e) {}
             document.body.innerHTML = `
                 <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; text-align:center; background:#0f172a; color:#f8fafc; margin: -18px -12px;">
@@ -678,6 +672,12 @@ HTML_PAGE = """
                 </div>
             `;
             document.body.style.background = '#0f172a';
+        }
+
+        async function confirmStart() {
+            document.getElementById('plugDetectedModal').style.display = 'none';
+            startPromptShown = false;
+            await startSession();
         }
 
         function updateTimerUI(sec) {
@@ -847,6 +847,15 @@ HTML_PAGE = """
                     document.getElementById('mainCard').style.display = 'block';
                 }
 
+                // KABEL EIN-STECK ERKENNUNG
+                if (data.show_start_prompt && !startPromptShown && !data.active) {
+                    document.getElementById('plugDetectedModal').style.display = 'flex';
+                    startPromptShown = true;
+                } else if (!data.show_start_prompt && startPromptShown) {
+                    document.getElementById('plugDetectedModal').style.display = 'none';
+                    startPromptShown = false;
+                }
+
                 if (data.transfer_requested && !transferModalOpen) { transferModalOpen = true; document.getElementById('transferModal').style.display = 'flex'; }
                 if (data.current_profile) applyProfile(data.current_profile_key, data.current_profile);
 
@@ -899,8 +908,8 @@ HTML_PAGE = """
                     startBtn.innerText = "▶️ Läuft bereits";
                 } else {
                     badge.className = "status-pill status-off";
-                    statusText.innerText = "Pausiert / Bereit";
-                    document.getElementById('wattSub').innerText = "Bereit zum Start";
+                    statusText.innerText = "Bereit für Gerät";
+                    document.getElementById('wattSub').innerText = "Stecke ein Kabel ein...";
                     startBtn.innerText = "▶️ Start / Fortsetzen";
                 }
 
@@ -911,8 +920,8 @@ HTML_PAGE = """
 
             } catch(e) {}
         }
-
-        setInterval(fetchSyncData, 1000);
+        
+        // Initialer Fetch (wird danach von syncInterval übernommen)
         fetchSyncData();
     </script>
 </body>
@@ -928,7 +937,8 @@ def get_user_data():
             "zero_power_counter": 0.0, "battery_full_counter": 0.0, "total_kwh": 0.0, "total_seconds": 0.0,
             "current_watt": 0.0, "smoothed_watt": 0.0, "current_ampere": 0.0, "current_voltage": 230.0,
             "device_key": "lamp", "analysis_samples": [], "analysis_completed": False, "manually_selected": False,
-            "estimated_soc_0": 0.0, "battery_full_triggered": False, "eighty_percent_triggered": False, "last_report": None
+            "estimated_soc_0": 0.0, "battery_full_triggered": False, "eighty_percent_triggered": False, "last_report": None,
+            "detection_mode": False, "show_start_prompt": False, "last_seen": time.time()
         }
     return user_sessions[uid], uid
 
@@ -950,6 +960,16 @@ def scan_qr_entry(token):
     get_user_data()
     return render_template_string(HTML_PAGE)
 
+@app.route('/init_detection', methods=['POST'])
+@require_physical_auth
+def init_detection():
+    ensure_worker()
+    u, _ = get_user_data()
+    if not u.get("active") and not u.get("terminated"):
+        u["detection_mode"] = True
+        async_cloud_control(turn_on=True)
+    return jsonify({"status": "ok"})
+
 @app.route('/start', methods=['POST'])
 @require_physical_auth
 def start():
@@ -958,7 +978,7 @@ def start():
     if u.get("terminated", False): return jsonify({"status": "forbidden"}), 403
     if global_state.get("active_user_id") and global_state["active_user_id"] != uid: return jsonify({"status": "busy"})
     global_state.update({"active_user_id": uid, "transfer_requested": False, "transfer_requester_id": None})
-    u.update({"active": True, "unplugged_detected": False, "zero_power_counter": 0.0, "paused_by_transfer": False})
+    u.update({"active": True, "unplugged_detected": False, "zero_power_counter": 0.0, "paused_by_transfer": False, "detection_mode": False, "show_start_prompt": False})
     async_cloud_control(turn_on=True)
     return jsonify({"status": "ok"})
 
@@ -969,6 +989,8 @@ def stop():
     u, uid = get_user_data()
     if u.get("terminated", False) or global_state.get("active_user_id") != uid: return jsonify({"status": "forbidden"}), 403
     u["active"] = False
+    u["detection_mode"] = False
+    u["show_start_prompt"] = False
     async_cloud_control(turn_on=False)
     return jsonify({"status": "ok"})
 
@@ -1019,6 +1041,7 @@ def reject_transfer():
 def logout():
     u, uid = get_user_data()
     u["active"] = False
+    u["detection_mode"] = False
     if (request.get_json() or {}).get("final", False): u["terminated"] = True
     if global_state["active_user_id"] == uid:
         global_state.update({"active_user_id": None, "transfer_requested": False, "transfer_requester_id": None})
@@ -1085,6 +1108,7 @@ def status():
     ensure_worker()
     u, uid = get_user_data()
     active_uid = global_state.get("active_user_id")
+    u["last_seen"] = time.time()
 
     if u.get("terminated", False): return jsonify({"session_terminated": True, "is_busy_for_other": False})
     
@@ -1119,9 +1143,10 @@ def status():
         "battery_pct": battery_pct, "remaining_time_str": remaining_str,
         "battery_full_triggered": u.get("battery_full_triggered", False),
         "analysis_completed": u.get("analysis_completed", False),
-        "analysis_threshold": get_analysis_threshold(u),
+        "analysis_threshold": 30.0,
         "manually_selected": u.get("manually_selected", False),
-        "session_terminated": False
+        "session_terminated": False,
+        "show_start_prompt": u.get("show_start_prompt", False)
     })
 
 if __name__ == '__main__':
