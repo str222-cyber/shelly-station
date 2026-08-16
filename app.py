@@ -15,15 +15,15 @@ from weasyprint import HTML
 app = Flask(__name__)
 
 # --- SICHERHEITS- & SESSION-KONFIGURATION ---
-app.secret_key = secrets.token_hex(32)
+app.secret_key = "shelly_smart_hub_screen_scan_auth_2026"
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SECURE=True,
-    SESSION_COOKIE_SAMESITE="Strict",
-    PERMANENT_SESSION_LIFETIME=14400  # 4 Stunden maximale Gültigkeit
+    SESSION_COOKIE_SAMESITE="Lax",  # Erlaubt reibungslose Übergabe aus der Smartphone-Kamera
+    PERMANENT_SESSION_LIFETIME=14400 # 4 Stunden Gültigkeit
 )
 
-# GEHEIMER VOR-ORT TOKEN (Muss exakt mit dem QR-Code übereinstimmen)
+# GEHEIMER VOR-ORT TOKEN
 STATION_PHYSICAL_TOKEN = "SEC-STATION-2026-X99Q-ALPHA-77"
 
 # --- SHELLY CLOUD KONFIGURATION ---
@@ -33,7 +33,6 @@ DEVICE_ID = "08927249a904"
 
 STROMPREIS_PER_KWH = 0.35  # 0,35 € pro kWh
 
-# OPTIONALE SMTP-DATEN FÜR E-MAIL-VERSAND
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 SMTP_USER = ""
@@ -50,7 +49,6 @@ global_state = {
 
 user_sessions = {}
 
-# Geräteprofile mit Lastbereichen und Akkukapazitäten
 DEVICE_PROFILES = {
     "lamp": {"name": "💡 Lampe / Beleuchtung", "icon": "💡", "is_battery": False, "capacity_wh": 0},
     "phone": {"name": "📱 Smartphone / Tablet", "icon": "📱", "is_battery": True, "capacity_wh": 25.0},
@@ -69,16 +67,19 @@ def add_security_headers(response):
     response.headers["X-Frame-Options"] = "DENY"
     return response
 
-# SICHERHEITS-GUARD: Blockiert Aufrufe ohne Vor-Ort-Authentifizierung
+# SICHERHEITS-GUARD: Prüft, ob der QR-Code gescannt wurde
+def check_authenticated():
+    return session.get("authenticated_on_site") is True and session.get("station_token") == STATION_PHYSICAL_TOKEN
+
 def require_physical_auth(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        if not session.get("authenticated_on_site") or session.get("station_token") != STATION_PHYSICAL_TOKEN:
-            return jsonify({"status": "unauthorized", "message": "Bitte QR-Code vor Ort scannen."}), 401
+        if not check_authenticated():
+            return jsonify({"status": "unauthorized", "message": "Bitte QR-Code scannen."}), 401
         return f(*args, **kwargs)
     return decorated_function
 
-# ASYNCHRONES SCHALTEN (Kein Blockieren der HTTP-Requests)
+# ASYNCHRONER SCHALTBEFEHL (0ms Wartezeit für UI)
 def async_cloud_control(turn_on=True):
     def _worker():
         turn_str = "on" if turn_on else "off"
@@ -99,7 +100,7 @@ def async_cloud_control(turn_on=True):
             pass
     threading.Thread(target=_worker, daemon=True).start()
 
-# AUTOMATISCHE LAST-ANALYSE
+# AUTOMATISCHE LASTPROFIL-KLASSIFIZIERUNG
 def classify_power_profile(avg_w, peak_w):
     if avg_w < 3.0 and peak_w < 6.0:
         return "lamp"
@@ -114,7 +115,7 @@ def classify_power_profile(avg_w, peak_w):
     else:
         return "appliance"
 
-# SERVER-SEITIGER HINTERGRUND-MESSWORKER (Autarke Messung unabhängig vom Handy-Display)
+# AUTARKER SERVER-MESSWORKER (Läuft unabhängig von Standby / Screensaver)
 def background_sensor_poller():
     last_poll = time.time()
     while True:
@@ -155,12 +156,11 @@ def background_sensor_poller():
                 u["current_ampere"] = amp
                 u["current_voltage"] = volt
 
-                # Autarke Zeit- und Energieintegration
                 if dt > 0:
                     u["total_seconds"] += dt
                     u["total_kwh"] += (watt * dt) / 3600000.0
 
-                # 30-Sekunden-Lernphase sammeln
+                # 30s-Lernphase sammeln
                 if u["total_seconds"] < 30 and not u["manually_selected"]:
                     u["analysis_samples"].append(watt)
                 elif u["total_seconds"] >= 30 and not u["analysis_completed"] and not u["manually_selected"]:
@@ -176,7 +176,6 @@ def background_sensor_poller():
                     if watt > 5.0:
                         u["had_charging_phase"] = True
                     
-                    # Wenn Akku voll (Standbylast < 1.8W nach aktiver Phase)
                     if u["had_charging_phase"] and 0.4 <= watt < 1.8 and (u["total_kwh"] * 1000.0) > 3.0:
                         u["battery_full_triggered"] = True
                         u["active"] = False
@@ -262,8 +261,8 @@ HTML_ACCESS_DENIED = """
     <div class="box">
         <div class="icon">🔒🚫</div>
         <h2>Sicherheits-Sperre</h2>
-        <p>Ein direkter Web-Zugriff ist aus Sicherheitsgründen gesperrt.</p>
-        <p style="margin-top: 12px; color: #e2e8f0; font-weight: 600;">Bitte scanne den offiziellen QR-Code direkt an der Ladestation vor Ort.</p>
+        <p>Ein direkter Web-Aufruf über das Internet ist nicht gestattet.</p>
+        <p style="margin-top: 12px; color: #e2e8f0; font-weight: 600;">Bitte scanne den QR-Code auf dem Laptop-Bildschirm oder an der Ladestation.</p>
     </div>
 </body>
 </html>
@@ -333,7 +332,6 @@ HTML_PAGE = """
         .ai-detected { font-size: 14px; font-weight: 700; color: var(--text-main); }
         .ai-mode { font-size: 11px; color: var(--text-muted); margin-top: 1px; }
 
-        /* AKKU LADEBALKEN & PROGNOSE */
         .battery-card {
             display: none;
             background: #f0fdf4;
@@ -493,7 +491,7 @@ HTML_PAGE = """
             <div style="font-size: 40px; margin-bottom: 6px;">👋🔔</div>
             <h3 style="color: var(--accent-amber); margin-bottom: 6px;">Freigabe-Anfrage</h3>
             <p style="font-size: 13px; color: var(--text-main); margin-bottom: 14px;">
-                Ein anderer Nutzer hat den QR-Code vor Ort gescannt und möchte laden. Möchtest du die Steckdose jetzt überlassen?
+                Ein anderer Nutzer hat den QR-Code gescannt und möchte laden. Möchtest du die Steckdose jetzt überlassen?
             </p>
             <button class="btn-start" style="background: var(--accent-green); margin-bottom: 8px;" onclick="acceptTransfer()">✅ Ja, beenden & freigeben</button>
             <button class="btn-stop" onclick="rejectTransfer()">Nein, ich nutze weiter</button>
@@ -635,7 +633,7 @@ HTML_PAGE = """
             </div>
 
             <div style="margin-top: 20px; font-size: 12px; color: var(--text-muted);">
-                ℹ️ Um die Steckdose erneut zu nutzen, scanne bitte den QR-Code an der Station vor Ort neu.
+                ℹ️ Um die Steckdose erneut zu nutzen, scanne bitte den QR-Code an der Station neu.
             </div>
         </div>
     </div>
@@ -798,7 +796,6 @@ HTML_PAGE = """
                     document.getElementById('transferModal').style.display = 'flex';
                 }
 
-                // Profil & Analyse-Status
                 if (data.current_profile) {
                     applyProfile(data.current_profile_key, data.current_profile);
                 }
@@ -813,7 +810,6 @@ HTML_PAGE = """
                     document.getElementById('aiStatusTitle').innerText = "Manuell gewählt";
                 }
 
-                // Server-synchronisierter Timer
                 updateTimerUI(Math.floor(data.elapsed_seconds));
 
                 let currentW = data.watt;
@@ -830,7 +826,7 @@ HTML_PAGE = """
                 document.getElementById('cost').innerText = data.cost.toFixed(5);
                 document.getElementById('microCost').innerText = (data.cost * 100.0).toFixed(3);
 
-                // AKKU-LADEZUSTAND (%) & RESTZEIT-PROGNOSE
+                // AKKU-LADEZUSTAND & RESTZEIT
                 if (data.current_profile && data.current_profile.is_battery) {
                     let cap = data.current_profile.capacity_wh || 50.0;
                     let loadedWh = data.wh;
@@ -900,9 +896,18 @@ def get_user_data():
         }
     return user_sessions[uid], uid
 
+# --- AUTH-ROUTEN ---
+
+# Öffentliche Root-URL: Prüft Scan-Status
 @app.route('/')
 def home():
-    if not session.get("authenticated_on_site") or session.get("station_token") != STATION_PHYSICAL_TOKEN:
+    token_param = request.args.get("token")
+    if token_param == STATION_PHYSICAL_TOKEN:
+        session["authenticated_on_site"] = True
+        session["station_token"] = STATION_PHYSICAL_TOKEN
+        session["user_id"] = str(uuid.uuid4())
+
+    if not check_authenticated():
         return render_template_string(HTML_ACCESS_DENIED), 403
     
     if "user_id" in session:
@@ -913,6 +918,7 @@ def home():
     get_user_data()
     return render_template_string(HTML_PAGE)
 
+# QR-Code Einstiegspunkt: Sofortige Authentifizierung & Anzeige
 @app.route('/scan/<token>')
 def scan_qr_entry(token):
     if token != STATION_PHYSICAL_TOKEN:
@@ -921,7 +927,11 @@ def scan_qr_entry(token):
     session["authenticated_on_site"] = True
     session["station_token"] = STATION_PHYSICAL_TOKEN
     session["user_id"] = str(uuid.uuid4())
-    return redirect('/')
+    
+    get_user_data()
+    return render_template_string(HTML_PAGE)
+
+# --- GESCHÜTZTE API-ENDPUNKTE ---
 
 @app.route('/start', methods=['POST', 'GET'])
 @require_physical_auth
