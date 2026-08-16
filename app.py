@@ -121,15 +121,13 @@ def async_cloud_control(turn_on=True):
     threading.Thread(target=_worker, daemon=True).start()
 
 def ai_classify_samples(samples):
-    if not samples: return "phone" # Priorität 1: Wenn unsicher, starte als Smartphone
+    if not samples: return "phone" 
     peak_w = max(samples)
     
-    # RADIKALE KI-VEREINFACHUNG: Betrachtet die höchste Leistungsspitze der ersten 30s
     if peak_w > 250.0: return "ebike_fast"
     elif peak_w > 90.0: return "ebike_std"
     elif peak_w > 35.0: return "laptop"
     elif peak_w >= 0.1: return "phone"
-    
     return "lamp"
 
 def estimate_initial_soc(profile_key, samples):
@@ -140,7 +138,7 @@ def estimate_initial_soc(profile_key, samples):
         if avg_w >= 20.0: return 15.0
         elif avg_w >= 12.0: return 40.0
         elif avg_w >= 8.0: return 60.0
-        elif avg_w >= 4.0: return 80.0   # 80% Erkennung perfektioniert
+        elif avg_w >= 4.0: return 80.0
         elif avg_w >= 1.5: return 92.0
         else: return 98.0
     elif profile_key == "laptop":
@@ -213,7 +211,6 @@ def background_meter_worker():
                         u["estimated_soc_0"] = estimate_initial_soc(u["device_key"], u["analysis_samples"])
                         u["analysis_completed"] = True
 
-                    # 60s Aussteck-Sicherheit
                     if watt > 0.5:
                         u["had_power_draw"], u["zero_power_counter"] = True, 0.0
                     if u.get("had_power_draw") and watt <= 0.15:
@@ -330,7 +327,7 @@ HTML_PAGE = """
     <meta charset="utf-8">
     <title>Smart Power Hub • AI Powered</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <!-- Chart.js für das Live-Diagramm importieren -->
+    <!-- Chart.js importieren -->
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         :root {
@@ -342,7 +339,7 @@ HTML_PAGE = """
         * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; padding: 0; }
         body { background-color: var(--bg-color); color: var(--text-main); display: flex; justify-content: center; padding: 18px 12px; min-height: 100vh; }
         .container { width: 100%; max-width: 420px; margin: auto; }
-        .card { background: var(--card-bg); border-radius: 24px; padding: 22px 18px; box-shadow: var(--shadow-md); border: 1px solid var(--border-color); text-align: center; margin-bottom: 12px;}
+        .card { background: var(--card-bg); border-radius: 24px; padding: 22px 18px; box-shadow: var(--shadow-md); border: 1px solid var(--border-color); text-align: center; }
         .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
         .title { font-size: 18px; font-weight: 700; color: var(--text-main); letter-spacing: -0.3px; }
         .rate-badge { background: #f1f5f9; color: var(--text-muted); font-size: 12px; padding: 4px 10px; border-radius: 20px; font-weight: 600; }
@@ -377,7 +374,10 @@ HTML_PAGE = """
         .stat-label { font-size: 11px; font-weight: 600; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.4px; }
         .stat-val { font-size: 18px; font-weight: 700; color: var(--text-main); margin-top: 3px; font-family: monospace; white-space: nowrap; }
         .stat-sub { font-size: 11px; color: var(--text-muted); margin-top: 2px; font-family: monospace; }
+        .stat-watt .stat-val { color: var(--accent-primary); }
         .stat-cost .stat-val { color: var(--accent-green); }
+        .stat-volt .stat-val { color: var(--accent-amber); }
+        .stat-amp .stat-val { color: var(--accent-cyan); }
 
         .btn-group { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
         button { width: 100%; padding: 13px; font-size: 15px; font-weight: 600; border: none; border-radius: 14px; cursor: pointer; transition: transform 0.1s ease; }
@@ -462,6 +462,31 @@ HTML_PAGE = """
     </div>
 
     <div class="container">
+        <!-- BESETZT-KARTE -->
+        <div class="card busy-card" id="busyCard">
+            <div style="font-size: 48px; margin-bottom: 10px;">⏳🔒</div>
+            <div class="title" style="margin-bottom: 6px;">Steckdose aktuell belegt</div>
+            <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 16px;">Ein anderer Nutzer lädt gerade aktiv an dieser Station.</p>
+            <div style="background: #f1f5f9; padding: 12px; border-radius: 14px; margin-bottom: 16px; text-align: left; font-size: 13px;">
+                Aktuelle Leistung: <b id="busyWatt">0.000 W</b>
+            </div>
+            <button class="btn-start" id="btnRequestSlot" style="background: var(--accent-primary);" onclick="requestSlot()">🔔 Nutzer anfragen (Bescheid geben)</button>
+            <div id="requestSentText" style="display:none; color: var(--accent-green); font-size: 12px; font-weight: 600; margin-top: 10px;">✅ Anfrage gesendet! Der aktive Nutzer wurde benachrichtigt.</div>
+        </div>
+
+        <!-- WARTE-KARTE FÜR PAUSIERTEN NUTZER 1 -->
+        <div class="card pause-wait-card" id="pauseWaitCard">
+            <div style="font-size: 48px; margin-bottom: 10px;">⏸️⏳</div>
+            <div class="title" style="margin-bottom: 6px;">Sitzung pausiert</div>
+            <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 16px;">Deine bisherige Messung ist gesichert. Die Steckdose wird derzeit von einem anderen Nutzer verwendet.</p>
+            <div style="background: #f1f5f9; padding: 12px; border-radius: 14px; margin-bottom: 16px; text-align: left; font-size: 13px;">
+                Bisheriger Verbrauch: <b id="pauseWh">0.0000 Wh</b><br>
+                Bisherige Kosten: <b id="pauseCost">0.00000 €</b>
+            </div>
+            <p style="font-size: 12px; color: var(--accent-primary); font-weight: 600; margin-bottom: 12px;">Sobald die Station wieder frei ist, wirst du automatisch hierher zurückgeleitet und kannst fortsetzen!</p>
+            <button class="btn-finish" onclick="finalizeTermination()">🛑 Jetzt endgültig beenden & abrechnen</button>
+        </div>
+
         <!-- HAUPTKARTE -->
         <div class="card" id="mainCard">
             <div class="header">
@@ -503,47 +528,56 @@ HTML_PAGE = """
                 </div>
             </div>
 
-            <!-- NEUER LIVE-CHART BEREICH FÜR WATT -->
-            <div class="card" style="padding: 15px; margin-bottom: 10px; background: #f8fafc; border: 1px solid var(--border-color); box-shadow: none;">
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 8px;">
-                    <div style="font-size: 11px; font-weight: 600; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.5px;">Wirkleistung (P)</div>
-                    <div style="font-size: 18px; font-weight: 700; color: var(--accent-primary); font-family: monospace;"><span id="watt">0.000</span> W</div>
-                </div>
-                <!-- Canvas für Chart.js -->
-                <canvas id="powerChart" height="70"></canvas>
-                <div style="margin-top: 10px; background: #ffffff; border-radius: 10px; padding: 10px; font-size: 11px; color: var(--text-muted); text-align: left; line-height: 1.4; border: 1px solid #e2e8f0;">
-                    <b>ℹ️ Warum schwankt der Wert so stark?</b><br>
-                    Moderne Ladekabel und Netzteile (USB-PD) kommunizieren permanent mit dem Akku. Um Überhitzung zu vermeiden, pulsiert und taktet das Schaltnetzteil den Strom sekündlich. Der Shelly misst diese realen Mikroschwankungen live mit.
-                </div>
-            </div>
-
-            <!-- NETZDATEN -->
+            <!-- NETZDATEN GRID (ORIGINAL WIEDERHERGESTELLT) -->
             <div class="grid-2">
                 <div class="stat-card stat-volt">
                     <div class="stat-label">Spannung (U)</div>
                     <div class="stat-val"><span id="volt">230.0</span> V</div>
+                    <div class="stat-sub">Wechselspannung</div>
                 </div>
                 <div class="stat-card stat-amp">
                     <div class="stat-label">Strom (I)</div>
                     <div class="stat-val"><span id="amp">0.000</span> A</div>
+                    <div class="stat-sub"><span id="milliAmp">0</span> mA</div>
                 </div>
             </div>
 
-            <!-- ENERGIE & LAUFZEIT -->
+            <!-- LEISTUNG & LAUFZEIT (ORIGINAL WIEDERHERGESTELLT + SPARKLINE) -->
             <div class="grid-2">
-                <div class="stat-card">
-                    <div class="stat-label">Verbrauch</div>
-                    <div class="stat-val" style="color:var(--accent-primary);"><span id="wh">0.000</span> Wh</div>
+                <div class="stat-card stat-watt" style="display:flex; flex-direction:column;">
+                    <div>
+                        <div class="stat-label">Wirkleistung (P)</div>
+                        <div class="stat-val"><span id="watt">0.000</span> W</div>
+                        <div class="stat-sub" id="wattSub" style="margin-bottom: 6px;">Kein Strom</div>
+                    </div>
+                    
+                    <!-- NEUES LIVE-DIAGRAMM (SPARKLINE) INNERHALB DER WATT-KACHEL -->
+                    <div style="position: relative; height: 35px; width: 100%;">
+                        <canvas id="powerChart"></canvas>
+                    </div>
+                    <div style="font-size: 8.5px; color: var(--text-muted); margin-top: 6px; line-height: 1.3;">
+                        <b>ℹ️ Info:</b> Schwankungen sind durch USB-PD Ladetaktsignal völlig normal.
+                    </div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-label">Laufzeit</div>
-                    <div class="stat-val" id="timer" style="color: var(--text-main);">00:00:00</div>
+                    <div class="stat-val" id="timer">00:00:00</div>
+                    <div class="stat-sub">Autarke Server-Messung</div>
                 </div>
             </div>
-            
-            <div class="stat-card stat-cost" style="text-align: center; margin-bottom: 12px; background: #f0fdf4; border-color: #bbf7d0;">
-                <div class="stat-label" style="color: #166534;">Aktuelle Kosten</div>
-                <div class="stat-val" style="font-size: 24px;"><span id="cost">0.00000</span> €</div>
+
+            <!-- ENERGIE & KOSTEN (ORIGINAL WIEDERHERGESTELLT) -->
+            <div class="grid-2">
+                <div class="stat-card">
+                    <div class="stat-label">Verbrauch</div>
+                    <div class="stat-val" style="color:var(--accent-primary);"><span id="wh">0.0000</span> Wh</div>
+                    <div class="stat-sub"><span id="mwh">0.0</span> mWh</div>
+                </div>
+                <div class="stat-card stat-cost">
+                    <div class="stat-label">Kosten (€)</div>
+                    <div class="stat-val"><span id="cost">0.00000</span> €</div>
+                    <div class="stat-sub"><span id="microCost">0.00</span> Cent</div>
+                </div>
             </div>
 
             <div class="btn-group">
@@ -591,31 +625,6 @@ HTML_PAGE = """
                 </div>
             </div>
         </div>
-        
-        <!-- BESETZT-KARTE -->
-        <div class="card busy-card" id="busyCard">
-            <div style="font-size: 48px; margin-bottom: 10px;">⏳🔒</div>
-            <div class="title" style="margin-bottom: 6px;">Steckdose aktuell belegt</div>
-            <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 16px;">Ein anderer Nutzer lädt gerade aktiv an dieser Station.</p>
-            <div style="background: #f1f5f9; padding: 12px; border-radius: 14px; margin-bottom: 16px; text-align: left; font-size: 13px;">
-                Aktuelle Leistung: <b id="busyWatt">0.000 W</b>
-            </div>
-            <button class="btn-start" id="btnRequestSlot" style="background: var(--accent-primary);" onclick="requestSlot()">🔔 Nutzer anfragen (Bescheid geben)</button>
-            <div id="requestSentText" style="display:none; color: var(--accent-green); font-size: 12px; font-weight: 600; margin-top: 10px;">✅ Anfrage gesendet! Der aktive Nutzer wurde benachrichtigt.</div>
-        </div>
-
-        <!-- WARTE-KARTE FÜR PAUSIERTEN NUTZER 1 -->
-        <div class="card pause-wait-card" id="pauseWaitCard">
-            <div style="font-size: 48px; margin-bottom: 10px;">⏸️⏳</div>
-            <div class="title" style="margin-bottom: 6px;">Sitzung pausiert</div>
-            <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 16px;">Deine bisherige Messung ist gesichert. Die Steckdose wird derzeit von einem anderen Nutzer verwendet.</p>
-            <div style="background: #f1f5f9; padding: 12px; border-radius: 14px; margin-bottom: 16px; text-align: left; font-size: 13px;">
-                Bisheriger Verbrauch: <b id="pauseWh">0.0000 Wh</b><br>
-                Bisherige Kosten: <b id="pauseCost">0.00000 €</b>
-            </div>
-            <p style="font-size: 12px; color: var(--accent-primary); font-weight: 600; margin-bottom: 12px;">Sobald die Station wieder frei ist, wirst du automatisch hierher zurückgeleitet und kannst fortsetzen!</p>
-            <button class="btn-finish" onclick="finalizeTermination()">🛑 Jetzt endgültig beenden & abrechnen</button>
-        </div>
     </div>
 
     <script>
@@ -633,10 +642,10 @@ HTML_PAGE = """
             localStorage.setItem('hub_user_id', userId);
         }
 
-        // --- CHART.JS LOGIK ---
+        // --- CHART.JS (DIREKT IN DER WATT-KACHEL) ---
         let powerChart;
-        let chartData = Array(20).fill(0); // Füllt den Graphen anfangs mit Nullen
-        let chartLabels = Array(20).fill('');
+        let chartData = Array(15).fill(0); 
+        let chartLabels = Array(15).fill('');
 
         function initChart() {
             const ctx = document.getElementById('powerChart').getContext('2d');
@@ -645,13 +654,12 @@ HTML_PAGE = """
                 data: {
                     labels: chartLabels,
                     datasets: [{
-                        label: 'Watt (W)',
                         data: chartData,
                         borderColor: '#2563eb',
                         backgroundColor: 'rgba(37, 99, 235, 0.15)',
-                        borderWidth: 2,
+                        borderWidth: 1.5,
                         fill: true,
-                        tension: 0.4,
+                        tension: 0.3,
                         pointRadius: 0
                     }]
                 },
@@ -661,7 +669,7 @@ HTML_PAGE = """
                     animation: { duration: 0 }, 
                     scales: {
                         x: { display: false },
-                        y: { beginAtZero: true, suggestedMax: 20, display: false } // Y-Achse verstecken für sauberen Look
+                        y: { display: false, beginAtZero: true } 
                     },
                     plugins: { legend: { display: false }, tooltip: { enabled: false } },
                     layout: { padding: 0 }
@@ -681,6 +689,7 @@ HTML_PAGE = """
         let syncInterval = setInterval(fetchSyncData, 1000);
         sendAction('/init_detection');
 
+        // --- SCHLIESSEN-LOGIK (SOFORTIGES BEENDEN) ---
         function closeAppEarly() {
             clearInterval(syncInterval);
             try { window.open('','_self').close(); } catch (e) {}
@@ -896,11 +905,14 @@ HTML_PAGE = """
 
                 document.getElementById('volt').innerText = data.voltage.toFixed(1);
                 document.getElementById('amp').innerText = data.current_ampere.toFixed(3);
+                document.getElementById('milliAmp').innerText = (data.current_ampere * 1000.0).toFixed(0);
                 document.getElementById('watt').innerText = data.watt.toFixed(3);
                 document.getElementById('wh').innerText = data.wh.toFixed(4);
+                document.getElementById('mwh').innerText = (data.wh * 1000.0).toFixed(1);
                 document.getElementById('cost').innerText = data.cost.toFixed(5);
-                
-                // Chart.js aktualisieren
+                document.getElementById('microCost').innerText = (data.cost * 100.0).toFixed(3);
+
+                // Update Chart
                 updateChart(data.watt);
 
                 if (data.active && data.elapsed_seconds < data.analysis_threshold && !data.manually_selected) {
@@ -927,16 +939,23 @@ HTML_PAGE = """
 
                 let badge = document.getElementById('statusBadge');
                 let statusText = document.getElementById('statusText');
+                let startBtn = document.getElementById('mainStartBtn');
 
                 if (data.unplugged_detected) {
                     badge.className = "status-pill status-unplug";
                     statusText.innerText = "🔌 Kabel ausgesteckt";
+                    document.getElementById('wattSub').innerText = "Kein Stromfluss gemessen";
+                    startBtn.innerText = "▶️ Kabel wieder drin? Fortsetzen";
                 } else if (data.active) {
                     badge.className = "status-pill status-on";
                     statusText.innerText = "Aktiv / Strom fließt";
+                    document.getElementById('wattSub').innerText = data.watt > 0.1 ? "Fließt stabil" : "Bereit / Standby";
+                    startBtn.innerText = "▶️ Läuft bereits";
                 } else {
                     badge.className = "status-pill status-off";
                     statusText.innerText = "Bereit für Gerät";
+                    document.getElementById('wattSub').innerText = "Stecke ein Kabel ein...";
+                    startBtn.innerText = "▶️ Start / Fortsetzen";
                 }
 
                 if (data.battery_full_triggered) {
@@ -1026,7 +1045,7 @@ def save_device():
     if key in DEVICE_PROFILES:
         u.update({"device_key": key, "manually_selected": True, "analysis_completed": True})
         if u.get("analysis_samples"):
-            save_ai_models(load_ai_models()) # Dummy learn to file
+            save_ai_models(load_ai_models()) 
             u["estimated_soc_0"] = estimate_initial_soc(key, u["analysis_samples"])
     return jsonify({"status": "saved", "profile": DEVICE_PROFILES.get(u["device_key"])})
 
