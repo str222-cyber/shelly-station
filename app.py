@@ -94,8 +94,6 @@ def add_security_headers(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, private, max-age=0"
     response.headers["Pragma"] = "no-cache"
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
     return response
 
 def check_authenticated():
@@ -176,95 +174,93 @@ def ai_learn_from_feedback(correct_key, samples):
 def background_meter_worker():
     last_loop = time.time()
     while True:
-        try:
-            now = time.time()
-            dt = now - last_loop
-            last_loop = now
-            # Schutz vor absurden Zeitsprüngen, falls Server laggt
-            if dt < 0 or dt > 5:
-                dt = 1.0
+        now = time.time()
+        dt = now - last_loop
+        last_loop = now
+        if dt < 0 or dt > 5:
+            dt = 1.0
 
+        try:
             active_uid = global_state.get("active_user_id")
-            if active_uid and user_sessions.get(active_uid, {}).get("active", False):
+            if active_uid and active_uid in user_sessions:
                 u = user_sessions[active_uid]
                 
-                # Werte aus der Cloud laden
-                payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID}
-                res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=2.5).json()
-                
-                watt = 0.0
-                amp = 0.0
-                volt = 230.0
+                # NUR zählen, wenn die Sitzung vom Nutzer aktiv ist
+                if u.get("active", False):
+                    # Zeit sofort und unaufhaltsam erhöhen
+                    u["total_seconds"] += dt
+                    
+                    watt = u.get("current_watt", 0.0)
+                    amp = u.get("current_ampere", 0.0)
+                    volt = u.get("current_voltage", 230.0)
 
-                if res.get("isok"):
-                    status = res.get("data", {}).get("device_status", {})
-                    if "switch:0" in status:
-                        sw = status["switch:0"]
-                        watt = float(sw.get("apower", 0.0))
-                        amp = float(sw.get("current", 0.0))
-                        volt = float(sw.get("voltage", 230.0))
-                    elif "meters" in status and len(status["meters"]) > 0:
-                        m = status["meters"][0]
-                        watt = float(m.get("power", 0.0))
-                        amp = float(m.get("current", 0.0)) if "current" in m else (watt / 230.0 if watt > 0 else 0.0)
-                        volt = float(m.get("voltage", 230.0)) if "voltage" in m else 230.0
+                    # Cloud abfragen
+                    try:
+                        payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID}
+                        res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=2.0).json()
+                        if res.get("isok"):
+                            status = res.get("data", {}).get("device_status", {})
+                            if "switch:0" in status:
+                                watt = float(status["switch:0"].get("apower", 0.0))
+                                amp = float(status["switch:0"].get("current", 0.0))
+                                volt = float(status["switch:0"].get("voltage", 230.0))
+                            elif "meters" in status and len(status["meters"]) > 0:
+                                watt = float(status["meters"][0].get("power", 0.0))
+                                amp = float(status["meters"][0].get("current", 0.0)) if "current" in status["meters"][0] else (watt / 230.0 if watt > 0 else 0.0)
+                                volt = float(status["meters"][0].get("voltage", 230.0)) if "voltage" in status["meters"][0] else 230.0
+                    except Exception:
+                        pass # Bei API-Fehlern bleiben die letzten Werte bestehen!
 
-                global_state["last_watt"] = watt
-                global_state["last_amp"] = amp
-                global_state["last_volt"] = volt
+                    u["current_watt"] = watt
+                    u["current_ampere"] = amp
+                    u["current_voltage"] = volt
+                    global_state["last_watt"] = watt
+                    global_state["last_amp"] = amp
+                    global_state["last_volt"] = volt
 
-                u["current_watt"] = watt
-                u["current_ampere"] = amp
-                u["current_voltage"] = volt
+                    # Laufende Energie (Wh & Kosten) sicher aufaddieren
+                    u["total_kwh"] += (watt * dt) / 3600000.0
 
-                # EXAKTE ZEIT- UND ENERGIE-INTEGRATION (Läuft gnadenlos durch!)
-                u["accumulated_seconds"] += dt
-                u["accumulated_kwh"] += (watt * dt) / 3600000.0
+                    # 1. AI-ANALYSE IN DEN ERSTEN 30 SEKUNDEN (Nur Daten sammeln, Zähler laufen weiter!)
+                    if u["total_seconds"] < 30.0 and not u["manually_selected"]:
+                        if watt > 0.5:
+                            u["analysis_samples"].append(watt)
+                    elif u["total_seconds"] >= 30.0 and not u["analysis_completed"] and not u["manually_selected"]:
+                        u["device_key"] = ai_classify_samples(u["analysis_samples"])
+                        u["analysis_completed"] = True
 
-                # 1. AI-ANALYSE IN DEN ERSTEN 30 SEKUNDEN
-                if u["accumulated_seconds"] < 30.0 and not u["manually_selected"]:
-                    if watt > 0.5:
-                        u["analysis_samples"].append(watt)
-                elif u["accumulated_seconds"] >= 30.0 and not u["analysis_completed"] and not u["manually_selected"]:
-                    u["device_key"] = ai_classify_samples(u["analysis_samples"])
-                    u["analysis_completed"] = True
-
-                # 2. STABILE UNPLUG-ERKENNUNG (Kabel gezogen)
-                if watt > 1.0:
-                    u["had_power_draw"] = True
-                    u["zero_power_counter"] = 0  # Reset
-                
-                # Wenn Gerät an war, aber jetzt für >15 Sekunden auf 0W fällt
-                if u["had_power_draw"] and watt < 0.3:
-                    u["zero_power_counter"] += dt
-                    if u["zero_power_counter"] >= 15.0:
-                        u["active"] = False
-                        u["unplugged_detected"] = True
-                        u["had_power_draw"] = False
-                        async_cloud_control(turn_on=False)
-                else:
-                    u["zero_power_counter"] = 0
-
-                # 3. AKKU 100% ERKENNUNG (Sättigung)
-                prof = DEVICE_PROFILES.get(u["device_key"], {})
-                if prof.get("is_battery", False) and u["accumulated_seconds"] > 60:
-                    if u["had_power_draw"] and 0.2 <= watt < 1.8 and (u["accumulated_kwh"] * 1000.0) > 2.0:
-                        u["battery_full_counter"] += dt
-                        if u["battery_full_counter"] >= 30.0:
-                            u["battery_full_triggered"] = True
+                    # 2. STABILE UNPLUG-ERKENNUNG (Kabel gezogen) - Jetzt mit 15-Sekunden Puffer
+                    if watt > 1.0:
+                        u["had_power_draw"] = True
+                        u["zero_power_counter"] = 0.0
+                    
+                    if u["had_power_draw"] and watt < 0.3:
+                        u["zero_power_counter"] += dt
+                        if u["zero_power_counter"] >= 15.0:
                             u["active"] = False
+                            u["unplugged_detected"] = True
+                            u["had_power_draw"] = False
                             async_cloud_control(turn_on=False)
                     else:
-                        u["battery_full_counter"] = 0
-            else:
-                global_state["last_watt"] = 0.0
-                global_state["last_amp"] = 0.0
+                        u["zero_power_counter"] = 0.0
 
+                    # 3. AKKU 100% ERKENNUNG (Sättigung) - Auch hier 30s Puffer
+                    prof = DEVICE_PROFILES.get(u["device_key"], {})
+                    if prof.get("is_battery", False) and u["total_seconds"] > 60.0:
+                        if u["had_power_draw"] and 0.2 <= watt < 1.8 and (u["total_kwh"] * 1000.0) > 2.0:
+                            u["battery_full_counter"] += dt
+                            if u["battery_full_counter"] >= 30.0:
+                                u["battery_full_triggered"] = True
+                                u["active"] = False
+                                async_cloud_control(turn_on=False)
+                        else:
+                            u["battery_full_counter"] = 0.0
         except Exception:
             pass
+        
         time.sleep(1.0)
 
-# Thread starten
+# Startet den Server-Zeitgeber
 threading.Thread(target=background_meter_worker, daemon=True).start()
 # ------------------------------------------------------------------------------
 
@@ -553,11 +549,10 @@ HTML_PAGE = """
     </style>
 </head>
 <body>
-    <!-- MODAL: GERÄT WÄHLEN & AI ANLERNEN -->
     <div id="deviceModal" class="modal-overlay">
         <div class="modal-box">
             <h3 style="margin-bottom: 6px;">Gerät manuell festlegen</h3>
-            <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">Wähle dein Gerät. Die AI lernt deine Auswahl für zukünftige Messungen.</p>
+            <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">Wähle dein Gerät aus. Die Anzeige passt sich automatisch an.</p>
             <button class="device-option-btn" onclick="saveDeviceProfile('lamp')">💡 Lampe / Dauerbetrieb</button>
             <button class="device-option-btn" onclick="saveDeviceProfile('phone')">📱 Smartphone / Tablet (Akku ~20 Wh)</button>
             <button class="device-option-btn" onclick="saveDeviceProfile('laptop')">💻 Laptop / Monitor (Akku ~65 Wh)</button>
@@ -568,7 +563,6 @@ HTML_PAGE = """
         </div>
     </div>
 
-    <!-- ANFRAGE MODAL BEI NUTZER 1 -->
     <div id="transferModal" class="modal-overlay">
         <div class="modal-box" style="border: 2px solid var(--accent-amber);">
             <div style="font-size: 40px; margin-bottom: 6px;">👋🔔</div>
@@ -581,7 +575,6 @@ HTML_PAGE = """
         </div>
     </div>
 
-    <!-- 80% AKKU POP-UP (OPTIMALER LADEZUSTAND) -->
     <div id="eightyModal" class="modal-overlay">
         <div class="modal-box" style="border: 2px solid var(--accent-primary);">
             <div style="font-size: 48px; margin-bottom: 8px;">🔋⚡</div>
@@ -594,7 +587,6 @@ HTML_PAGE = """
         </div>
     </div>
 
-    <!-- 100% AKKU VOLL POP-UP -->
     <div id="fullModal" class="modal-overlay">
         <div class="modal-box" style="border: 2px solid var(--accent-green);">
             <div style="font-size: 48px; margin-bottom: 8px;">🔋✨</div>
@@ -605,7 +597,6 @@ HTML_PAGE = """
     </div>
 
     <div class="container">
-        <!-- BESETZT-KARTE -->
         <div class="card busy-card" id="busyCard">
             <div style="font-size: 48px; margin-bottom: 10px;">⏳🔒</div>
             <div class="title" style="margin-bottom: 6px;">Steckdose aktuell belegt</div>
@@ -621,7 +612,6 @@ HTML_PAGE = """
             </div>
         </div>
 
-        <!-- WARTE-KARTE FÜR PAUSIERTEN NUTZER 1 -->
         <div class="card pause-wait-card" id="pauseWaitCard">
             <div style="font-size: 48px; margin-bottom: 10px;">⏸️⏳</div>
             <div class="title" style="margin-bottom: 6px;">Sitzung pausiert</div>
@@ -638,7 +628,6 @@ HTML_PAGE = """
             <button class="btn-finish" onclick="finalizeTermination()">🛑 Jetzt doch endgültig beenden & abrechnen</button>
         </div>
 
-        <!-- HAUPTKARTE -->
         <div class="card" id="mainCard">
             <div class="header">
                 <span class="title">⚡ Smart Power Hub</span>
@@ -653,7 +642,6 @@ HTML_PAGE = """
                 </div>
             </div>
 
-            <!-- GERÄTE ERKENNUNG -->
             <div class="ai-banner">
                 <div class="ai-header">
                     <span class="ai-title" id="aiStatusTitle">AI Erkennung</span>
@@ -668,7 +656,6 @@ HTML_PAGE = """
                 </div>
             </div>
 
-            <!-- AKKU LADESTAND & RESTZEIT -->
             <div class="battery-card" id="batteryCard">
                 <div class="battery-header">
                     <span>🔋 Geschätzter Ladefortschritt</span>
@@ -683,7 +670,6 @@ HTML_PAGE = """
                 </div>
             </div>
 
-            <!-- NETZDATEN -->
             <div class="grid-2">
                 <div class="stat-card stat-volt">
                     <div class="stat-label">Netzspannung (U)</div>
@@ -697,7 +683,6 @@ HTML_PAGE = """
                 </div>
             </div>
 
-            <!-- LEISTUNG & LAUFZEIT -->
             <div class="grid-2">
                 <div class="stat-card stat-watt">
                     <div class="stat-label">Wirkleistung (P)</div>
@@ -711,7 +696,6 @@ HTML_PAGE = """
                 </div>
             </div>
 
-            <!-- ENERGIE & KOSTEN -->
             <div class="grid-2">
                 <div class="stat-card">
                     <div class="stat-label">Verbrauch</div>
@@ -732,7 +716,6 @@ HTML_PAGE = """
             </div>
         </div>
 
-        <!-- QUITTUNG NACH ÜBERGABE -->
         <div class="card receipt-card" id="receiptCard">
             <div class="receipt-header">
                 <div style="font-size: 40px; margin-bottom: 4px;">🧾</div>
@@ -755,7 +738,6 @@ HTML_PAGE = """
                 <div id="emailFeedback" style="display:none; font-size:12px; font-weight:600; margin-top:8px;"></div>
             </div>
 
-            <!-- WAHLMÖGLICHKEIT BEIM NUTZERWECHSEL -->
             <div id="transferChoiceBox" style="margin-top: 16px; display: flex; flex-direction: column; gap: 8px;">
                 <button class="btn-stop" style="background: #e0f2fe; color: #0369a1; border-color: #bae6fd;" onclick="setWaitingMode()">⏳ Sitzung pausieren (Warten bis anderer Nutzer fertig ist)</button>
                 <button class="btn-finish" style="font-size: 14px;" onclick="finalizeTermination()">🛑 Endgültig beenden & Finales PDF</button>
@@ -940,7 +922,6 @@ HTML_PAGE = """
             window.open('/download_invoice', '_blank');
         }
 
-        // 1-SEKUNDEN STATUSABGLEICH (NUR ANZEIGE, SERVER ZÄHLT AUTARK)
         async function fetchSyncData() {
             if (isTerminated) return;
             try {
@@ -1006,7 +987,6 @@ HTML_PAGE = """
                 document.getElementById('cost').innerText = data.cost.toFixed(5);
                 document.getElementById('microCost').innerText = (data.cost * 100.0).toFixed(3);
 
-                // AI Lern-Phase Feedback (Strom und Zeit laufen völlig normal weiter)
                 if (data.active && sec < 30 && !data.manually_selected) {
                     let remain = 30 - sec;
                     document.getElementById('aiStatusTitle').innerText = "AI lernt Last...";
@@ -1017,7 +997,6 @@ HTML_PAGE = """
                     document.getElementById('aiStatusTitle').innerText = "Vom Nutzer gelernt";
                 }
 
-                // Akku-Ladezustand & Pop-Ups
                 if (data.current_profile && data.current_profile.is_battery) {
                     let cap = data.current_profile.capacity_wh || 20.0;
                     let pct = data.battery_pct;
@@ -1035,7 +1014,6 @@ HTML_PAGE = """
                 let statusText = document.getElementById('statusText');
                 let startBtn = document.getElementById('mainStartBtn');
 
-                // STRIKTES KABEL-AUSGESTECKT FEEDBACK
                 if (data.unplugged_detected) {
                     badge.className = "status-pill status-unplug";
                     statusText.innerText = "🔌 Kabel ausgesteckt – Strom gestoppt";
@@ -1082,7 +1060,7 @@ def get_user_data():
             "zero_power_counter": 0.0,
             "battery_full_counter": 0.0,
             "total_kwh": 0.0,
-            "accumulated_seconds": 0.0,
+            "total_seconds": 0.0,
             "current_watt": 0.0,
             "current_ampere": 0.0,
             "current_voltage": 230.0,
@@ -1155,10 +1133,12 @@ def start():
     global_state["active_user_id"] = uid
     global_state["transfer_requested"] = False
     global_state["transfer_requester_id"] = None
+    
     u["active"] = True
     u["unplugged_detected"] = False
     u["zero_power_counter"] = 0.0
     u["paused_by_transfer"] = False
+    
     async_cloud_control(turn_on=True)
     return jsonify({"status": "ok"})
 
@@ -1235,7 +1215,7 @@ def logout():
         global_state["transfer_requested"] = False
         global_state["transfer_requester_id"] = None
 
-    sec = int(u["accumulated_seconds"])
+    sec = int(u["total_seconds"])
     h = str(sec // 3600).zfill(2)
     m = str((sec % 3600) // 60).zfill(2)
     s = str(sec % 60).zfill(2)
@@ -1340,15 +1320,21 @@ def status():
             is_busy = True
             global_w = global_state["last_watt"]
 
-    # Das Dashboard holt sich hier nur passiv die Daten ab.
-    # Alle Berechnungen laufen geschützt im Server-Hintergrund-Thread!
-
+    # Werte aus Backend holen
     dev_key = u.get("device_key", "lamp")
     prof = DEVICE_PROFILES.get(dev_key, DEVICE_PROFILES["lamp"])
     
     wh = u["total_kwh"] * 1000.0
     cap = prof.get("capacity_wh", 20.0)
     
+    # 80% Ladeerkennung (Schätzung durch Ladekurve)
+    curr_w = u.get("current_watt", 0.0)
+    if u["active"] and prof.get("is_battery"):
+        if 0.4 <= curr_w < 3.0 and u["total_seconds"] > 15:
+            u["already_saturated_detected"] = True
+        if curr_w >= 3.0:
+            u["already_saturated_detected"] = False
+
     if prof.get("is_battery") and cap > 0:
         if u.get("already_saturated_detected"):
             battery_pct = 85.0 + min(15.0, (wh / 4.0) * 15.0)
@@ -1358,7 +1344,6 @@ def status():
         battery_pct = 0.0
     
     remaining_str = "--"
-    curr_w = u.get("current_watt", 0.0)
     if prof.get("is_battery") and curr_w > 1.0 and battery_pct < 100.0:
         rem_wh = max(0.0, cap - wh)
         rem_mins = int((rem_wh / curr_w) * 60)
@@ -1381,7 +1366,7 @@ def status():
         "wh": wh,
         "kwh": u["total_kwh"],
         "cost": u["total_kwh"] * STROMPREIS_PER_KWH,
-        "elapsed_seconds": int(u["accumulated_seconds"]),
+        "elapsed_seconds": int(u["total_seconds"]),
         "is_busy_for_other": is_busy,
         "is_paused_by_transfer": u.get("paused_by_transfer", False) and (active_uid != uid),
         "transfer_requested": global_state.get("transfer_requested", False) and (active_uid == uid),
