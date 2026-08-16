@@ -1,6 +1,7 @@
 from flask import Flask, render_template_string, jsonify, session, request, send_file
 import requests
 import time
+import threading
 import uuid
 import smtplib
 import io
@@ -10,7 +11,7 @@ from email.mime.application import MIMEApplication
 from weasyprint import HTML
 
 app = Flask(__name__)
-app.secret_key = "shelly_smart_hub_pdf_email_flow_2026"
+app.secret_key = "shelly_smart_hub_zero_offset_calibrated_2026"
 
 # --- SHELLY CLOUD KONFIGURATION ---
 SHELLY_CLOUD_URL = "https://shelly-274-eu.shelly.cloud"
@@ -19,11 +20,15 @@ DEVICE_ID = "08927249a904"
 
 STROMPREIS_PER_KWH = 0.35  # 0,35 € pro kWh
 
-# --- OPTIONALE SMTP-DATEN FÜR E-MAIL-VERSAND ---
-SMTP_SERVER = "smtp.gmail.com"  # z. B. smtp.gmail.com oder dein E-Mail Provider
+# EIGENVERBRAUCHS- & NOISE-OFFSET (WLAN-Modul, Relais, LED-Ring)
+SHELLY_IDLE_NOISE_THRESHOLD_WATT = 0.75  # Alles darunter ist Leerlauf / Eigenrauschen
+SHELLY_IDLE_NOISE_THRESHOLD_AMP = 0.015  # 15 mA Schwellwert
+
+# OPTIONALE SMTP-DATEN
+SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
-SMTP_USER = "deine-email@gmail.com"      # Hier deine E-Mail eintragen
-SMTP_PASSWORD = "dein-app-passwort"      # Hier dein Passwort / App-Passwort eintragen
+SMTP_USER = ""
+SMTP_PASSWORD = ""
 
 global_state = {
     "active_user_id": None,
@@ -58,7 +63,7 @@ def cloud_control(turn_on=True):
     turn_str = "on" if turn_on else "off"
     payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID, "turn": turn_str, "channel": 0}
     try:
-        requests.post(f"{SHELLY_CLOUD_URL}/device/relay/control", data=payload, timeout=3.5)
+        requests.post(f"{SHELLY_CLOUD_URL}/device/relay/control", data=payload, timeout=2.5)
     except:
         pass
 
@@ -69,38 +74,54 @@ def cloud_control(turn_on=True):
         "params": {"id": 0, "on": turn_on}
     }
     try:
-        requests.post(f"{SHELLY_CLOUD_URL}/device/rpc", json=rpc_payload, timeout=3.5)
+        requests.post(f"{SHELLY_CLOUD_URL}/device/rpc", json=rpc_payload, timeout=2.5)
     except:
         pass
 
-def cloud_get_metrics():
-    payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID}
-    try:
-        res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=3.5).json()
-        if res.get("isok"):
-            status = res.get("data", {}).get("device_status", {})
-            watt = 0.0
-            amp = 0.0
-            volt = 230.0
-            
-            if "switch:0" in status:
-                sw = status["switch:0"]
-                watt = float(sw.get("apower", 0.0))
-                amp = float(sw.get("current", 0.0))
-                volt = float(sw.get("voltage", 230.0))
-            elif "meters" in status and len(status["meters"]) > 0:
-                m = status["meters"][0]
-                watt = float(m.get("power", 0.0))
-                amp = float(m.get("current", 0.0)) if "current" in m else (watt / 230.0 if watt > 0 else 0.0)
-                volt = float(m.get("voltage", 230.0)) if "voltage" in m else 230.0
-            
-            global_state["cached_watt"] = watt
-            global_state["cached_current"] = amp
-            global_state["cached_voltage"] = volt
-            return watt, amp, volt
-    except:
-        pass
-    return global_state["cached_watt"], global_state["cached_current"], global_state["cached_voltage"]
+def background_sensor_poller():
+    while True:
+        try:
+            active_uid = global_state.get("active_user_id")
+            if active_uid and user_sessions.get(active_uid, {}).get("active", False):
+                payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID}
+                res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=2.0).json()
+                if res.get("isok"):
+                    status = res.get("data", {}).get("device_status", {})
+                    raw_watt = 0.0
+                    raw_amp = 0.0
+                    volt = 230.0
+                    
+                    if "switch:0" in status:
+                        sw = status["switch:0"]
+                        raw_watt = float(sw.get("apower", 0.0))
+                        raw_amp = float(sw.get("current", 0.0))
+                        volt = float(sw.get("voltage", 230.0))
+                    elif "meters" in status and len(status["meters"]) > 0:
+                        m = status["meters"][0]
+                        raw_watt = float(m.get("power", 0.0))
+                        raw_amp = float(m.get("current", 0.0)) if "current" in m else (raw_watt / 230.0 if raw_watt > 0 else 0.0)
+                        volt = float(m.get("voltage", 230.0)) if "voltage" in m else 230.0
+                    
+                    # EIGENVERBRAUCHS-KOMPENSATION:
+                    # Liegt der Wert im Leerlauf-Bereich des Plugs selbst, bereinigen wir ihn auf echte 0.0 W
+                    if raw_watt < SHELLY_IDLE_NOISE_THRESHOLD_WATT and raw_amp < SHELLY_IDLE_NOISE_THRESHOLD_AMP:
+                        watt = 0.0
+                        amp = 0.0
+                    else:
+                        watt = raw_watt
+                        amp = raw_amp
+
+                    global_state["cached_watt"] = watt
+                    global_state["cached_current"] = amp
+                    global_state["cached_voltage"] = volt
+            else:
+                global_state["cached_watt"] = 0.0
+                global_state["cached_current"] = 0.0
+        except:
+            pass
+        time.sleep(1.2)
+
+threading.Thread(target=background_sensor_poller, daemon=True).start()
 
 def generate_pdf_invoice(report_data):
     html_invoice = f"""
@@ -194,6 +215,7 @@ HTML_PAGE = """
             padding: 12px 14px;
             margin-bottom: 14px;
             text-align: left;
+            min-height: 68px;
         }
         .ai-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
         .ai-title { font-size: 11px; font-weight: 700; text-transform: uppercase; color: var(--accent-primary); letter-spacing: 0.5px; }
@@ -213,6 +235,7 @@ HTML_PAGE = """
             padding: 5px 12px;
             border-radius: 30px;
             margin-bottom: 14px;
+            height: 28px;
         }
         .status-on { background: #ecfdf5; color: #065f46; }
         .status-off { background: #f1f5f9; color: var(--text-muted); }
@@ -223,19 +246,33 @@ HTML_PAGE = """
         .status-unplug .status-dot { background: var(--accent-amber); }
 
         .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
-        .stat-card { background: #f8fafc; border: 1px solid var(--border-color); border-radius: 16px; padding: 12px; text-align: left; }
+        .stat-card {
+            background: #f8fafc;
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 12px;
+            text-align: left;
+            min-height: 84px;
+        }
         .stat-label { font-size: 11px; font-weight: 600; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.4px; }
-        .stat-val { font-size: 19px; font-weight: 700; color: var(--text-main); margin-top: 3px; }
-        .stat-sub { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+        .stat-val {
+            font-size: 18px;
+            font-weight: 700;
+            color: var(--text-main);
+            margin-top: 3px;
+            font-variant-numeric: tabular-nums;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+            white-space: nowrap;
+        }
+        .stat-sub { font-size: 11px; color: var(--text-muted); margin-top: 2px; font-variant-numeric: tabular-nums; }
 
-        .stat-watt .stat-val { color: var(--accent-primary); font-family: monospace; font-size: 18px; }
-        .stat-cost .stat-val { color: var(--accent-green); font-family: monospace; font-size: 17px; }
-        .stat-volt .stat-val { color: var(--accent-amber); font-family: monospace; }
-        .stat-amp .stat-val { color: var(--accent-cyan); font-family: monospace; }
-        .stat-time .stat-val { font-family: monospace; }
+        .stat-watt .stat-val { color: var(--accent-primary); }
+        .stat-cost .stat-val { color: var(--accent-green); }
+        .stat-volt .stat-val { color: var(--accent-amber); }
+        .stat-amp .stat-val { color: var(--accent-cyan); }
 
         .bar-wrap { margin-top: 6px; width: 100%; height: 5px; background: #e2e8f0; border-radius: 3px; overflow: hidden; }
-        .bar-fill { height: 100%; width: 0%; border-radius: 3px; transition: width 0.4s ease; }
+        .bar-fill { height: 100%; width: 0%; border-radius: 3px; transition: width 0.3s ease; }
         .bar-blue { background: var(--accent-primary); }
         .bar-green { background: var(--accent-green); }
 
@@ -412,12 +449,12 @@ HTML_PAGE = """
             <div class="grid-2">
                 <div class="stat-card stat-volt">
                     <div class="stat-label">Netzspannung (U)</div>
-                    <div class="stat-val"><span id="volt">230.0</span> <span style="font-size:12px; font-weight:500;">V</span></div>
+                    <div class="stat-val"><span id="volt">230.0</span> V</div>
                     <div class="stat-sub">Wechselspannung</div>
                 </div>
                 <div class="stat-card stat-amp">
                     <div class="stat-label">Stromstärke (I)</div>
-                    <div class="stat-val"><span id="amp">0.000</span> <span style="font-size:12px; font-weight:500;">A</span></div>
+                    <div class="stat-val"><span id="amp">0.000</span> A</div>
                     <div class="stat-sub"><span id="milliAmp">0</span> mA</div>
                 </div>
             </div>
@@ -426,10 +463,10 @@ HTML_PAGE = """
             <div class="grid-2">
                 <div class="stat-card stat-watt">
                     <div class="stat-label">Wirkleistung (P)</div>
-                    <div class="stat-val"><span id="watt">0.000</span> <span style="font-size:12px; font-weight:500;">W</span></div>
+                    <div class="stat-val"><span id="watt">0.000</span> W</div>
                     <div class="stat-sub" id="wattSub">Kein Strom</div>
                 </div>
-                <div class="stat-card stat-time">
+                <div class="stat-card">
                     <div class="stat-label">Laufzeit</div>
                     <div class="stat-val" id="timer">00:00:00</div>
                     <div class="stat-sub">Sekundengenau</div>
@@ -440,7 +477,7 @@ HTML_PAGE = """
             <div class="grid-2">
                 <div class="stat-card">
                     <div class="stat-label">Verbrauch</div>
-                    <div class="stat-val" style="color:var(--accent-primary); font-family:monospace; font-size:17px;"><span id="wh">0.0000</span> <span style="font-size:11px;">Wh</span></div>
+                    <div class="stat-val" style="color:var(--accent-primary); font-family:monospace; font-size:17px;"><span id="wh">0.0000</span> Wh</div>
                     <div class="stat-sub"><span id="mwh">0.0</span> mWh</div>
                     <div class="bar-wrap"><div class="bar-fill bar-blue" id="whBar"></div></div>
                 </div>
@@ -483,7 +520,6 @@ HTML_PAGE = """
                 <div id="emailFeedback" style="display:none; font-size:12px; font-weight:600; margin-top:8px;"></div>
             </div>
 
-            <!-- NEUE SITZUNG STARTEN (FALLS WEITERVERWENDUNG GEWÜNSCHT) -->
             <button class="btn-start" style="margin-top:16px; background:var(--text-main);" onclick="window.location.reload()">🔄 Neue Sitzung / Erneut verbinden</button>
         </div>
     </div>
@@ -492,13 +528,17 @@ HTML_PAGE = """
         let isTerminated = false;
         let lastReport = null;
         let alarmInterval = null;
+        let transferModalOpen = false;
         const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 
-        let hadPowerPhase = false;
+        let hadHeavyPowerPhase = false;
         let isBatteryDevice = false;
         let zeroPowerStreak = 0;
         let isUnplugged = false;
         let currentProfileKey = "lamp";
+
+        let localSeconds = 0;
+        let isActive = false;
 
         function playContinuousTone() {
             try {
@@ -532,6 +572,7 @@ HTML_PAGE = """
             if (audioCtx.state === 'suspended') { audioCtx.resume(); }
             isUnplugged = false;
             zeroPowerStreak = 0;
+            isActive = true;
             sendAction('/start');
         }
 
@@ -568,11 +609,13 @@ HTML_PAGE = """
         }
 
         async function acceptTransfer() {
+            transferModalOpen = false;
             document.getElementById('transferModal').style.display = 'none';
             await logout();
         }
 
         async function rejectTransfer() {
+            transferModalOpen = false;
             document.getElementById('transferModal').style.display = 'none';
             await sendAction('/reject_transfer');
         }
@@ -585,6 +628,7 @@ HTML_PAGE = """
 
         async function logout() {
             isTerminated = true;
+            isActive = false;
             try {
                 let report = await sendAction('/logout');
                 lastReport = report;
@@ -629,13 +673,23 @@ HTML_PAGE = """
                 fb.innerText = '✅ Rechnung wurde erfolgreich an deine E-Mail gesendet!';
             } else {
                 fb.style.color = 'var(--accent-amber)';
-                fb.innerText = 'Hinweis: ' + res.message;
+                fb.innerText = res.message;
             }
         }
 
         function downloadInvoicePdf() {
             window.open('/download_invoice', '_blank');
         }
+
+        setInterval(() => {
+            if (isActive && !isTerminated) {
+                localSeconds++;
+                let h = Math.floor(localSeconds / 3600).toString().padStart(2, '0');
+                let m = Math.floor((localSeconds % 3600) / 60).toString().padStart(2, '0');
+                let s = Math.floor(localSeconds % 60).toString().padStart(2, '0');
+                document.getElementById('timer').innerText = `${h}:${m}:${s}`;
+            }
+        }, 1000);
 
         setInterval(async () => {
             if (isTerminated) return;
@@ -662,10 +716,14 @@ HTML_PAGE = """
                     applyProfile(data.current_profile_key, data.current_profile);
                 }
 
-                if (data.transfer_requested) {
+                if (data.transfer_requested && !transferModalOpen) {
+                    transferModalOpen = true;
                     document.getElementById('transferModal').style.display = 'flex';
-                } else {
-                    document.getElementById('transferModal').style.display = 'none';
+                }
+
+                isActive = data.active;
+                if (Math.abs(localSeconds - data.elapsed_seconds) > 2) {
+                    localSeconds = data.elapsed_seconds;
                 }
 
                 let currentW = data.watt;
@@ -681,25 +739,20 @@ HTML_PAGE = """
                 document.getElementById('mwh').innerText = (data.wh * 1000.0).toFixed(1);
                 document.getElementById('cost').innerText = data.cost.toFixed(5);
                 document.getElementById('microCost').innerText = (data.cost * 100.0).toFixed(3);
-                
-                let sec = data.elapsed_seconds;
-                let h = Math.floor(sec / 3600).toString().padStart(2, '0');
-                let m = Math.floor((sec % 3600) / 60).toString().padStart(2, '0');
-                let s = Math.floor(sec % 60).toString().padStart(2, '0');
-                document.getElementById('timer').innerText = `${h}:${m}:${s}`;
 
                 let badge = document.getElementById('statusBadge');
                 let text = document.getElementById('statusText');
                 let startBtn = document.getElementById('mainStartBtn');
                 
                 if (data.active) {
-                    if (currentW > 1.5 || currentA > 0.02) {
-                        hadPowerPhase = true;
+                    if (currentW > 3.0) {
+                        hadHeavyPowerPhase = true;
                     }
 
-                    if (hadPowerPhase && currentW < 0.1 && currentA < 0.01) {
+                    // --- EIGENVERBRAUCHS-BEREINIGTE UNPLUG-ERKENNUNG ---
+                    if (isBatteryDevice && hadHeavyPowerPhase && currentW === 0.0 && currentA === 0.0) {
                         zeroPowerStreak++;
-                        document.getElementById('wattSub').innerText = `Keine Last gemessen (${zeroPowerStreak}/15s)...`;
+                        document.getElementById('wattSub').innerText = `Keine Last (${zeroPowerStreak}/15s)...`;
                         
                         if (zeroPowerStreak >= 15) {
                             isUnplugged = true;
@@ -707,20 +760,21 @@ HTML_PAGE = """
                             await sendAction('/stop');
                             badge.className = "status-pill status-unplug";
                             text.innerText = "🔌 Kabel ausgesteckt – Pausiert";
-                            document.getElementById('wattSub').innerText = "Warte auf Einstecken & Start";
-                            startBtn.innerText = "▶️ Kabel wieder drin? Fortsetzen";
+                            document.getElementById('wattSub').innerText = "Warte auf Start";
+                            startBtn.innerText = "▶️ Fortsetzen";
                             return;
                         }
                     } else {
                         zeroPowerStreak = 0;
-                        document.getElementById('wattSub').innerText = currentW > 0.5 ? "Fließt stabil" : "Bereit / Minimallast";
+                        document.getElementById('wattSub').innerText = currentW > 0.0 ? "Fließt stabil" : "Bereit / Leerlauf";
                     }
 
                     badge.className = "status-pill status-on";
                     text.innerText = "Aktiv / Strom fließt";
                     startBtn.innerText = "▶️ Läuft bereits";
 
-                    if (isBatteryDevice && hadPowerPhase && currentW >= 0.3 && currentW < 2.0 && data.wh > 2.0) {
+                    // 100% VOLLGELADEN BEI AKKUS (Netzteil zieht noch Standby 0.8W - 2.0W)
+                    if (isBatteryDevice && hadHeavyPowerPhase && currentW >= 0.8 && currentW < 2.2 && data.wh > 2.0) {
                         await sendAction('/stop');
                         document.getElementById('fullModal').style.display = 'flex';
                         startAudioAlert();
@@ -731,16 +785,17 @@ HTML_PAGE = """
                     if (isUnplugged) {
                         badge.className = "status-pill status-unplug";
                         text.innerText = "🔌 Kabel ausgesteckt – Pausiert";
-                        startBtn.innerText = "▶️ Kabel wieder drin? Fortsetzen";
+                        startBtn.innerText = "▶️ Fortsetzen";
                     } else {
                         badge.className = "status-pill status-off";
                         text.innerText = "Pausiert / Bereit";
                         startBtn.innerText = "▶️ Start / Fortsetzen";
                     }
                     
-                    if (sec === 0) {
-                        hadPowerPhase = false;
+                    if (data.elapsed_seconds === 0) {
+                        hadHeavyPowerPhase = false;
                         zeroPowerStreak = 0;
+                        localSeconds = 0;
                     }
                 }
 
@@ -788,6 +843,7 @@ def start():
     global_state["active_user_id"] = uid
     global_state["active_since"] = time.time()
     global_state["transfer_requested"] = False
+    global_state["transfer_requester_id"] = None
     u["active"] = True
     u["last_check"] = time.time()
     cloud_control(turn_on=True)
@@ -862,7 +918,7 @@ def download_invoice():
     u, _ = get_user_data()
     report = u.get("last_report") or {
         "invoice_id": "RE-SAMPLE",
-        "device": "💡 Lampe",
+        "device": "💡 Lampe / Beleuchtung",
         "mode": "Dauerbetrieb",
         "time_formatted": "00:15:00",
         "wh": 10.5,
@@ -877,30 +933,34 @@ def send_email_invoice():
     data = request.get_json() or {}
     recipient = data.get("email")
     report = data.get("report") or {}
-    report["device"] = data.get("device", "Elektrogerät")
-    report["mode"] = data.get("mode", "Standard")
+    report["device"] = data.get("device", "💡 Lampe / Beleuchtung")
+    report["mode"] = data.get("mode", "Dauerbetrieb")
 
     if not recipient or "@" not in recipient:
         return jsonify({"status": "error", "message": "Ungültige E-Mail-Adresse"})
 
+    if not SMTP_USER or not SMTP_PASSWORD:
+        return jsonify({
+            "status": "error",
+            "message": "Hinweis: Es sind noch keine SMTP-Zugangsdaten in app.py hinterlegt. Nutze bitte '📥 PDF direkt herunterladen'."
+        })
+
     pdf_buffer = generate_pdf_invoice(report)
 
-    # E-Mail zusammenstellen
     try:
         msg = MIMEMultipart()
         msg["From"] = SMTP_USER
         msg["To"] = recipient
         msg["Subject"] = f"Deine Stromquittung ({report.get('invoice_id')})"
 
-        body_text = f"""Hallo,\n\nvielen Dank für die Nutzung der Smart Power Station.\n\nZusammenfassung deiner Sitzung:\n- Dauer: {report.get('time_formatted')}\n- Verbrauch: {report.get('wh', 0):.2f} Wh ({report.get('kwh', 0):.5f} kWh)\n- Gesamtbetrag: {report.get('cost', 0):.5f} €\n\nIm Anhang findest du deine detaillierte PDF-Rechnung.\n\nViele Grüße\nDein Smart Power Team"""
+        body_text = f"Hallo,\n\nvielen Dank für die Nutzung der Smart Power Station.\n\nZusammenfassung:\n- Dauer: {report.get('time_formatted')}\n- Verbrauch: {report.get('wh', 0):.2f} Wh ({report.get('kwh', 0):.5f} kWh)\n- Gesamtbetrag: {report.get('cost', 0):.5f} €\n\nIm Anhang findest du deine detaillierte PDF-Rechnung."
         msg.attach(MIMEText(body_text, "plain", "utf-8"))
 
         pdf_attachment = MIMEApplication(pdf_buffer.read(), _subtype="pdf")
         pdf_attachment.add_header('Content-Disposition', 'attachment', filename=f"{report.get('invoice_id')}.pdf")
         msg.attach(pdf_attachment)
 
-        # Versand über SMTP
-        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=10)
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=8)
         server.starttls()
         server.login(SMTP_USER, SMTP_PASSWORD)
         server.send_message(msg)
@@ -910,7 +970,7 @@ def send_email_invoice():
     except Exception as e:
         return jsonify({
             "status": "error",
-            "message": "E-Mail-Server nicht konfiguriert. Du kannst das PDF direkt über 'PDF herunterladen' speichern."
+            "message": f"Versand fehlgeschlagen ({str(e)}). Bitte lade das PDF direkt über den Download-Button herunter."
         })
 
 @app.route('/status')
@@ -923,11 +983,14 @@ def status():
     if active_uid and active_uid != uid:
         if user_sessions.get(active_uid, {}).get("active", False):
             is_busy = True
-            global_w = user_sessions[active_uid].get("current_watt", 0.0)
+            global_w = global_state["cached_watt"]
 
     if u["active"]:
         now = time.time()
-        w, a, v = cloud_get_metrics()
+        w = global_state["cached_watt"]
+        a = global_state["cached_current"]
+        v = global_state["cached_voltage"]
+        
         u["current_watt"] = w
         u["current_ampere"] = a
         u["current_voltage"] = v
