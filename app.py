@@ -971,9 +971,18 @@ def get_status():
         vat_amt = charge["total_vat_amount"]
         brutto = charge["total_cost_brutto"]
 
-        is_plug_off = (not charge["relay_on"]) or charge["paused"] or charge["terminated"]
-        live_watt = 0.0 if is_plug_off else round(shelly["watt"], 3)
-        live_amp  = 0.0 if is_plug_off else round(shelly["amp"], 3)
+        # Live Watt & Ampere: Wenn tatsächlich Strom fließt (> 0.2W), immer echte Messung ausgeben!
+        if shelly["watt"] > 0.2 or shelly["amp"] > 0.015:
+            live_watt = round(shelly["watt"], 3)
+            live_amp  = round(shelly["amp"], 3)
+            if not charge["active"] and not charge["paused"] and not charge["terminated"]:
+                charge["active"] = True
+        elif charge["paused"] or charge["terminated"] or (not charge["relay_on"]):
+            live_watt = 0.0
+            live_amp  = 0.0
+        else:
+            live_watt = round(shelly["watt"], 3)
+            live_amp  = round(shelly["amp"], 3)
 
         return jsonify({
             "active": charge["active"],
@@ -1129,17 +1138,33 @@ def unplug_action():
                 return jsonify({"status": "ok", "state": "waiting_for_plug", "reused_device": cur_d})
 
         elif action == "prep_new_device":
-            charge["target_is_new"] = True
+            device_key = data.get("device_key", "phone")
+            prof = DEVICE_PROFILES.get(device_key, DEVICE_PROFILES["phone"])
+            next_num = len(charge["devices"]) + 1
+            new_dev = new_device_entry(next_num, device_key)
+            new_dev["raw_name"] = prof["name"]
+            new_dev["name"] = f"Gerät {next_num}: {prof['name']}"
+            new_dev["icon"] = prof["icon"]
+            new_dev["mode"] = prof["mode"]
+            new_dev["is_battery"] = prof["is_battery"]
+            new_dev["nominal_wh"] = prof["nominal_wh"]
+            new_dev["user_confirmed"] = True
+
+            charge["devices"].append(new_dev)
+            charge["current_device_idx"] = len(charge["devices"]) - 1
+            charge["power_history"] = []
+            charge["target_is_new"] = False
             charge["unplug_modal"] = None
             charge["waiting_for_new_plug"] = True
-            charge["unplug_cooldown_until"] = now + 10.0
+            charge["unplug_cooldown_until"] = now + 15.0
             charge["flow_continuous_seconds"] = 0.0
             charge["had_flowing"] = False
-            charge["active"] = False
-            charge["paused"] = True
+            charge["active"] = True
+            charge["paused"] = False
+            charge["relay_on"] = True
             relay_control(True)
-            logger.info("Unplug: Neues Gerät vorbereitet -> Relais EIN, warte auf Stromfluss!")
-            return jsonify({"status": "ok", "state": "waiting_for_plug"})
+            logger.info(f"Unplug: Neues Gerät #{next_num} ({new_dev['name']}) gewählt -> Relais EIN, bereit!")
+            return jsonify({"status": "ok", "state": "device_selected", "device": new_dev})
 
         elif action == "finish":
             charge["unplug_modal"] = None
@@ -1779,21 +1804,76 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 <div class="mbox" style="text-align:left;border:2px solid var(--blue)">
   <div style="text-align:center;margin-bottom:12px">
     <div style="font-size:38px;margin-bottom:4px">🔄⚡</div>
-    <div style="font-size:17.5px;font-weight:800;color:#1e40af">Gerätewechsel & Fortfahren</div>
-    <p style="font-size:12px;color:var(--muted);margin-top:2px">
-      Wurde ein bereits genutztes Gerät oder ein neues Gerät angeschlossen?
+    <div style="font-size:17.5px;font-weight:800;color:#1e40af">Gerätewechsel</div>
+    <p style="font-size:12.5px;color:var(--muted);margin-top:2px">
+      Welches Gerät möchtest du als Nächstes einstecken?
     </p>
   </div>
 
-  <div class="m-sec-title">🔁 Bisheriges Gerät fortsetzen:</div>
-  <div id="reusableDevicesContainer"></div>
+  <div class="m-sec-title">➕ Neues Gerät auswählen:</div>
+  <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:12px">
+    <div class="dev-option" onclick="handleUnplugResponse('prep_new_device', null, 'phone')">
+      <div class="dev-opt-left">
+        <span class="dev-opt-ico">📱</span>
+        <div>
+          <div class="dev-opt-nm">Smartphone / Tablet / Akku</div>
+          <div class="dev-opt-sub">Akku-Modus (80%/100% Schutz)</div>
+        </div>
+      </div>
+      <span class="dev-opt-tag" style="background:#d1fae5;color:#065f46">Wählen</span>
+    </div>
 
-  <div class="m-sec-title" style="margin-top:14px">➕ Neues Gerät erfassen:</div>
-  <button class="btn bp" style="background:var(--blue);padding:12px;font-size:13.5px;margin-bottom:8px" onclick="handleUnplugResponse('prep_new_device')">
-    ➕ Neues separates Gerät einstecken
-  </button>
-  
-  <button class="btn bs" style="background:#f1f5f9;color:var(--text);padding:11px;font-size:13px" onclick="handleUnplugResponse('finish')">
+    <div class="dev-option" onclick="handleUnplugResponse('prep_new_device', null, 'laptop')">
+      <div class="dev-opt-left">
+        <span class="dev-opt-ico">💻</span>
+        <div>
+          <div class="dev-opt-nm">Laptop / Ultrabook</div>
+          <div class="dev-opt-sub">Akku-Modus (65 Wh)</div>
+        </div>
+      </div>
+      <span class="dev-opt-tag" style="background:#d1fae5;color:#065f46">Wählen</span>
+    </div>
+
+    <div class="dev-option" onclick="handleUnplugResponse('prep_new_device', null, 'ebike')">
+      <div class="dev-opt-left">
+        <span class="dev-opt-ico">🚲</span>
+        <div>
+          <div class="dev-opt-nm">E-Bike / Pedelec (Standard)</div>
+          <div class="dev-opt-sub">Großakku (500 Wh)</div>
+        </div>
+      </div>
+      <span class="dev-opt-tag" style="background:#d1fae5;color:#065f46">Wählen</span>
+    </div>
+
+    <div class="dev-option" onclick="handleUnplugResponse('prep_new_device', null, 'ebike_fast')">
+      <div class="dev-opt-left">
+        <span class="dev-opt-ico">⚡</span>
+        <div>
+          <div class="dev-opt-nm">E-Bike Schnelllader</div>
+          <div class="dev-opt-sub">Schnellladung (750 Wh)</div>
+        </div>
+      </div>
+      <span class="dev-opt-tag" style="background:#d1fae5;color:#065f46">Wählen</span>
+    </div>
+
+    <div class="dev-option" onclick="handleUnplugResponse('prep_new_device', null, 'lamp')">
+      <div class="dev-opt-left">
+        <span class="dev-opt-ico">💡</span>
+        <div>
+          <div class="dev-opt-nm">Lampe / Dauerbetrieb</div>
+          <div class="dev-opt-sub">Dauerhafter Verbrauch</div>
+        </div>
+      </div>
+      <span class="dev-opt-tag" style="background:#f1f5f9;color:var(--text)">Wählen</span>
+    </div>
+  </div>
+
+  <div id="reusableSec" style="display:none">
+    <div class="m-sec-title">🔁 Bisheriges Gerät fortsetzen:</div>
+    <div id="reusableDevicesContainer"></div>
+  </div>
+
+  <button class="btn bs" style="background:#f1f5f9;color:var(--text);padding:11px;font-size:13px;margin-top:8px" onclick="handleUnplugResponse('finish')">
     🧾 Sitzung beenden & Quittung
   </button>
 </div>
@@ -2261,7 +2341,7 @@ function devAct(a){
 }
 
 // ABSTECK- & WECHSEL-ANTWORTEN
-function handleUnplugResponse(action, devIdx){
+function handleUnplugResponse(action, devIdx, devKey){
   lastActionLocalTime = Date.now();
   hideM('modalAskUnplug');
   hideM('modalAskNextDevice');
@@ -2269,11 +2349,15 @@ function handleUnplugResponse(action, devIdx){
   if(action === 'select_existing'){
     payload.device_idx = devIdx;
   }
+  if(devKey){
+    payload.device_key = devKey;
+  }
   post('/unplug_action', payload).then(function(res){
     if(action === 'finish'){
       showReceipt(res);
     } else {
-      poll();
+      setTimeout(poll, 300);
+      setTimeout(poll, 1000);
     }
   });
 }
@@ -2331,9 +2415,17 @@ function handleBatteryAction(action){
 
 function renderReusableDevices(devs){
   var c = document.getElementById('reusableDevicesContainer');
+  var sec = document.getElementById('reusableSec');
   if(!c) return;
   c.innerHTML = '';
+  var validDevs = (devs || []).filter(function(d){ return (d.wh || 0) > 0.01; });
+  if(validDevs.length > 0 && sec){
+    sec.style.display = 'block';
+  } else if(sec){
+    sec.style.display = 'none';
+  }
   (devs || []).forEach(function(d, idx){
+    if((d.wh || 0) <= 0.01) return;
     var div = document.createElement('div');
     div.className = 'reuse-card';
     div.onclick = function(){ handleUnplugResponse('select_existing', idx); };
@@ -2624,9 +2716,8 @@ function poll(){
     }
 
     var srvSec = d.elapsed_seconds || 0;
-    var isPlugOff = (d.paused || d.terminated || !d.relay_on);
-    var curW = isPlugOff ? 0.0 : (d.watt || 0.0);
-    var curA = isPlugOff ? 0.0 : (d.current_ampere || 0.0);
+    var curW = d.watt || 0.0;
+    var curA = d.current_ampere || 0.0;
     var curWh = d.wh || 0.0;
     var flowSec = d.total_flow_seconds || 0.0;
     var idleSec = d.total_idle_seconds || 0.0;
