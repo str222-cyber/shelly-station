@@ -189,7 +189,6 @@ def async_cloud_control(turn_on=True):
         with state_lock:
             global_state["relay_on"] = turn_on
         
-        # 1. Gen 1 / Legacy REST Endpunkt
         turn_str = "on" if turn_on else "off"
         payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID, "turn": turn_str, "channel": 0}
         try:
@@ -197,7 +196,6 @@ def async_cloud_control(turn_on=True):
         except Exception:
             pass
 
-        # 2. Gen 2 / Gen 3 RPC Endpunkt (Switch.Set)
         rpc_payload = {
             "auth_key": AUTH_KEY,
             "id": DEVICE_ID,
@@ -211,7 +209,7 @@ def async_cloud_control(turn_on=True):
             
     threading.Thread(target=_worker, daemon=True).start()
 
-# --- THREAD 1: ZENTRALER GETAKTETER SHELLY-POLLER (VERHINDERT RATE-LIMITS) ---
+# --- THREAD 1: ZENTRALER GETAKTETER SHELLY-POLLER ---
 def shelly_cloud_poller_loop():
     time.sleep(1.0)
     while True:
@@ -263,7 +261,7 @@ def shelly_cloud_poller_loop():
 
 threading.Thread(target=shelly_cloud_poller_loop, daemon=True).start()
 
-# --- THREAD 2: AUTARKER ENERGIE- & AI-METERING ENGINE (STANDBY-IMMUN) ---
+# --- THREAD 2: AUTARKER ENERGIE- & AI-METERING ENGINE ---
 def background_metering_loop():
     last_loop_time = time.time()
     while True:
@@ -285,7 +283,7 @@ def background_metering_loop():
                 if not u.get("active") or u.get("terminated") or u.get("paused"):
                     continue
 
-                # 1. Energie-Integration (sekundengenau)
+                # 1. Energie-Integration
                 wh_increment = (watt * dt) / 3600.0
                 u["accumulated_seconds"] += dt
                 u["total_wh"] += wh_increment
@@ -324,7 +322,7 @@ def background_metering_loop():
                         dev["soc_pct"] = round(min(100.0, soc), 1)
                         dev["wh_to_100"] = max(0.0, round(nom_wh * (1.0 - (dev["soc_pct"] / 100.0)), 2))
 
-                        # 3. Automatischer 80% Lade-Stopp (Batterieschutz)
+                        # 3. Automatischer 80% Lade-Stopp
                         if u.get("battery_80_protection_enabled") and not u.get("battery_80_triggered") and dev["soc_pct"] >= 80.0:
                             u["battery_80_triggered"] = True
                             u["active"] = False
@@ -332,7 +330,7 @@ def background_metering_loop():
                             u["stop_reason"] = "battery_80_protection"
                             async_cloud_control(turn_on=False)
 
-                        # 4. Automatischer 100% Lade-Stopp (Vollladung)
+                        # 4. Automatischer 100% Lade-Stopp
                         if not u.get("battery_100_triggered") and (dev["soc_pct"] >= 99.5 or (dev["duration_sec"] > 45 and watt <= prof["trickle_w"])):
                             u["battery_100_triggered"] = True
                             u["active"] = False
@@ -1939,6 +1937,28 @@ def admin_override():
                 user_sessions[global_state["active_user_id"]]["active"] = False
         return jsonify({"status": "ok", "message": "Notabschaltung ausgeführt (Relais AUS)"})
     return jsonify({"status": "error", "message": "Unbekannte Aktion"}), 400
+
+@app.route('/debug_shelly')
+def debug_shelly():
+    try:
+        payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID}
+        t0 = time.time()
+        res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=5.0).json()
+        dur = time.time() - t0
+        return jsonify({
+            "status_code": 200,
+            "duration": dur,
+            "isok": res.get("isok"),
+            "error": res.get("error"),
+            "data_keys": list(res.get("data", {}).keys()),
+            "switch0": res.get("data", {}).get("device_status", {}).get("switch:0"),
+            "global_watt": global_state.get("last_watt"),
+            "global_amp": global_state.get("last_amp"),
+            "global_volt": global_state.get("last_volt"),
+            "last_valid_fetch_time": global_state.get("last_valid_fetch_time")
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)})
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
