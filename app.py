@@ -685,8 +685,10 @@ def accumulate_energy():
             if (ratio >= 2.8 or ratio <= 0.35) and delta >= 20.0:
                 charge["power_shift_modal"] = {
                     "from_w": round(base_w, 1),
-                    "to_w": round(w, 1)
+                    "to_w": round(w, 1),
+                    "created_at": now
                 }
+                charge["power_shift_modal_created_at"] = now
                 charge["power_shift_cooldown_until"] = now + 35.0
                 logger.info(f"⚡ Signifikanter Lastsprung: {base_w:.1f} W -> {w:.1f} W (Delta {delta:.1f} W)!")
 
@@ -697,6 +699,20 @@ def accumulate_energy():
         else:
             charge["stable_samples_count"] = 1
             charge["last_stable_w"] = w
+
+    # Automatischer 20s-Timeout: Falls Nutzer nicht reagiert, gleiches Gerät beibehalten
+    if charge.get("power_shift_modal"):
+        created_at = charge.get("power_shift_modal_created_at", now)
+        if (now - created_at) >= 20.0:
+            idx = charge["current_device_idx"]
+            devs = charge["devices"]
+            if 0 <= idx < len(devs):
+                cur_d = devs[idx]
+                if cur_d.get("key") in DEVICE_PROFILES:
+                    DeviceAI.learn_from_feedback(cur_d["key"], charge.get("power_history", []), w)
+                logger.info(f"⏳ 20s Timeout: Lastwechsel automatisch als gleiches Gerät bestätigt ({cur_d['name']}).")
+            charge["power_shift_modal"] = None
+            charge["power_shift_cooldown_until"] = now + 35.0
 
     # =====================================================================
     # 5. ENERGIE- & ZEIT-AKKUMULATION + 80% / 100% AKKUSCHUTZ
@@ -1693,18 +1709,23 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 <div id="modalPowerShift" class="modal">
 <div class="mbox" style="text-align:center;border:2px solid var(--amber)">
   <div style="font-size:42px;margin-bottom:6px">⚡📈</div>
-  <div style="font-size:18px;font-weight:800;margin-bottom:6px;color:#b45309">Signifikanter Lastwechsel erkannt!</div>
-  <p style="font-size:13px;color:var(--muted);margin-bottom:16px;line-height:1.4">
-    Die Leistung hat sich sprunghaft verändert von <b id="psFromW" style="color:var(--text)">-- W</b> auf <b id="psToW" style="color:var(--blue)">-- W</b>.<br/>
-    <b>Wurde ein neues / anderes Gerät eingesteckt?</b>
+  <div style="font-size:18px;font-weight:800;margin-bottom:6px;color:#b45309">Lastwechsel erkannt</div>
+  <p style="font-size:13px;color:var(--muted);margin-bottom:12px;line-height:1.4">
+    Die Leistung hat sich verändert von <b id="psFromW" style="color:var(--text)">-- W</b> auf <b id="psToW" style="color:var(--blue)">-- W</b>.<br/>
+    Wurde ein neues / anderes Gerät eingesteckt?
   </p>
+
+  <div style="background:#fffbeb;border:1px solid #fde68a;border-radius:12px;padding:8px 12px;margin-bottom:14px;font-size:12px;color:#92400e;display:flex;align-items:center;justify-content:center;gap:6px;font-weight:700">
+    <span>⏳ Fortsetzung als gleiches Gerät in</span>
+    <span id="psCountdown" style="font-size:14px;color:#b45309;font-family:ui-monospace,monospace;font-weight:800">20s</span>
+  </div>
   
   <div style="display:flex;flex-direction:column;gap:10px">
     <button class="btn bp" style="background:var(--blue);padding:13px;font-size:14px" onclick="handlePowerShift('new_device')">
       🔄 Ja, neues separates Gerät erfassen
     </button>
-    <button class="btn bs" style="background:#f8fafc;color:var(--text);padding:12px;font-size:13.5px" onclick="handlePowerShift('same_device')">
-      ✅ Nein, gleiches Gerät (Lastwechsel / Display / Aufwachen)
+    <button class="btn bs" style="background:#f8fafc;color:var(--text);padding:12px;font-size:13.5px;font-weight:700" onclick="handlePowerShift('same_device')">
+      ✅ Nein, gleiches Gerät (Lastwechsel / Standby)
     </button>
   </div>
 </div>
@@ -2159,8 +2180,36 @@ function handleUnplugResponse(action, devIdx){
   });
 }
 
+var powerShiftTimer = null;
+var powerShiftSecondsLeft = 20;
+
+function startPowerShiftCountdown(){
+  if(powerShiftTimer) return;
+  powerShiftSecondsLeft = 20;
+  var el = document.getElementById('psCountdown');
+  if(el) el.innerText = powerShiftSecondsLeft + 's';
+
+  powerShiftTimer = setInterval(function(){
+    powerShiftSecondsLeft -= 1;
+    if(el) el.innerText = Math.max(0, powerShiftSecondsLeft) + 's';
+    if(powerShiftSecondsLeft <= 0){
+      clearInterval(powerShiftTimer);
+      powerShiftTimer = null;
+      handlePowerShift('same_device');
+    }
+  }, 1000);
+}
+
+function stopPowerShiftCountdown(){
+  if(powerShiftTimer){
+    clearInterval(powerShiftTimer);
+    powerShiftTimer = null;
+  }
+}
+
 // LASTWECHSEL-ANTWORTEN
 function handlePowerShift(action){
+  stopPowerShiftCountdown();
   lastActionLocalTime = Date.now();
   hideM('modalPowerShift');
   post('/power_shift_action', { action: action }).then(function(res){
@@ -2513,21 +2562,25 @@ function poll(){
       hideM('modalAskUnplug');
       hideM('modalAskNextDevice');
       showM('modalPowerShift');
+      startPowerShiftCountdown();
       hideM('modalBattery80');
       hideM('modalBattery100');
     } else if(d.battery_modal === 'BATTERY_80' && !isRecentAction){
+      stopPowerShiftCountdown();
       hideM('modalAskUnplug');
       hideM('modalAskNextDevice');
       hideM('modalPowerShift');
       showM('modalBattery80');
       hideM('modalBattery100');
     } else if(d.battery_modal === 'BATTERY_100' && !isRecentAction){
+      stopPowerShiftCountdown();
       hideM('modalAskUnplug');
       hideM('modalAskNextDevice');
       hideM('modalPowerShift');
       hideM('modalBattery80');
       showM('modalBattery100');
     } else if(!d.unplug_modal && !d.battery_modal && !d.power_shift_modal || isRecentAction){
+      stopPowerShiftCountdown();
       hideM('modalAskUnplug');
       hideM('modalAskNextDevice');
       hideM('modalPowerShift');
