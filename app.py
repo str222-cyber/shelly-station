@@ -183,6 +183,7 @@ charge = {
     
     # --- PRÄZISER ABSTECK- & WECHSEL-WORKFLOW MIT SCHONFRIST ---
     "unplug_modal": None,            # None | "ASK_UNPLUG" | "ASK_NEXT_DEVICE"
+    "battery_modal": None,           # None | "BATTERY_80" | "BATTERY_100"
     "unplug_cooldown_until": 0.0,    # Timestamp: Bis wann kein Absteck-Popup getriggert werden darf (Schonfrist)
     "flow_continuous_seconds": 0.0,  # Zählt zusammenhängende Sekunden stabilen Stromflusses
     "waiting_for_new_plug": False,   # True, wenn Relais wieder EIN ist und auf Strom gewartet wird
@@ -437,6 +438,12 @@ def new_device_entry(num, key="lamp"):
         "is_battery": prof["is_battery"],
         "nominal_wh": prof["nominal_wh"],
         "user_confirmed": False,
+        
+        # 80% & 100% Akkuschutz Status
+        "charge_to_100": False,
+        "notified_80": False,
+        "notified_100": False,
+        
         "duration_sec": 0.0,
         "flow_duration_sec": 0.0,
         "idle_duration_sec": 0.0,
@@ -513,12 +520,12 @@ def accumulate_energy():
             charge["paused"] = True
             charge["unplug_modal"] = "ASK_UNPLUG"
             charge["had_flowing"] = False
-            charge["unplug_cooldown_until"] = now + 8.0  # Mindestens 8s Pause vor nächstem Event
+            charge["unplug_cooldown_until"] = now + 8.0
             relay_control(False)
             logger.info("🔌 Ampere auf 0.0 A abgefallen -> Ladevorgang pausiert, Relais AUS, Modal ASK_UNPLUG geöffnet!")
 
     # =====================================================================
-    # 4. ENERGIE- & ZEIT-AKKUMULATION
+    # 4. ENERGIE- & ZEIT-AKKUMULATION + 80% / 100% AKKUSCHUTZ
     # =====================================================================
     if last and last > 0 and charge["session_start_time"] is not None:
         dt = now - last
@@ -553,6 +560,31 @@ def accumulate_energy():
                     d["cost_brutto"] = d["cost_netto"] + d["vat_amount"]
                     d["cost"] = d["cost_brutto"]
                     d["peak_w"] = max(d.get("peak_w", 0), w)
+
+                    # --- 80% & 100% AKKU-ABSCHALTAUTOMATIK ---
+                    if d.get("is_battery") and d.get("nominal_wh", 0) > 0:
+                        nom_wh = d["nominal_wh"]
+                        cur_wh = d["wh"]
+                        soc_pct = (cur_wh / nom_wh) * 100.0
+
+                        # Fall A: 80% Akkuschutz schlägt an
+                        if soc_pct >= 80.0 and not d.get("charge_to_100", False) and not d.get("notified_80", False):
+                            d["notified_80"] = True
+                            charge["active"] = False
+                            charge["paused"] = True
+                            charge["battery_modal"] = "BATTERY_80"
+                            relay_control(False)
+                            logger.info(f"🔋 80% Akkuschutz erreicht ({cur_wh:.2f} Wh / {nom_wh} Wh) -> Relais AUS, Modal BATTERY_80!")
+
+                        # Fall B: 100% Vollladung erreicht
+                        elif (soc_pct >= 100.0 or (soc_pct >= 92.0 and w < 1.5)) and d.get("charge_to_100", False) and not d.get("notified_100", False):
+                            d["notified_100"] = True
+                            charge["active"] = False
+                            charge["paused"] = True
+                            charge["battery_modal"] = "BATTERY_100"
+                            relay_control(False)
+                            logger.info(f"🔋 100% Akku voll geladen ({cur_wh:.2f} Wh / {nom_wh} Wh) -> Relais AUS, Modal BATTERY_100!")
+
             else:
                 # Pausenzeit erfassen (wenn kein Strom fließt oder pausiert ist)
                 charge["total_idle_seconds"] += dt
@@ -618,6 +650,7 @@ def scan(token):
             charge["active"] = False
             charge["paused"] = False
             charge["unplug_modal"] = None
+            charge["battery_modal"] = None
             charge["unplug_cooldown_until"] = 0.0
             charge["flow_continuous_seconds"] = 0.0
             charge["waiting_for_new_plug"] = False
@@ -650,6 +683,7 @@ def reset_session():
         charge["active"] = False
         charge["paused"] = False
         charge["unplug_modal"] = None
+        charge["battery_modal"] = None
         charge["unplug_cooldown_until"] = 0.0
         charge["flow_continuous_seconds"] = 0.0
         charge["waiting_for_new_plug"] = False
@@ -712,8 +746,9 @@ def get_status():
             "wh": round(charge["total_wh"], 4),
             "kwh": round(charge["total_kwh"], 6),
             
-            # Absteck- & Wechsel-Status
+            # Absteck- & Akku-Status
             "unplug_modal": charge["unplug_modal"],
+            "battery_modal": charge["battery_modal"],
             "waiting_for_new_plug": charge["waiting_for_new_plug"],
             "had_flowing": charge["had_flowing"],
             "is_flowing": charge["is_flowing"],
@@ -764,7 +799,8 @@ def start_charge():
         charge["active"] = True
         charge["paused"] = False
         charge["unplug_modal"] = None
-        charge["unplug_cooldown_until"] = now + 10.0  # 10s Schonfrist beim Start
+        charge["battery_modal"] = None
+        charge["unplug_cooldown_until"] = now + 10.0
         charge["flow_continuous_seconds"] = 0.0
         charge["had_flowing"] = False
         charge["waiting_for_new_plug"] = False
@@ -795,17 +831,15 @@ def stop_charge():
 def unplug_action():
     data = request.get_json() or {}
     action = data.get("action")
-    # action: "no_resume" | "yes_unplugged" | "select_existing" | "prep_new_device" | "finish"
-
     now = time.time()
+
     with lock:
         if action == "no_resume":
-            # 1. Selbes aktuelles Gerät fortsetzen
             charge["unplug_modal"] = None
             charge["waiting_for_new_plug"] = False
             charge["active"] = True
             charge["paused"] = False
-            charge["unplug_cooldown_until"] = now + 10.0  # 10s Schonfrist
+            charge["unplug_cooldown_until"] = now + 10.0
             charge["flow_continuous_seconds"] = 0.0
             charge["last_wh_time"] = now
             relay_control(True)
@@ -813,7 +847,6 @@ def unplug_action():
             return jsonify({"status": "ok", "state": "resumed"})
 
         elif action == "yes_unplugged":
-            # 2. Stecker abgezogen -> Zeige Auswahl: Früheres Gerät vs. Neues Gerät vs. Beenden
             charge["unplug_modal"] = "ASK_NEXT_DEVICE"
             charge["waiting_for_new_plug"] = False
             charge["unplug_cooldown_until"] = now + 10.0
@@ -821,7 +854,6 @@ def unplug_action():
             return jsonify({"status": "ok", "state": "ask_next_device", "devices": charge["devices"]})
 
         elif action == "select_existing":
-            # 3. Ein FRÜHER GENUTZTES Gerät aus dieser Sitzung wiederverwenden!
             dev_idx = int(data.get("device_idx", 0))
             if 0 <= dev_idx < len(charge["devices"]):
                 charge["current_device_idx"] = dev_idx
@@ -839,7 +871,6 @@ def unplug_action():
                 return jsonify({"status": "ok", "state": "waiting_for_plug", "reused_device": cur_d})
 
         elif action == "prep_new_device":
-            # 4. Komplett NEUES Gerät erfassen
             charge["target_is_new"] = True
             charge["unplug_modal"] = None
             charge["waiting_for_new_plug"] = True
@@ -853,9 +884,37 @@ def unplug_action():
             return jsonify({"status": "ok", "state": "waiting_for_plug"})
 
         elif action == "finish":
-            # 5. Sitzung beenden
             charge["unplug_modal"] = None
             charge["waiting_for_new_plug"] = False
+            return logout()
+
+    return jsonify({"status": "error"}), 400
+
+# =====================================================================
+# 80% & 100% AKKUSCHUTZ ENDPOINT
+# =====================================================================
+@app.route('/battery_action', methods=['POST'])
+def battery_action():
+    data = request.get_json() or {}
+    action = data.get("action")  # "continue_100" | "finish"
+    now = time.time()
+
+    with lock:
+        charge["battery_modal"] = None
+        idx = charge["current_device_idx"]
+        devs = charge["devices"]
+        cur_d = devs[idx] if 0 <= idx < len(devs) else None
+
+        if action == "continue_100" and cur_d:
+            cur_d["charge_to_100"] = True
+            charge["active"] = True
+            charge["paused"] = False
+            charge["unplug_cooldown_until"] = now + 10.0
+            charge["last_wh_time"] = now
+            relay_control(True)
+            logger.info(f"🔋 80% Akkuschutz freigegeben -> Lade weiter bis 100% auf {cur_d['name']}.")
+            return jsonify({"status": "ok", "charge_to_100": True})
+        elif action == "finish":
             return logout()
 
     return jsonify({"status": "error"}), 400
@@ -911,6 +970,7 @@ def logout():
         charge["paused"] = False
         charge["terminated"] = True
         charge["unplug_modal"] = None
+        charge["battery_modal"] = None
         charge["waiting_for_new_plug"] = False
         
         elapsed = get_session_elapsed()
@@ -1091,6 +1151,7 @@ def debug():
         "charge_active": charge["active"],
         "charge_paused": charge["paused"],
         "unplug_modal": charge["unplug_modal"],
+        "battery_modal": charge["battery_modal"],
         "unplug_cooldown_until": charge["unplug_cooldown_until"],
         "flow_continuous_seconds": charge["flow_continuous_seconds"],
         "waiting_for_new_plug": charge["waiting_for_new_plug"],
@@ -1205,7 +1266,7 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 .dev-pill{font-size:11px;font-weight:700;padding:4px 10px;border-radius:20px;background:#f1f5f9;color:var(--muted);white-space:nowrap;border:1px solid var(--border)}
 .dev-pill.active{background:#eff6ff;color:var(--blue);border-color:#bfdbfe}
 
-/* BANNER: WARTE AUF EINSTECKEN DES NEUEN GERÄTS */
+/* BANNER: WARTE AUF EINSTECKEN / STROMERKENNUNG */
 .waiting-banner{background:#eff6ff;border:2px dashed #3b82f6;border-radius:16px;padding:14px;margin-bottom:12px;text-align:center;animation:pulsebox 1.5s infinite}
 @keyframes pulsebox{0%,100%{background:#eff6ff;border-color:#3b82f6}50%{background:#dbeafe;border-color:#1d4ed8}}
 .wb-title{font-size:14.5px;font-weight:800;color:#1e40af;margin-bottom:4px}
@@ -1361,6 +1422,43 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 </div>
 </div>
 
+<!-- DIALOG: 80% AKKUSCHUTZ ERREICHT -->
+<div id="modalBattery80" class="modal">
+<div class="mbox" style="text-align:center;border:2px solid #059669">
+  <div style="font-size:42px;margin-bottom:6px">🛡️🔋</div>
+  <div style="font-size:18px;font-weight:800;margin-bottom:6px;color:#065f46">80% Akkuschutz erreicht!</div>
+  <p style="font-size:13px;color:var(--muted);margin-bottom:18px;line-height:1.4">
+    Dein Akku ist zu <b>80% voll geladen</b>.<br/>
+    Die Steckdose wurde automatisch ausgeschaltet, um die <b>Akkuzellen optimal zu schonen</b>.
+  </p>
+  
+  <div style="display:flex;flex-direction:column;gap:10px">
+    <button class="btn bp" style="background:#059669;padding:14px;font-size:14.5px" onclick="handleBatteryAction('continue_100')">
+      ⚡ Weiterladen bis 100% voll
+    </button>
+    <button class="btn bs" style="background:#f1f5f9;color:var(--text);padding:12px;font-size:13.5px" onclick="handleBatteryAction('finish')">
+      🧾 Ladevorgang beenden & Quittung
+    </button>
+  </div>
+</div>
+</div>
+
+<!-- DIALOG: 100% AKKU VOLLGELADEN -->
+<div id="modalBattery100" class="modal">
+<div class="mbox" style="text-align:center;border:2px solid #2563eb">
+  <div style="font-size:42px;margin-bottom:6px">✅🔋</div>
+  <div style="font-size:18px;font-weight:800;margin-bottom:6px;color:#1e40af">100% Akku voll geladen!</div>
+  <p style="font-size:13px;color:var(--muted);margin-bottom:18px;line-height:1.4">
+    Der Ladevorgang ist <b>vollständig abgeschlossen (100%)</b>.<br/>
+    Die Steckdose wurde automatisch stromlos geschaltet.
+  </p>
+  
+  <button class="btn bp" style="background:var(--blue);padding:14px;font-size:15px" onclick="handleBatteryAction('finish')">
+    🧾 Beenden & Quittung anzeigen
+  </button>
+</div>
+</div>
+
 <!-- MODAL: LAND & MWST WAHLEN -->
 <div id="countryModal" class="modal">
 <div class="mbox">
@@ -1485,7 +1583,7 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 
 <!-- BANNER WENN AUF NEUES GERAET GEWARTET WIRD -->
 <div class="waiting-banner" id="waitingPlugBanner" style="display:none">
-  <div class="wb-title">🔌 Steckdose aktiv – Gerät einstecken</div>
+  <div class="wb-title" id="waitingPlugTitle">🔌 Steckdose aktiv – Gerät einstecken</div>
   <div class="wb-sub" id="waitingPlugSub">Stecke das Gerät ein. Sobald Strom fließt, läuft die Erfassung automatisch weiter!</div>
 </div>
 
@@ -1643,7 +1741,7 @@ var done = false, lastR = null;
 var localElapsed = 0;
 var sessionStarted = false;
 var localTimerInterval = null;
-var lastActionLocalTime = 0; // Lokale Schonfrist im Frontend (verhindert Pop-up Kaskaden)
+var lastActionLocalTime = 0;
 
 var STROMPREIS_NETTO = 0.35;
 var currentCountry = { code: 'DE', name: 'Deutschland', flag: '🇩🇪', vat_name: 'MwSt.', rate: 19.0 };
@@ -1707,6 +1805,8 @@ function startFreshSession(){
     document.getElementById('waitingPlugBanner').style.display = 'none';
     hideM('modalAskUnplug');
     hideM('modalAskNextDevice');
+    hideM('modalBattery80');
+    hideM('modalBattery100');
     poll();
   });
 }
@@ -1748,6 +1848,20 @@ function handleUnplugResponse(action, devIdx){
     payload.device_idx = devIdx;
   }
   post('/unplug_action', payload).then(function(res){
+    if(action === 'finish'){
+      showReceipt(res);
+    } else {
+      poll();
+    }
+  });
+}
+
+// 80% & 100% AKKU-AKTIONEN
+function handleBatteryAction(action){
+  lastActionLocalTime = Date.now();
+  hideM('modalBattery80');
+  hideM('modalBattery100');
+  post('/battery_action', { action: action }).then(function(res){
     if(action === 'finish'){
       showReceipt(res);
     } else {
@@ -2058,24 +2172,49 @@ function poll(){
       document.getElementById('sTxt').innerText = 'Bereit';
     }
 
-    // Modal Status Management (mit 6s lokaler Schonfrist gegen Pop-up Kaskaden)
+    // Modal Status Management (mit Schonfrist)
     var isRecentAction = (Date.now() - lastActionLocalTime < 6000);
+    
+    // 1. Absteck-Modale
     if(d.unplug_modal === 'ASK_UNPLUG' && !isRecentAction){
       showM('modalAskUnplug');
       hideM('modalAskNextDevice');
+      hideM('modalBattery80');
+      hideM('modalBattery100');
     } else if(d.unplug_modal === 'ASK_NEXT_DEVICE' && !isRecentAction){
       hideM('modalAskUnplug');
       renderReusableDevices(d.devices);
       showM('modalAskNextDevice');
-    } else if(!d.unplug_modal || isRecentAction){
+      hideM('modalBattery80');
+      hideM('modalBattery100');
+    } else if(d.battery_modal === 'BATTERY_80' && !isRecentAction){
       hideM('modalAskUnplug');
       hideM('modalAskNextDevice');
+      showM('modalBattery80');
+      hideM('modalBattery100');
+    } else if(d.battery_modal === 'BATTERY_100' && !isRecentAction){
+      hideM('modalAskUnplug');
+      hideM('modalAskNextDevice');
+      hideM('modalBattery80');
+      showM('modalBattery100');
+    } else if(!d.unplug_modal && !d.battery_modal || isRecentAction){
+      hideM('modalAskUnplug');
+      hideM('modalAskNextDevice');
+      hideM('modalBattery80');
+      hideM('modalBattery100');
     }
 
-    // Waiting for plug banner
+    // Waiting for plug banner & Status (bereits eingesteckt vs. einzustecken)
     var wb = document.getElementById('waitingPlugBanner');
     if(d.waiting_for_new_plug){
       wb.style.display = 'block';
+      if(curW > 0.3 || curA > 0.02){
+        document.getElementById('waitingPlugTitle').innerText = '⚡ Strom fließt – Gerät bereits eingesteckt';
+        document.getElementById('waitingPlugSub').innerText = 'Das Gerät zieht bereits ' + curW.toFixed(1) + ' W. Erfassung läuft!';
+      } else {
+        document.getElementById('waitingPlugTitle').innerText = '🔌 Steckdose aktiv – Gerät einstecken';
+        document.getElementById('waitingPlugSub').innerText = 'Stecke das Gerät jetzt ein. Sobald Strom fließt, wird automatisch gestartet!';
+      }
     } else {
       wb.style.display = 'none';
     }
