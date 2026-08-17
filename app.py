@@ -1104,6 +1104,131 @@ def claim_control():
         logger.info(f"📲 Steuerung der Station exklusiv auf Client {cid} übertragen!")
         return jsonify({"status": "ok", "is_owner": True, "client_id": cid})
 
+
+# =====================================================================
+# KI-LADEASSISTENT & CHATBOT BACKEND
+# =====================================================================
+FEEDBACK_LOG_FILE = "user_feedback_log.json"
+
+class StationChatbot:
+    @classmethod
+    def answer(cls, user_text, station_state):
+        t = (user_text or "").strip().lower()
+        if not t:
+            return "Wie kann ich dir bei deinem Ladevorgang behilflich sein? Du kannst mich nach Restzeit, Kosten, Ladephase oder Geräten fragen."
+
+        active_dev = station_state.get("active_device", {})
+        dev_name = active_dev.get("name", "Dein Gerät")
+        w = station_state.get("watt", 0.0)
+        wh = station_state.get("wh", 0.0)
+        cost = station_state.get("cost_brutto", 0.0)
+        batt = station_state.get("battery_state") or {}
+        soc = batt.get("soc_percent", 50)
+        phase = batt.get("phase_name", "Hauptladung")
+        eta = batt.get("eta_minutes_100", 0)
+
+        # 1. Feedback / Feature Requests
+        if any(k in t for k in ["feedback", "vorschlag", "feature", "idee", "verbesser", "wunsch", "könnt ihr", "bitte einbauen"]):
+            cls.log_feedback(user_text, station_state)
+            return f"💡 Vielen Dank für dein Feedback! Ich habe deine Anmerkung in unserem System gespeichert, damit sie beim nächsten Update berücksichtigt werden kann."
+
+        # 2. Restzeit & Dauer
+        if any(k in t for k in ["restzeit", "dauer", "wie lange", "wann fertig", "zeit", "fertig"]):
+            if w > 0.5:
+                if eta > 0:
+                    return f"⏱️ Bei aktueller Leistung ({w:.1f} W) benötigt {dev_name} noch ca. **{eta} Minuten** bis zur vollständigen Ladung (100%). Der aktuelle Ladestand liegt bei ca. **{soc}%**."
+                else:
+                    return f"⚡ {dev_name} lädt aktuell mit **{w:.1f} W**. Der Akku ist bereits nahezu vollständig geladen (< 5 Min Restzeit)."
+            else:
+                return f"⏸️ Aktuell fließt kein Strom (0.0 W). Sobald Strom fließt, berechne ich die genaue Restzeit für {dev_name}."
+
+        # 3. Kosten & Verbrauch
+        if any(k in t for k in ["kost", "preis", "euro", "cent", "tarif", "strompreis", "verbrauch", "kwh", "wh"]):
+            return f"💶 Bisher wurden **{wh:.2f} Wh** verbraucht. Die Gesamtkosten belaufen sich auf **{cost:.4f} €** (brutto). Der Strompreis beträgt transparente 0,35 €/kWh."
+
+        # 4. Ladephase & Drosselung
+        if any(k in t for k in ["phase", "cv", "cc", "drossel", "langsamer", "warum weniger", "balanc"]):
+            return (
+                f"🔋 **Aktuelle Ladephase:** {phase}\n\n"
+                f"• **CC-Phase (Hauptladung):** Maximaler Ladestrom bis ca. 75–80%.\n"
+                f"• **CV-Phase (Sättigung):** Die Spannung erreicht das Maximum und der Strom wird kontinuierlich gedrosselt, um die Akkuzellen zu schonen.\n"
+                f"• **Balancing (95–100%):** Minimaler Reststrom zum perfekten Ausgleich der Zellen."
+            )
+
+        # 5. Gerät wechseln / Mehrere Geräte
+        if any(k in t for k in ["gerät", "wechsel", "laptop", "ebike", "bike", "handy", "umsteck"]):
+            return f"📱 Du kannst jederzeit ein anderes Gerät anstecken! Klicke einfach oben auf **'⚡ Gerät wählen'** oder wähle einen der Geräte-Reiter. Das System erfasst jedes Gerät mit eigenem Verbrauch und eigener Quittung."
+
+        # 6. Pause / Fortsetzen
+        if any(k in t for k in ["pause", "pausieren", "unterbrech", "stopp", "weiter"]):
+            return "⏸️ Du kannst die Ladung jederzeit über den Button **'⏸️ Pause'** unterbrechen. Die Steckdose schaltet dann ab, ohne dass deine bisherigen Zählerstände verloren gehen. Ein Klick auf **'▶️ Fortsetzen'** schaltet den Strom sofort wieder ein."
+
+        # 7. Quittung / Beenden
+        if any(k in t for k in ["quittung", "rechnung", "beenden", "abschluss", "fertig", "ausdruck"]):
+            return "🧾 Um deine Ladung abzuschließen, klicke auf **'🧾 Beenden & Quittung'**. Du erhältst sofort eine steuerkonforme Quittung mit QR-Code und kannst sie dir per E-Mail senden."
+
+        # Fallback
+        return (
+            f"🤖 Ich bin dein KI-Ladeassistent für {dev_name}.\n\n"
+            f"Aktueller Status: **{w:.1f} W** | **{wh:.2f} Wh** | **{cost:.4f} €**.\n\n"
+            f"Du kannst mich z. B. fragen:\n"
+            f"• *'Wie lange dauert das Laden noch?'*\n"
+            f"• *'Was kostet das Laden bisher?'*\n"
+            f"• *'Warum wird die Ladeleistung gedrosselt?'*"
+        )
+
+    @classmethod
+    def log_feedback(cls, text, state):
+        try:
+            entries = []
+            if os.path.exists(FEEDBACK_LOG_FILE):
+                with open(FEEDBACK_LOG_FILE, "r", encoding="utf-8") as f:
+                    entries = json.load(f)
+            entries.append({
+                "timestamp": time.time(),
+                "time_str": time.strftime('%Y-%m-%d %H:%M:%S'),
+                "feedback": text,
+                "active_device": state.get("active_device", {}).get("name", "Unbekannt"),
+                "watt": state.get("watt", 0.0),
+                "wh": state.get("wh", 0.0)
+            })
+            with open(FEEDBACK_LOG_FILE, "w", encoding="utf-8") as f:
+                json.dump(entries[-100:], f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"Feedback log error: {e}")
+
+@app.route('/ai_chat', methods=['POST'])
+def ai_chat():
+    data = request.get_json() or {}
+    msg = data.get("message", "")
+    with lock:
+        curr_idx = charge["current_device_idx"]
+        devs = charge["devices"]
+        active_dev = devs[curr_idx] if 0 <= curr_idx < len(devs) else {}
+        batt_state = None
+        if active_dev.get("is_battery"):
+            hist_watts = [float(item[1]) if isinstance(item, (tuple, list)) else float(item) for item in charge.get("power_history", [])]
+            pw = max(hist_watts or [shelly["watt"]])
+            batt_state = DeviceAI.estimate_battery_state(
+                active_dev.get("key", "ebike"),
+                shelly["watt"],
+                pw,
+                active_dev.get("wh", 0.0),
+                active_dev.get("nominal_wh", 500.0),
+                charge.get("power_history", [])
+            )
+        state_snap = {
+            "active_device": active_dev,
+            "watt": shelly["watt"],
+            "wh": charge["total_wh"],
+            "cost_brutto": charge["total_cost_brutto"],
+            "battery_state": batt_state,
+            "paused": charge["paused"],
+            "active": charge["active"]
+        }
+    reply = StationChatbot.answer(msg, state_snap)
+    return jsonify({"status": "ok", "reply": reply})
+
 @app.route('/status')
 def get_status():
     with lock:
@@ -1827,6 +1952,22 @@ p{font-size:13.5px;color:#94a3b8;line-height:1.5;margin-bottom:20px}
 .tcode{font-family:monospace;font-size:13px;word-break:break-all}
 .btn{display:block;width:100%;padding:14px;font-size:15px;font-weight:700;background:#3b82f6;color:#fff;border:none;border-radius:14px;text-decoration:none;cursor:pointer;margin-top:10px}
 .btn2{background:transparent;border:1px solid #1f2937;color:#94a3b8;font-size:12px;padding:9px}
+
+.chat-chip {
+  background: #eff6ff;
+  color: #1e40af;
+  border: 1px solid #bfdbfe;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 4px 10px;
+  border-radius: 12px;
+  cursor: pointer;
+  display: inline-block;
+}
+.chat-chip:hover {
+  background: #dbeafe;
+}
+
 </style></head><body>
 <div class="card">
 <div style="font-size:54px">🔒</div>
@@ -1860,7 +2001,62 @@ body{background:var(--bg);color:var(--text);padding:16px;display:flex;justify-co
 .btn-act{padding:8px 14px;border-radius:10px;border:none;cursor:pointer;font-weight:700;font-size:12px}
 .btn-on{background:var(--green);color:#fff}
 .btn-off{background:var(--red);color:#fff}
+
+.chat-chip {
+  background: #eff6ff;
+  color: #1e40af;
+  border: 1px solid #bfdbfe;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 4px 10px;
+  border-radius: 12px;
+  cursor: pointer;
+  display: inline-block;
+}
+.chat-chip:hover {
+  background: #dbeafe;
+}
+
 </style></head><body>
+
+<!-- CHATBOT FLOATING ACTION BUTTON -->
+<div id="chatFab" onclick="toggleChat()" style="position:fixed;bottom:20px;right:20px;z-index:9000;background:var(--blue);color:#fff;border-radius:30px;padding:10px 16px;box-shadow:0 4px 14px rgba(37,99,235,0.35);cursor:pointer;display:flex;align-items:center;gap:8px;font-size:13px;font-weight:700">
+  <span style="font-size:18px">💬</span> <span id="chatFabTxt">KI-Assistent</span>
+</div>
+
+<!-- CHATBOT DRAWER FENSTER -->
+<div id="chatDrawer" style="display:none;position:fixed;bottom:75px;right:20px;width:340px;max-width:calc(100vw - 40px);height:420px;background:#fff;border-radius:18px;box-shadow:0 10px 30px rgba(0,0,0,0.18);border:1px solid var(--border);z-index:9000;flex-direction:column;overflow:hidden">
+  <div style="background:var(--card);border-bottom:1px solid var(--border);padding:12px 16px;display:flex;justify-content:space-between;align-items:center">
+    <div style="display:flex;align-items:center;gap:8px">
+      <span style="font-size:20px">🤖</span>
+      <div>
+        <div style="font-size:13.5px;font-weight:800;color:var(--text)">Smart Lade-Assistent</div>
+        <div style="font-size:10.5px;color:#059669;display:flex;align-items:center;gap:4px">
+          <span style="width:6px;height:6px;background:#059669;border-radius:50%"></span> Online & Live verbunden
+        </div>
+      </div>
+    </div>
+    <button onclick="toggleChat()" style="background:none;border:none;font-size:18px;cursor:pointer;color:var(--muted);padding:4px">✕</button>
+  </div>
+  
+  <div id="chatMsgList" style="flex:1;overflow-y:auto;padding:12px 14px;display:flex;flex-direction:column;gap:10px;background:#f8fafc;font-size:12.5px">
+    <div style="align-self:flex-start;background:#fff;border:1px solid #e2e8f0;padding:10px 12px;border-radius:14px;border-top-left-radius:3px;max-width:85%;line-height:1.4;box-shadow:0 1px 3px rgba(0,0,0,0.05)">
+      Hallo! Ich bin dein KI-Ladeassistent. ⚡ Wie kann ich dir bei deinem Ladevorgang oder deinen Geräten helfen?
+    </div>
+  </div>
+  
+  <div style="padding:6px 12px;background:#fff;border-top:1px solid #f1f5f9;display:flex;gap:6px;overflow-x:auto;white-space:nowrap">
+    <span class="chat-chip" onclick="sendQuickPrompt('Wie lange dauert das Laden noch?')">🔋 Restzeit?</span>
+    <span class="chat-chip" onclick="sendQuickPrompt('Was kostet das Laden bisher?')">💶 Kosten?</span>
+    <span class="chat-chip" onclick="sendQuickPrompt('Was bedeutet die Ladephase?')">💡 Ladephase?</span>
+  </div>
+  
+  <form onsubmit="handleChatSubmit(event)" style="display:flex;gap:6px;padding:10px 12px;background:#fff;border-top:1px solid var(--border);margin:0">
+    <input id="chatInput" type="text" placeholder="Frage stellen oder Feedback..." style="flex:1;padding:9px 12px;border:1.5px solid var(--border);border-radius:20px;font-size:12.5px;outline:none" />
+    <button type="submit" style="background:var(--blue);color:#fff;border:none;border-radius:50%;width:34px;height:34px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:14px">➤</button>
+  </form>
+</div>
+
 <div class="wrap">
   <div class="hdr">
     <div>
@@ -2091,6 +2287,22 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 .rtbl td{padding:8px 4px;border-bottom:1px solid var(--border)}
 .tbox{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:14px;padding:14px;text-align:right;margin-top:14px}
 .ein{width:100%;padding:11px;border:1px solid var(--border);border-radius:10px;font-size:13.5px;margin-bottom:8px}
+
+.chat-chip {
+  background: #eff6ff;
+  color: #1e40af;
+  border: 1px solid #bfdbfe;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 4px 10px;
+  border-radius: 12px;
+  cursor: pointer;
+  display: inline-block;
+}
+.chat-chip:hover {
+  background: #dbeafe;
+}
+
 </style></head><body>
 
 <!-- MODAL: SICHERHEITS- & ZUGANGS-MODUS WAHL -->
@@ -2442,6 +2654,45 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 </div>
 
 <!-- HAUPTANSICHT -->
+
+<!-- CHATBOT FLOATING ACTION BUTTON -->
+<div id="chatFab" onclick="toggleChat()" style="position:fixed;bottom:20px;right:20px;z-index:9000;background:var(--blue);color:#fff;border-radius:30px;padding:10px 16px;box-shadow:0 4px 14px rgba(37,99,235,0.35);cursor:pointer;display:flex;align-items:center;gap:8px;font-size:13px;font-weight:700">
+  <span style="font-size:18px">💬</span> <span id="chatFabTxt">KI-Assistent</span>
+</div>
+
+<!-- CHATBOT DRAWER FENSTER -->
+<div id="chatDrawer" style="display:none;position:fixed;bottom:75px;right:20px;width:340px;max-width:calc(100vw - 40px);height:420px;background:#fff;border-radius:18px;box-shadow:0 10px 30px rgba(0,0,0,0.18);border:1px solid var(--border);z-index:9000;flex-direction:column;overflow:hidden">
+  <div style="background:var(--card);border-bottom:1px solid var(--border);padding:12px 16px;display:flex;justify-content:space-between;align-items:center">
+    <div style="display:flex;align-items:center;gap:8px">
+      <span style="font-size:20px">🤖</span>
+      <div>
+        <div style="font-size:13.5px;font-weight:800;color:var(--text)">Smart Lade-Assistent</div>
+        <div style="font-size:10.5px;color:#059669;display:flex;align-items:center;gap:4px">
+          <span style="width:6px;height:6px;background:#059669;border-radius:50%"></span> Online & Live verbunden
+        </div>
+      </div>
+    </div>
+    <button onclick="toggleChat()" style="background:none;border:none;font-size:18px;cursor:pointer;color:var(--muted);padding:4px">✕</button>
+  </div>
+  
+  <div id="chatMsgList" style="flex:1;overflow-y:auto;padding:12px 14px;display:flex;flex-direction:column;gap:10px;background:#f8fafc;font-size:12.5px">
+    <div style="align-self:flex-start;background:#fff;border:1px solid #e2e8f0;padding:10px 12px;border-radius:14px;border-top-left-radius:3px;max-width:85%;line-height:1.4;box-shadow:0 1px 3px rgba(0,0,0,0.05)">
+      Hallo! Ich bin dein KI-Ladeassistent. ⚡ Wie kann ich dir bei deinem Ladevorgang oder deinen Geräten helfen?
+    </div>
+  </div>
+  
+  <div style="padding:6px 12px;background:#fff;border-top:1px solid #f1f5f9;display:flex;gap:6px;overflow-x:auto;white-space:nowrap">
+    <span class="chat-chip" onclick="sendQuickPrompt('Wie lange dauert das Laden noch?')">🔋 Restzeit?</span>
+    <span class="chat-chip" onclick="sendQuickPrompt('Was kostet das Laden bisher?')">💶 Kosten?</span>
+    <span class="chat-chip" onclick="sendQuickPrompt('Was bedeutet die Ladephase?')">💡 Ladephase?</span>
+  </div>
+  
+  <form onsubmit="handleChatSubmit(event)" style="display:flex;gap:6px;padding:10px 12px;background:#fff;border-top:1px solid var(--border);margin:0">
+    <input id="chatInput" type="text" placeholder="Frage stellen oder Feedback..." style="flex:1;padding:9px 12px;border:1.5px solid var(--border);border-radius:20px;font-size:12.5px;outline:none" />
+    <button type="submit" style="background:var(--blue);color:#fff;border:none;border-radius:50%;width:34px;height:34px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:14px">➤</button>
+  </form>
+</div>
+
 <div class="wrap">
 <div class="card" id="mainC">
 <div class="hdr">
@@ -2737,6 +2988,69 @@ function chooseSecurityMode(mode){
   }
 }
 window.chooseSecurityMode = chooseSecurityMode;
+
+function toggleChat(){
+  var cd = document.getElementById('chatDrawer');
+  if(!cd) return;
+  if(cd.style.display === 'none' || cd.style.display === ''){
+    cd.style.display = 'flex';
+    var inp = document.getElementById('chatInput');
+    if(inp) inp.focus();
+  } else {
+    cd.style.display = 'none';
+  }
+}
+
+function sendQuickPrompt(txt){
+  var inp = document.getElementById('chatInput');
+  if(inp) inp.value = txt;
+  handleChatSubmit();
+}
+
+function handleChatSubmit(e){
+  if(e && e.preventDefault) e.preventDefault();
+  var inp = document.getElementById('chatInput');
+  if(!inp) return;
+  var msg = inp.value.trim();
+  if(!msg) return;
+  inp.value = '';
+  
+  var list = document.getElementById('chatMsgList');
+  if(list){
+    var uDiv = document.createElement('div');
+    uDiv.style.cssText = 'align-self:flex-end;background:var(--blue);color:#fff;padding:9px 12px;border-radius:14px;border-top-right-radius:3px;max-width:85%;line-height:1.4;box-shadow:0 1px 3px rgba(37,99,235,0.2)';
+    uDiv.innerText = msg;
+    list.appendChild(uDiv);
+    
+    var bDiv = document.createElement('div');
+    bDiv.id = 'chatTypingBubble';
+    bDiv.style.cssText = 'align-self:flex-start;background:#fff;border:1px solid #e2e8f0;padding:9px 12px;border-radius:14px;border-top-left-radius:3px;max-width:85%;line-height:1.4;color:var(--muted)';
+    bDiv.innerText = 'Antworte...';
+    list.appendChild(bDiv);
+    list.scrollTop = list.scrollHeight;
+    
+    post('/ai_chat', { message: msg }).then(function(res){
+      var typ = document.getElementById('chatTypingBubble');
+      if(typ && typ.parentNode) typ.parentNode.removeChild(typ);
+      
+      var repDiv = document.createElement('div');
+      repDiv.style.cssText = 'align-self:flex-start;background:#fff;border:1px solid #e2e8f0;padding:10px 12px;border-radius:14px;border-top-left-radius:3px;max-width:85%;line-height:1.4;box-shadow:0 1px 3px rgba(0,0,0,0.05);color:var(--text)';
+      var rep = (res && res.reply) ? res.reply : 'Entschuldigung, ich konnte keine Antwort abrufen.';
+      var formatted = rep.split('**').map(function(part, i){ return i % 2 === 1 ? ('<b>' + part + '</b>') : part; }).join('').replace(/\n/g, '<br/>');
+      repDiv.innerHTML = formatted;
+      list.appendChild(repDiv);
+      list.scrollTop = list.scrollHeight;
+    }).catch(function(){
+      var typ = document.getElementById('chatTypingBubble');
+      if(typ && typ.parentNode) typ.parentNode.removeChild(typ);
+    });
+  }
+}
+
+window.toggleChat = toggleChat;
+window.sendQuickPrompt = sendQuickPrompt;
+window.handleChatSubmit = handleChatSubmit;
+
 
 
 
