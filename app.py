@@ -245,23 +245,27 @@ def update_shelly_telemetry_once():
                 global_state["relay_on"] = relay_out
                 global_state["last_valid_fetch_time"] = time.time()
                 global_state["history_w"].append(watt)
-            return True
-    except Exception:
-        pass
-    return False
+            return True, None
+        else:
+            err = res.get("error") or "UNKNOWN"
+            return False, err
+    except Exception as e:
+        return False, str(e)
 
-# --- THREAD 1: ZENTRALER GETAKTETER SHELLY-POLLER (5.0s Intervall = 100% Rate-Limit konform) ---
+# --- THREAD 1: ZENTRALER GETAKTETER SHELLY-POLLER (7.5s Intervall = 100% Rate-Limit konform) ---
 def shelly_cloud_poller_loop():
-    time.sleep(0.5)
+    time.sleep(1.0)
     while True:
         try:
-            success = update_shelly_telemetry_once()
+            success, err = update_shelly_telemetry_once()
             if success:
-                time.sleep(5.0)
+                time.sleep(7.5)
+            elif err == "TOO_MANY_REQUESTS":
+                time.sleep(10.0)
             else:
-                time.sleep(5.5)
+                time.sleep(8.0)
         except Exception:
-            time.sleep(5.0)
+            time.sleep(7.5)
 
 # --- THREAD 2: AUTARKER ENERGIE- & AI-METERING ENGINE (1s Intervall) ---
 def background_metering_loop():
@@ -347,7 +351,7 @@ def background_metering_loop():
                 # 5. Erkennung: Gerät ausgesteckt
                 if watt < 0.3 and u.get("active") and not u.get("paused"):
                     global_state["consecutive_zero_w_count"] += 1
-                    if global_state["consecutive_zero_w_count"] >= 8 and u["accumulated_seconds"] > 20:
+                    if global_state["consecutive_zero_w_count"] >= 10 and u["accumulated_seconds"] > 25:
                         u["unplug_dialog_active"] = True
                         u["active"] = False
                         u["paused"] = True
