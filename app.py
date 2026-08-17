@@ -177,17 +177,17 @@ load_history()
 # =====================================================================
 def poll_shelly():
     """Pollt Shelly Cloud API. Ergebnis wird in shelly-Dict gecacht.
-    Aufgerufen aus /status (jede Sekunde vom Browser).
-    Cache: Kein neuer Poll wenn letzter < 1.5s her ist."""
+    Aufgerufen aus /status (vom Browser ca. jede Sekunde).
+    Cache: Maximal 1 Abfrage alle 2.0 Sekunden, um Rate-Limits (HTTP 429) zu vermeiden."""
     now = time.time()
-    if now - shelly["poll_time"] < 1.5:
+    if now < shelly["poll_time"] + 2.0:
         return  # Cache noch frisch
 
     try:
         r = http_requests.post(
             f"{SHELLY_CLOUD_URL}/device/status",
             data={"auth_key": AUTH_KEY, "id": DEVICE_ID},
-            timeout=3.0
+            timeout=3.5
         )
         if r.status_code == 200:
             j = r.json()
@@ -211,6 +211,10 @@ def poll_shelly():
                     shelly["error"] = f"Unbekannte Keys: {list(ds.keys())[:3]}"
             else:
                 shelly["error"] = j.get("error", "isok=false")
+        elif r.status_code == 429:
+            shelly["error"] = "Rate Limit (429)"
+            shelly["poll_time"] = now + 4.0  # 4s Pause bei Rate Limit
+            return
         else:
             shelly["error"] = f"HTTP {r.status_code}"
     except http_requests.exceptions.Timeout:
@@ -261,29 +265,30 @@ def accumulate_energy():
 
     if last and last > 0:
         dt = now - last
-        # Nur realistische dt-Werte akzeptieren (0.3s - 10s)
-        if 0.3 < dt < 10.0:
+        # Nur realistische dt-Werte akzeptieren (0.2s - 15s)
+        if 0.2 < dt < 15.0:
             w = shelly["watt"]
+            delta_wh = 0.0
             if w > 0.05:
                 delta_wh = (w * dt) / 3600.0
                 charge["total_wh"] += delta_wh
                 charge["total_kwh"] = charge["total_wh"] / 1000.0
                 charge["total_cost"] = charge["total_kwh"] * STROMPREIS_PER_KWH
 
-                # Power-History fuer KI (max 120 Punkte)
-                charge["power_history"].append((now, w))
-                if len(charge["power_history"]) > 120:
-                    charge["power_history"] = charge["power_history"][-120:]
+            # Power-History fuer KI (max 120 Punkte)
+            charge["power_history"].append((now, w))
+            if len(charge["power_history"]) > 120:
+                charge["power_history"] = charge["power_history"][-120:]
 
-                # Aktuelles Geraet aktualisieren
-                idx = charge["current_device_idx"]
-                devs = charge["devices"]
-                if 0 <= idx < len(devs):
-                    d = devs[idx]
-                    d["duration_sec"] = d.get("duration_sec", 0) + dt
-                    d["wh"] = d.get("wh", 0) + delta_wh
-                    d["cost"] = (d["wh"] / 1000.0) * STROMPREIS_PER_KWH
-                    d["peak_w"] = max(d.get("peak_w", 0), w)
+            # Aktuelles Geraet aktualisieren
+            idx = charge["current_device_idx"]
+            devs = charge["devices"]
+            if 0 <= idx < len(devs):
+                d = devs[idx]
+                d["duration_sec"] = d.get("duration_sec", 0) + dt
+                d["wh"] = d.get("wh", 0) + delta_wh
+                d["cost"] = (d["wh"] / 1000.0) * STROMPREIS_PER_KWH
+                d["peak_w"] = max(d.get("peak_w", 0), w)
 
     charge["last_wh_time"] = now
 
