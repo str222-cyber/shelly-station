@@ -618,6 +618,8 @@ def format_time(seconds):
 def get_or_create_user_session():
     if "user_id" not in session:
         session["user_id"] = str(uuid.uuid4())
+        session.permanent = True
+        session.modified = True
     uid = session["user_id"]
 
     with state_lock:
@@ -1719,6 +1721,8 @@ def get_status():
     current_device = devices_copy[curr_idx] if 0 <= curr_idx < len(devices_copy) else None
 
     return jsonify({
+        "user_id": uid,
+        "active_user_id": global_state["active_user_id"],
         "active": u.get("active", False),
         "paused": u.get("paused", False),
         "watt": w,
