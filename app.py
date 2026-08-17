@@ -176,15 +176,13 @@ charge = {
     "paused": False,
     "terminated": False,
     "relay_on": False,
-    "selected_country": "DE",  # Standard: Deutschland (19% MwSt.)
+    "selected_country": "DE",
     
-    # --- PRÄZISE PHYSIKALISCHE STECKER-ERKENNUNG (6s Debounce) ---
-    # plug_state: "CONNECTED" | "UNPLUG_PENDING" | "UNPLUGGED"
-    "plug_state": "CONNECTED",
-    "zero_current_start": None,
-    "replug_prompt": False,
-    "replug_watt": 0.0,
-    "replug_amp": 0.0,
+    # --- PRÄZISER ABSTECK- & WECHSEL-WORKFLOW ---
+    # unplug_modal: None | "ASK_UNPLUG" | "ASK_NEXT_DEVICE"
+    "unplug_modal": None,
+    "waiting_for_new_plug": False,   # True, wenn Relais wieder EIN ist und auf Ampere-Anstieg gewartet wird
+    "had_flowing": False,            # True, sobald nach Start mindestens 1x Strom floss
     "is_flowing": False,
     
     # --- ZEIT-METRIKEN (Stromfluss vs. Pausen/Leerlauf) ---
@@ -443,9 +441,6 @@ def new_device_entry(num, key="lamp"):
 
 
 def accumulate_energy():
-    if not charge["active"]:
-        return
-
     now = time.time()
     last = charge.get("last_wh_time")
 
@@ -459,36 +454,50 @@ def accumulate_energy():
     is_flowing = (a >= 0.018 or w >= 0.25)
     charge["is_flowing"] = is_flowing
 
-    # =====================================================================
-    # PRÄZISE PHYSIKALISCHE STECKER-ERKENNUNG (6.0s Entprellung)
-    # =====================================================================
-    if not is_flowing:
-        if charge["zero_current_start"] is None:
-            charge["zero_current_start"] = now
-            charge["plug_state"] = "UNPLUG_PENDING"
-        else:
-            zero_duration = now - charge["zero_current_start"]
-            # Erst wenn mindestens 6.0 Sekunden durchgehend 0 Strom fließt: Echter Steckerabzug!
-            if zero_duration >= 6.0 and charge["plug_state"] != "UNPLUGGED":
-                charge["plug_state"] = "UNPLUGGED"
-                logger.info(f"🔌 Stecker physisch abgezogen (Nullstrom seit {zero_duration:.1f}s)")
-    else:
-        if charge["plug_state"] == "UNPLUGGED":
-            # Nach echtem Unplug fließt jetzt wieder Strom -> Frage Nutzer!
-            charge["replug_prompt"] = True
-            charge["replug_watt"] = round(w, 1)
-            charge["replug_amp"] = round(a, 3)
-            charge["plug_state"] = "CONNECTED"
-            logger.info(f"⚡ Stecker wieder eingesteckt ({w:.1f} W / {a:.3f} A) -> Replug Dialog aktiv")
-        
-        charge["zero_current_start"] = None
-        if charge["plug_state"] == "UNPLUG_PENDING":
-            charge["plug_state"] = "CONNECTED"
+    if is_flowing and charge["active"]:
+        charge["had_flowing"] = True
 
     # =====================================================================
-    # ENERGIE- & ZEIT-AKKUMULATION (Stromfluss vs. Pausen)
+    # 1. PRÄZISE ERKENNUNG: ABSTECKEN EINES KABELS (AMPERE -> 0.000 A)
     # =====================================================================
-    if last and last > 0:
+    if charge["active"] and not charge["paused"] and charge["had_flowing"]:
+        if not is_flowing and (a < 0.015 and w < 0.25):
+            # Stromfluss schlagartig weg -> Sofort Zählen stoppen, Relais AUS, Frage poppt auf!
+            if charge["last_start_time"]:
+                charge["accumulated_seconds"] += time.time() - charge["last_start_time"]
+            
+            charge["active"] = False
+            charge["paused"] = True
+            charge["last_start_time"] = None
+            charge["unplug_modal"] = "ASK_UNPLUG"
+            relay_control(False)
+            logger.info("🔌 Ampere auf 0.0 A abgefallen -> Ladevorgang pausiert, Relais AUS, Modal ASK_UNPLUG geöffnet!")
+
+    # =====================================================================
+    # 2. PRÄZISE ERKENNUNG: NEUES GERÄT EINGESTECKT (AMPERE-ANSTIEG)
+    # =====================================================================
+    if charge["waiting_for_new_plug"] and is_flowing:
+        # Benutzer hat bestätigt "Neues Gerät einstecken", Relais war EIN, jetzt fließt neuer Strom!
+        charge["waiting_for_new_plug"] = False
+        charge["active"] = True
+        charge["paused"] = False
+        charge["last_start_time"] = now
+        charge["last_wh_time"] = now
+        charge["had_flowing"] = True
+        
+        next_num = len(charge["devices"]) + 1
+        new_dev = new_device_entry(next_num, "lamp")
+        charge["devices"].append(new_dev)
+        charge["current_device_idx"] = len(charge["devices"]) - 1
+        charge["power_history"] = []
+        charge["ai_result"] = None
+        charge["ai_tick"] = 0
+        logger.info(f"⚡ Neues Gerät erkannt & eingesteckt ({w:.1f} W)! Gerät #{next_num} automatisch gestartet.")
+
+    # =====================================================================
+    # 3. ENERGIE- & ZEIT-AKKUMULATION (nur bei aktivem Ladevorgang)
+    # =====================================================================
+    if charge["active"] and last and last > 0:
         dt = now - last
         if 0.2 < dt < 15.0:
             delta_wh = (w * dt) / 3600.0 if is_flowing else 0.0
@@ -500,7 +509,6 @@ def accumulate_energy():
             charge["total_vat_amount"] = charge["total_cost_netto"] * (vat_rate / 100.0)
             charge["total_cost_brutto"] = charge["total_cost_netto"] + charge["total_vat_amount"]
 
-            # Gesamte Zeiten aufschlüsseln
             if is_flowing:
                 charge["total_flow_seconds"] += dt
             else:
@@ -510,7 +518,6 @@ def accumulate_energy():
             if len(charge["power_history"]) > 120:
                 charge["power_history"] = charge["power_history"][-120:]
 
-            # Auf aktives Gerät verbuchen
             idx = charge["current_device_idx"]
             devs = charge["devices"]
             if 0 <= idx < len(devs):
@@ -532,25 +539,26 @@ def accumulate_energy():
 
     charge["last_wh_time"] = now
 
-    # KI-Klassifizierung alle 3 Status-Aufrufe
-    charge["ai_tick"] = charge.get("ai_tick", 0) + 1
-    if charge["ai_tick"] % 3 == 0 or charge["ai_result"] is None:
-        ai = DeviceAI.classify(charge["power_history"])
-        charge["ai_result"] = ai
+    # KI-Klassifizierung
+    if charge["active"]:
+        charge["ai_tick"] = charge.get("ai_tick", 0) + 1
+        if charge["ai_tick"] % 3 == 0 or charge["ai_result"] is None:
+            ai = DeviceAI.classify(charge["power_history"])
+            charge["ai_result"] = ai
 
-        idx = charge["current_device_idx"]
-        devs = charge["devices"]
-        if 0 <= idx < len(devs):
-            cur_dev = devs[idx]
-            if not cur_dev.get("user_confirmed", False) and ai.get("suggested_key") in DEVICE_PROFILES:
-                s_prof = DEVICE_PROFILES[ai["suggested_key"]]
-                cur_dev["key"] = s_prof["key"]
-                cur_dev["raw_name"] = s_prof["name"]
-                cur_dev["name"] = f"Gerät {cur_dev['num']}: {s_prof['name']}"
-                cur_dev["icon"] = s_prof["icon"]
-                cur_dev["mode"] = s_prof["mode"]
-                cur_dev["is_battery"] = s_prof["is_battery"]
-                cur_dev["nominal_wh"] = s_prof["nominal_wh"]
+            idx = charge["current_device_idx"]
+            devs = charge["devices"]
+            if 0 <= idx < len(devs):
+                cur_dev = devs[idx]
+                if not cur_dev.get("user_confirmed", False) and ai.get("suggested_key") in DEVICE_PROFILES:
+                    s_prof = DEVICE_PROFILES[ai["suggested_key"]]
+                    cur_dev["key"] = s_prof["key"]
+                    cur_dev["raw_name"] = s_prof["name"]
+                    cur_dev["name"] = f"Gerät {cur_dev['num']}: {s_prof['name']}"
+                    cur_dev["icon"] = s_prof["icon"]
+                    cur_dev["mode"] = s_prof["mode"]
+                    cur_dev["is_battery"] = s_prof["is_battery"]
+                    cur_dev["nominal_wh"] = s_prof["nominal_wh"]
 
 
 def fmt_time(s):
@@ -584,9 +592,9 @@ def scan(token):
             charge["last_report"] = None
             charge["active"] = False
             charge["paused"] = False
-            charge["plug_state"] = "CONNECTED"
-            charge["zero_current_start"] = None
-            charge["replug_prompt"] = False
+            charge["unplug_modal"] = None
+            charge["waiting_for_new_plug"] = False
+            charge["had_flowing"] = False
             charge["accumulated_seconds"] = 0.0
             charge["total_flow_seconds"] = 0.0
             charge["total_idle_seconds"] = 0.0
@@ -613,9 +621,9 @@ def reset_session():
         charge["last_report"] = None
         charge["active"] = False
         charge["paused"] = False
-        charge["plug_state"] = "CONNECTED"
-        charge["zero_current_start"] = None
-        charge["replug_prompt"] = False
+        charge["unplug_modal"] = None
+        charge["waiting_for_new_plug"] = False
+        charge["had_flowing"] = False
         charge["accumulated_seconds"] = 0.0
         charge["total_flow_seconds"] = 0.0
         charge["total_idle_seconds"] = 0.0
@@ -669,11 +677,10 @@ def get_status():
             "wh": round(charge["total_wh"], 4),
             "kwh": round(charge["total_kwh"], 6),
             
-            # Stecker-Zustand & Replug
-            "plug_state": charge["plug_state"],
-            "replug_prompt": charge["replug_prompt"],
-            "replug_watt": charge["replug_watt"],
-            "replug_amp": charge["replug_amp"],
+            # Absteck- & Wechsel-Status
+            "unplug_modal": charge["unplug_modal"],
+            "waiting_for_new_plug": charge["waiting_for_new_plug"],
+            "had_flowing": charge["had_flowing"],
             "is_flowing": charge["is_flowing"],
             
             # Mehrwertsteuer & Beträge
@@ -715,18 +722,16 @@ def start_charge():
             charge["devices"] = [new_device_entry(1, "lamp")]
             charge["current_device_idx"] = 0
 
-        if not charge["active"]:
-            charge["active"] = True
-            charge["paused"] = False
-            charge["last_start_time"] = time.time()
-            charge["last_wh_time"] = time.time()
-            if not charge["devices"]:
-                charge["devices"] = [new_device_entry(1, "lamp")]
-                charge["current_device_idx"] = 0
-            charge["power_history"] = []
-            charge["ai_result"] = None
-            charge["ai_tick"] = 0
-            logger.info(f">>> START (t_acc={charge['accumulated_seconds']:.1f}s) <<<")
+        charge["active"] = True
+        charge["paused"] = False
+        charge["unplug_modal"] = None
+        charge["waiting_for_new_plug"] = False
+        charge["last_start_time"] = time.time()
+        charge["last_wh_time"] = time.time()
+        if not charge["devices"]:
+            charge["devices"] = [new_device_entry(1, "lamp")]
+            charge["current_device_idx"] = 0
+        logger.info(f">>> START (t_acc={charge['accumulated_seconds']:.1f}s) <<<")
 
     relay_control(True)
     return jsonify({"status": "ok"})
@@ -745,29 +750,51 @@ def stop_charge():
     logger.info(f">>> PAUSE (t_acc={charge['accumulated_seconds']:.1f}s) <<<")
     return jsonify({"status": "ok"})
 
-# --- REPLUG ENTSCHEIDUNG (Dasselbe vs. Neues Gerät) ---
-@app.route('/handle_replug', methods=['POST'])
-def handle_replug():
+# =====================================================================
+# ABSTECK- & WECHSEL-WORKFLOW ENDPOINT
+# =====================================================================
+@app.route('/unplug_action', methods=['POST'])
+def unplug_action():
     data = request.get_json() or {}
-    action = data.get("action")  # "same" oder "new"
-    key = data.get("key", "lamp")
+    action = data.get("action")
+    # action: "no_resume" | "yes_unplugged" | "prep_new_device" | "finish"
 
     with lock:
-        charge["replug_prompt"] = False
-        if action == "same":
-            logger.info(f"Replug: Selbes Gerät ({charge['devices'][charge['current_device_idx']]['name']}) fortgesetzt.")
-            return jsonify({"status": "ok", "action": "same"})
-        elif action == "new":
-            next_num = len(charge["devices"]) + 1
-            new_dev = new_device_entry(next_num, key)
-            new_dev["user_confirmed"] = True
-            charge["devices"].append(new_dev)
-            charge["current_device_idx"] = len(charge["devices"]) - 1
-            charge["power_history"] = []
-            charge["ai_result"] = None
-            charge["ai_tick"] = 0
-            logger.info(f"Replug: Neues Gerät #{next_num} angelegt ({new_dev['name']}).")
-            return jsonify({"status": "ok", "action": "new", "device": new_dev})
+        if action == "no_resume":
+            # 1. Nutzer klickt: "Nein, war nur Standby/Pause -> Selbes Gerät fortsetzen"
+            charge["unplug_modal"] = None
+            charge["waiting_for_new_plug"] = False
+            charge["active"] = True
+            charge["paused"] = False
+            charge["last_start_time"] = time.time()
+            charge["last_wh_time"] = time.time()
+            relay_control(True)
+            logger.info("Unplug: Abstecken verneint -> Relais EIN, Ladevorgang auf selbem Gerät fortgesetzt.")
+            return jsonify({"status": "ok", "state": "resumed"})
+
+        elif action == "yes_unplugged":
+            # 2. Nutzer klickt: "Ja, Gerät wurde ausgesteckt" -> Wechsle zu Frage: Neues Gerät oder Beenden?
+            charge["unplug_modal"] = "ASK_NEXT_DEVICE"
+            charge["waiting_for_new_plug"] = False
+            logger.info("Unplug: Abstecken bestätigt -> Zeige Frage 'Neues Gerät einstecken?'")
+            return jsonify({"status": "ok", "state": "ask_next_device"})
+
+        elif action == "prep_new_device":
+            # 3. Nutzer klickt: "Neues Gerät einstecken" -> Schalte Steckdose EIN, warte auf Ampere-Anstieg!
+            charge["unplug_modal"] = None
+            charge["waiting_for_new_plug"] = True
+            charge["active"] = False
+            charge["paused"] = True
+            relay_control(True)
+            logger.info("Unplug: Warte auf Einstecken des neuen Geräts -> Relais EIN geschaltet!")
+            return jsonify({"status": "ok", "state": "waiting_for_plug"})
+
+        elif action == "finish":
+            # 4. Nutzer klickt: "Beenden"
+            charge["unplug_modal"] = None
+            charge["waiting_for_new_plug"] = False
+            return logout()
+
     return jsonify({"status": "error"}), 400
 
 @app.route('/set_country', methods=['POST'])
@@ -823,7 +850,8 @@ def logout():
         charge["active"] = False
         charge["paused"] = False
         charge["terminated"] = True
-        charge["replug_prompt"] = False
+        charge["unplug_modal"] = None
+        charge["waiting_for_new_plug"] = False
         charge["last_start_time"] = None
         charge["last_wh_time"] = None
 
@@ -1001,8 +1029,8 @@ def debug():
         "shelly": dict(shelly),
         "charge_active": charge["active"],
         "charge_paused": charge["paused"],
-        "plug_state": charge["plug_state"],
-        "replug_prompt": charge["replug_prompt"],
+        "unplug_modal": charge["unplug_modal"],
+        "waiting_for_new_plug": charge["waiting_for_new_plug"],
         "total_flow_seconds": charge["total_flow_seconds"],
         "total_idle_seconds": charge["total_idle_seconds"],
         "country": c_info,
@@ -1106,7 +1134,7 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 .pill-off{background:#f1f5f9;color:var(--muted);border:1px solid var(--border)}
 .pill-on{background:#ecfdf5;color:#065f46;border:1px solid #a7f3d0}
 .pill-p{background:#fffbeb;color:#92400e;border:1px solid #fde68a}
-.pill-warn{background:#fff7ed;color:#c2410c;border:1px solid #fed7aa}
+.pill-warn{background:#fee2e2;color:#b91c1c;border:1px solid #fca5a5}
 .dot{width:8px;height:8px;border-radius:50%;background:currentColor;flex-shrink:0}
 .pill-on .dot{background:#059669;box-shadow:0 0 8px rgba(5,150,105,.7)}
 .pill-p .dot{background:#d97706}
@@ -1116,6 +1144,12 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 .dev-pills{display:flex;gap:6px;overflow-x:auto;padding-bottom:8px;margin-bottom:10px;scrollbar-width:none}
 .dev-pill{font-size:11px;font-weight:700;padding:4px 10px;border-radius:20px;background:#f1f5f9;color:var(--muted);white-space:nowrap;border:1px solid var(--border)}
 .dev-pill.active{background:#eff6ff;color:var(--blue);border-color:#bfdbfe}
+
+/* BANNER: WARTE AUF EINSTECKEN DES NEUEN GERÄTS */
+.waiting-banner{background:#eff6ff;border:2px dashed #3b82f6;border-radius:16px;padding:14px;margin-bottom:12px;text-align:center;animation:pulsebox 1.5s infinite}
+@keyframes pulsebox{0%,100%{background:#eff6ff;border-color:#3b82f6}50%{background:#dbeafe;border-color:#1d4ed8}}
+.wb-title{font-size:14.5px;font-weight:800;color:#1e40af;margin-bottom:4px}
+.wb-sub{font-size:12px;color:#3b82f6;line-height:1.4}
 
 /* KI-VORSCHLAG & GERAETE-AUSWAHL */
 .ai-box{background:#f8fafc;border:1.5px solid var(--border);border-radius:18px;padding:14px;margin-bottom:12px;text-align:left;transition:border-color .2s}
@@ -1193,9 +1227,9 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 .bd{background:#fee2e2;color:var(--red)}
 
 /* MODALE */
-.modal{display:none;position:fixed;inset:0;background:rgba(9,13,22,.75);backdrop-filter:blur(5px);z-index:999;padding:16px;align-items:center;justify-content:center}
-.mbox{background:#fff;border-radius:24px;padding:22px 18px;text-align:left;max-width:390px;width:100%;max-height:90vh;overflow-y:auto;animation:pop .2s ease-out}
-@keyframes pop{from{transform:scale(.9);opacity:0}to{transform:scale(1);opacity:1}}
+.modal{display:none;position:fixed;inset:0;background:rgba(9,13,22,.8);backdrop-filter:blur(6px);z-index:999;padding:16px;align-items:center;justify-content:center}
+.mbox{background:#fff;border-radius:24px;padding:24px 20px;text-align:left;max-width:390px;width:100%;max-height:90vh;overflow-y:auto;animation:pop .2s ease-out}
+@keyframes pop{from{transform:scale(.92);opacity:0}to{transform:scale(1);opacity:1}}
 .m-sec-title{font-size:11px;font-weight:800;text-transform:uppercase;color:var(--muted);letter-spacing:.5px;margin:12px 0 6px}
 .dev-option{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border:1px solid var(--border);border-radius:12px;margin-bottom:6px;cursor:pointer;background:#ffffff;transition:background .15s, border-color .15s}
 .dev-option:hover{background:#f8fafc;border-color:var(--blue)}
@@ -1213,21 +1247,42 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 .ein{width:100%;padding:11px;border:1px solid var(--border);border-radius:10px;font-size:13.5px;margin-bottom:8px}
 </style></head><body>
 
-<!-- MODAL: UMSTECK-FRAGE (IST GERÄT WIRKLICH ABGESTECKT WORDEN?) -->
-<div id="replugModal" class="modal">
-<div class="mbox" style="text-align:center;border:2px solid var(--blue)">
-  <div style="font-size:38px;margin-bottom:6px">🔌⚡</div>
-  <div style="font-size:17px;font-weight:800;margin-bottom:6px">Ist das Gerät wirklich abgesteckt worden?</div>
-  <p style="font-size:12.5px;color:var(--muted);margin-bottom:16px">
-    Strom fließt wieder (<b id="replugWattDisplay" style="color:var(--blue)">0.0 W</b>). Wurde ein neues Gerät angeschlossen oder steckt noch dasselbe Gerät?
+<!-- DIALOG 1: WURDE GERÄT ABGESTECKT? (ABFALL AUF 0.0 A) -->
+<div id="modalAskUnplug" class="modal">
+<div class="mbox" style="text-align:center;border:2px solid var(--red)">
+  <div style="font-size:42px;margin-bottom:6px">🔌⚠️</div>
+  <div style="font-size:18px;font-weight:800;margin-bottom:6px;color:#991b1b">Stromfluss auf 0.0 A abgefallen</div>
+  <p style="font-size:13px;color:var(--muted);margin-bottom:18px;line-height:1.4">
+    Das Strom-Zählen wurde pausiert und die Steckdose sicherheitshalber <b>ausgeschaltet</b>.<br/>
+    <b>Wurde das Gerät ausgesteckt?</b>
   </p>
   
-  <div style="display:flex;flex-direction:column;gap:8px">
-    <button class="btn bs" style="background:#f8fafc;border:1.5px solid #cbd5e1;font-weight:800;font-size:14px;color:#334155;padding:13px" onclick="handleReplugChoice('same')">
-      ❌ Nein, selbes Gerät (<span id="curDevNameModal">Gerät 1</span>)
+  <div style="display:flex;flex-direction:column;gap:10px">
+    <button class="btn bp" style="background:#059669;padding:14px;font-size:14.5px" onclick="handleUnplugResponse('no_resume')">
+      ❌ Nein, gleiches Gerät (Weiterladen)
     </button>
-    <button class="btn bp" style="background:var(--blue);font-weight:800;font-size:14px;padding:13px" onclick="handleReplugChoice('new_picker')">
-      ✅ Ja, neues Gerät erfassen (<span id="nextDevNameModal">Gerät 2</span>)
+    <button class="btn bs" style="background:#fee2e2;color:#b91c1c;border:1px solid #fca5a5;padding:14px;font-size:14.5px;font-weight:800" onclick="handleUnplugResponse('yes_unplugged')">
+      ✅ Ja, Gerät ist ausgesteckt
+    </button>
+  </div>
+</div>
+</div>
+
+<!-- DIALOG 2: NEUES GERÄT EINSTECKEN ODER BEENDEN? -->
+<div id="modalAskNextDevice" class="modal">
+<div class="mbox" style="text-align:center;border:2px solid var(--blue)">
+  <div style="font-size:42px;margin-bottom:6px">🔄⚡</div>
+  <div style="font-size:18px;font-weight:800;margin-bottom:6px;color:#1e40af">Gerätewechsel & Fortfahren</div>
+  <p style="font-size:13px;color:var(--muted);margin-bottom:18px;line-height:1.4">
+    Möchtest du ein <b>neues Gerät einstecken</b> oder die Ladesitzung <b>beenden</b>?
+  </p>
+  
+  <div style="display:flex;flex-direction:column;gap:10px">
+    <button class="btn bp" style="background:var(--blue);padding:14px;font-size:14.5px" onclick="handleUnplugResponse('prep_new_device')">
+      ➕ Neues Gerät einstecken & fortfahren
+    </button>
+    <button class="btn bs" style="background:#f1f5f9;color:var(--text);padding:13px;font-size:14px" onclick="handleUnplugResponse('finish')">
+      🧾 Nein, Ladevorgang beenden
     </button>
   </div>
 </div>
@@ -1352,7 +1407,13 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 <div class="badges">
   <span class="pill pill-g">🔒 Verifiziert</span>
   <span class="pill pill-off" id="sPill"><span class="dot"></span><span id="sTxt">Bereit</span></span>
-  <span class="pill pill-warn" id="unplugPill" style="display:none">⚠️ Kein Stromfluss (0.0 A)</span>
+  <span class="pill pill-warn" id="unplugPill" style="display:none">⚠️ 0.0 A (Kein Strom)</span>
+</div>
+
+<!-- BANNER WENN AUF NEUES GERAET GEWARTET WIRD -->
+<div class="waiting-banner" id="waitingPlugBanner" style="display:none">
+  <div class="wb-title">🔌 Steckdose aktiv – Neues Gerät einstecken</div>
+  <div class="wb-sub">Stecke das nächste Gerät ein. Sobald Strom fließt, wird Gerät #2 automatisch gestartet!</div>
 </div>
 
 <!-- GERÄTE-TABS DER AKTUELLEN SITZUNG -->
@@ -1523,7 +1584,6 @@ var STROMPREIS_NETTO = 0.35;
 var currentCountry = { code: 'DE', name: 'Deutschland', flag: '🇩🇪', vat_name: 'MwSt.', rate: 19.0 };
 var currentDevice = { num: 1, name: 'Gerät 1: Lampe / Beleuchtung', mode: 'continuous', is_battery: false, nominal_wh: 0, user_confirmed: false };
 var latestAiSuggestion = null;
-var isReplugModalOpen = false;
 
 function fs(s){
   s = Math.floor(Math.max(0, s));
@@ -1587,6 +1647,9 @@ function startFreshSession(){
     document.getElementById('timeIdleText').innerText = '00:00:00';
     document.getElementById('tbFlowSeg').style.width = '0%';
     document.getElementById('tbPauseSeg').style.width = '100%';
+    document.getElementById('waitingPlugBanner').style.display = 'none';
+    hideM('modalAskUnplug');
+    hideM('modalAskNextDevice');
     poll();
   });
 }
@@ -1619,16 +1682,17 @@ function devAct(a){
   }
 }
 
-// AUTOMATISCHE UMSTECK-BEHANDLUNG
-function handleReplugChoice(choice){
-  hideM('replugModal');
-  isReplugModalOpen = false;
-  if(choice === 'same'){
-    post('/handle_replug', { action: 'same' }).then(function(){ poll(); });
-  } else if(choice === 'new_picker'){
-    showM('devModal');
-    post('/handle_replug', { action: 'new', key: 'lamp' }).then(function(){ poll(); });
-  }
+// ABSTECK- & WECHSEL-ANTWORTEN
+function handleUnplugResponse(action){
+  hideM('modalAskUnplug');
+  hideM('modalAskNextDevice');
+  post('/unplug_action', { action: action }).then(function(res){
+    if(action === 'finish'){
+      showReceipt(res);
+    } else {
+      poll();
+    }
+  });
 }
 
 function chooseCountry(code){
@@ -1880,9 +1944,29 @@ function poll(){
       }
     }
 
+    // Modal Status Management
+    if(d.unplug_modal === 'ASK_UNPLUG'){
+      showM('modalAskUnplug');
+      hideM('modalAskNextDevice');
+    } else if(d.unplug_modal === 'ASK_NEXT_DEVICE'){
+      hideM('modalAskUnplug');
+      showM('modalAskNextDevice');
+    } else {
+      hideM('modalAskUnplug');
+      hideM('modalAskNextDevice');
+    }
+
+    // Waiting for new plug banner
+    var wb = document.getElementById('waitingPlugBanner');
+    if(d.waiting_for_new_plug){
+      wb.style.display = 'block';
+    } else {
+      wb.style.display = 'none';
+    }
+
     // Stecker gezogen Indikator
     var unplugPill = document.getElementById('unplugPill');
-    if(!d.is_flowing && d.active && d.plug_state === 'UNPLUGGED'){
+    if(!d.is_flowing && (d.active || d.paused) && d.had_flowing){
       unplugPill.style.display = 'inline-flex';
     } else {
       unplugPill.style.display = 'none';
@@ -1890,16 +1974,6 @@ function poll(){
 
     // DYNAMISCHES SCHAUBILD (PAUSEN & STROMFLUSS)
     updateTimelineVisual(flowSec, idleSec);
-
-    // AUTOMATISCHES UMSTECK-DIALOGFENSTER
-    if(d.replug_prompt && !isReplugModalOpen){
-      isReplugModalOpen = true;
-      document.getElementById('replugWattDisplay').innerText = (d.replug_watt || curW).toFixed(1) + ' W';
-      var curDevNum = (d.active_device && d.active_device.num) ? d.active_device.num : 1;
-      document.getElementById('curDevNameModal').innerText = 'Gerät ' + curDevNum;
-      document.getElementById('nextDevNameModal').innerText = 'Gerät ' + (curDevNum + 1);
-      showM('replugModal');
-    }
 
     // Geräte-Tabs
     renderDevicePills(d.devices, d.current_device_idx);
