@@ -215,8 +215,6 @@ charge = {
     "devices": [],
     "current_device_idx": 0,
     "last_report": None,
-    "owner_client_id": None,
-    "owner_since": None,
 }
 
 history_records = []
@@ -451,76 +449,6 @@ class DeviceAI:
             "avg_w": round(aw, 2),
             "current_w": round(cw, 2)
         }
-
-    @classmethod
-    def estimate_battery_state(cls, dev_key, current_w, peak_w, wh_loaded, nominal_wh, power_history=None):
-        if not nominal_wh or nominal_wh <= 0:
-            nominal_wh = 65.0
-
-        profile_typical_max_w = {
-            "phone": 18.0,
-            "laptop": 65.0,
-            "ebike": 180.0,
-            "ebike_fast": 350.0,
-            "battery_custom": 80.0
-        }.get(dev_key, 65.0)
-
-        ref_peak_w = max(peak_w, current_w, profile_typical_max_w * 0.7)
-        w_ratio = current_w / ref_peak_w if ref_peak_w > 0 else 0.0
-        energy_added_pct = (wh_loaded / nominal_wh) * 100.0 if nominal_wh > 0 else 0.0
-
-        if current_w < 0.2:
-            phase_key = "idle"
-            phase_name = "Standby / Kein Stromfluss"
-            phase_desc = "Kein messbarer Ladevorgang aktiv"
-            phase_badge = "⏸️ Standby"
-            soc_est = min(100.0, max(0.0, energy_added_pct))
-        elif w_ratio >= 0.65:
-            phase_key = "cc_bulk"
-            phase_name = "⚡ Hauptladung (CC-Phase / Volle Leistung)"
-            phase_desc = f"Akku nimmt maximale Ladeleistung ({current_w:.1f} W) auf (Schnellladebereich 15–75%)"
-            phase_badge = "⚡ CC-Hauptladung"
-            base_soc = 20.0
-            soc_est = min(75.0, base_soc + energy_added_pct * 0.75)
-        elif w_ratio >= 0.20:
-            phase_key = "cv_saturation"
-            phase_name = "🔋 Sättigungsphase (CV-Phase / Akku fast voll)"
-            phase_desc = f"Leistung sinkt auf {current_w:.1f} W ab, Zellenspannung erreicht Maximum (75–92%)"
-            phase_badge = "🔋 CV-Sättigung"
-            norm_fall = (0.65 - w_ratio) / 0.45
-            soc_est = min(93.0, max(75.0, 75.0 + norm_fall * 15.0 + energy_added_pct * 0.2))
-        elif w_ratio >= 0.04:
-            phase_key = "trickle"
-            phase_name = "✨ Abschluss & Balancing (Nahezu voll)"
-            phase_desc = f"Minimale Restleistung ({current_w:.1f} W) zum Ausgleichen der Akkuzellen (93–99%)"
-            phase_badge = "✨ 95-100% Balancing"
-            soc_est = min(99.0, max(93.0, 93.0 + energy_added_pct * 0.1))
-        else:
-            phase_key = "full"
-            phase_name = "🏁 Ladevorgang abgeschlossen (100% Voll)"
-            phase_desc = "Akku ist vollständig geladen"
-            phase_badge = "🏁 100% Voll"
-            soc_est = 100.0
-
-        soc_pct = int(round(min(100.0, max(5.0, soc_est))))
-        wh_left_100 = max(0.0, nominal_wh * (1.0 - soc_pct / 100.0))
-        wh_left_80 = max(0.0, nominal_wh * (0.80 - soc_pct / 100.0))
-        eta_min_100 = int(round((wh_left_100 / current_w) * 60)) if current_w > 0.5 else 0
-        eta_min_80 = int(round((wh_left_80 / current_w) * 60)) if current_w > 0.5 and soc_pct < 80 else 0
-
-        return {
-            "is_battery": True,
-            "soc_percent": soc_pct,
-            "phase_key": phase_key,
-            "phase_name": phase_name,
-            "phase_desc": phase_desc,
-            "phase_badge": phase_badge,
-            "wh_needed_100": round(wh_left_100, 1),
-            "wh_needed_80": round(wh_left_80, 1),
-            "eta_minutes_100": eta_min_100,
-            "eta_minutes_80": eta_min_80
-        }
-
 
 
 # =====================================================================
@@ -840,15 +768,14 @@ def accumulate_energy():
                     d["cost"] = d["cost_brutto"]
                     d["peak_w"] = max(d.get("peak_w", 0), w)
 
-                    # --- 80% & 100% AKKU-ABSCHALTAUTOMATIK & DROSSELUNGS-ERKENNUNG ---
+                    # --- 80% & 100% AKKU-ABSCHALTAUTOMATIK ---
                     if d.get("is_battery") and d.get("nominal_wh", 0) > 0:
                         nom_wh = d["nominal_wh"]
                         cur_wh = d["wh"]
-                        peak_w = d.get("peak_w", 0.0)
                         soc_pct = (cur_wh / nom_wh) * 100.0
 
-                        # Fall A: 80% Akkuschutz schlägt an (wenn nicht explizit auf 100% freigegeben)
-                        if soc_pct >= 80.0 and not d.get("charge_to_100", False) and not d.get("notified_80", False) and not d.get("notified_100", False):
+                        # Fall A: 80% Akkuschutz schlägt an
+                        if soc_pct >= 80.0 and not d.get("charge_to_100", False) and not d.get("notified_80", False):
                             d["notified_80"] = True
                             charge["active"] = False
                             charge["paused"] = True
@@ -856,17 +783,14 @@ def accumulate_energy():
                             relay_control(False)
                             logger.info(f"🔋 80% Akkuschutz erreicht ({cur_wh:.2f} Wh / {nom_wh} Wh) -> Relais AUS, Modal BATTERY_80!")
 
-                        # Fall B: 100% Vollladung & BMS-Drosselung erkannt
-                        # Triggert wenn:
-                        # 1. SoC rechnerisch >= 95% erreicht ODER
-                        # 2. Akku hatte vorher substantielle Ladeleistung (Peak >= 15W, Dauer >= 20s) und ist nun auf <= 2.2W gedrosselt (BMS-Ladeschluss)
-                        is_throttled_full = (peak_w >= 15.0 and d.get("flow_duration_sec", 0) >= 20.0 and w <= 2.2 and w > 0.02)
-                        is_wh_full = (soc_pct >= 95.0 and w < 10.0)
-
-                        if (is_throttled_full or is_wh_full) and not d.get("notified_100", False):
+                        # Fall B: 100% Vollladung erreicht
+                        elif (soc_pct >= 100.0 or (soc_pct >= 92.0 and w < 1.5)) and d.get("charge_to_100", False) and not d.get("notified_100", False):
                             d["notified_100"] = True
+                            charge["active"] = False
+                            charge["paused"] = True
                             charge["battery_modal"] = "BATTERY_100"
-                            logger.info(f"🔋 100% Akku voll geladen / gedrosselt ({w:.1f} W / Peak {peak_w:.1f} W) -> Modal BATTERY_100!")
+                            relay_control(False)
+                            logger.info(f"🔋 100% Akku voll geladen ({cur_wh:.2f} Wh / {nom_wh} Wh) -> Relais AUS, Modal BATTERY_100!")
 
             else:
                 # Standby / Pause-Zeit nur buchen, wenn Session läuft und (Relais aus ODER Cooldown abgelaufen)
@@ -905,15 +829,6 @@ def accumulate_energy():
 # =====================================================================
 # KONTINUIERLICHER SERVER-SEITIGER HINTERGRUND-THREAD (24/7 DAEMON)
 # =====================================================================
-
-active_clients = {}
-
-def get_client_type():
-    ua = request.headers.get('User-Agent', '')
-    if any(k in ua.lower() for k in ['mobile', 'android', 'iphone', 'ipad']):
-        return "Smartphone / Tablet"
-    return "Laptop / PC-Browser"
-
 daemon_pid = None
 daemon_lock = threading.Lock()
 
@@ -949,40 +864,9 @@ def fmt_time(s):
 # =====================================================================
 # ROUTES
 # =====================================================================
-
-def get_client_id():
-    cid = session.get("client_id")
-    if not cid:
-        cid = uuid.uuid4().hex[:12]
-        session["client_id"] = cid
-        session.permanent = True
-    return cid
-
-def check_client_control():
-    cid = get_client_id()
-    owner = charge.get("owner_client_id")
-    if owner is None:
-        charge["owner_client_id"] = cid
-        charge["owner_since"] = time.time()
-        return True
-    return owner == cid
-
 @app.before_request
 def check_worker_daemon():
     ensure_daemon_started()
-    try:
-        cid = get_client_id()
-        now = time.time()
-        active_clients[cid] = {
-            "last_seen": now,
-            "type": get_client_type(),
-            "ip": request.remote_addr
-        }
-        stale = [k for k, v in active_clients.items() if now - v["last_seen"] > 25.0]
-        for k in stale:
-            active_clients.pop(k, None)
-    except Exception:
-        pass
 
 @app.after_request
 def headers(r):
@@ -1002,59 +886,41 @@ def scan(token):
         session["station_verified"] = True
         session.permanent = True
         session.modified = True
-        cid = get_client_id()
         with lock:
-            has_existing = (
-                charge.get("owner_client_id") is not None or
-                charge["active"] or
-                charge["paused"] or
-                charge.get("total_wh", 0.0) > 0.005 or
-                len(charge.get("devices", [])) > 1 or
-                charge.get("session_start_time") is not None
-            )
-            is_same_owner = (charge.get("owner_client_id") == cid)
-
-            if not has_existing:
-                charge["owner_client_id"] = cid
-                charge["owner_since"] = time.time()
-                charge["terminated"] = False
-                charge["last_report"] = None
-                charge["active"] = True
-                charge["paused"] = False
-                charge["relay_on"] = True
-                charge["unplug_modal"] = None
-                charge["battery_modal"] = None
-                charge["power_shift_modal"] = None
-                charge["power_shift_cooldown_until"] = 0.0
-                charge["last_stable_w"] = 0.0
-                charge["stable_samples_count"] = 0
-                charge["unplug_cooldown_until"] = 0.0
-                charge["flow_continuous_seconds"] = 0.0
-                charge["waiting_for_new_plug"] = False
-                charge["target_is_new"] = True
-                charge["had_flowing"] = False
-                charge["session_start_time"] = None
-                charge["total_session_seconds"] = 0.0
-                charge["total_flow_seconds"] = 0.0
-                charge["total_idle_seconds"] = 0.0
-                charge["last_wh_time"] = None
-                charge["total_wh"] = 0.0
-                charge["total_kwh"] = 0.0
-                charge["total_cost_netto"] = 0.0
-                charge["total_vat_amount"] = 0.0
-                charge["total_cost_brutto"] = 0.0
-                charge["power_history"] = []
-                charge["ai_result"] = None
-                charge["ai_tick"] = 0
-                charge["devices"] = [new_device_entry(1, "lamp")]
-                charge["current_device_idx"] = 0
-                logger.info(f">>> QR-CODE GESCANNT -> NEUE STATION INITIALISIERT FÜR CLIENT {cid} <<<")
-                relay_control(True)
-                return redirect(url_for('index'))
-            else:
-                logger.info(f">>> QR-CODE GESCANNT -> LAUFENDE SITZUNG ERKANNT (Owner={charge.get('owner_client_id')}, Caller={cid}) <<<")
-                relay_control(True)
-                return redirect(url_for('index', join='1' if not is_same_owner else None))
+            charge["terminated"] = False
+            charge["last_report"] = None
+            charge["active"] = True
+            charge["paused"] = False
+            charge["relay_on"] = True
+            charge["unplug_modal"] = None
+            charge["battery_modal"] = None
+            charge["power_shift_modal"] = None
+            charge["power_shift_cooldown_until"] = 0.0
+            charge["last_stable_w"] = 0.0
+            charge["stable_samples_count"] = 0
+            charge["unplug_cooldown_until"] = 0.0
+            charge["flow_continuous_seconds"] = 0.0
+            charge["waiting_for_new_plug"] = False
+            charge["target_is_new"] = True
+            charge["had_flowing"] = False
+            charge["session_start_time"] = None
+            charge["total_session_seconds"] = 0.0
+            charge["total_flow_seconds"] = 0.0
+            charge["total_idle_seconds"] = 0.0
+            charge["last_wh_time"] = None
+            charge["total_wh"] = 0.0
+            charge["total_kwh"] = 0.0
+            charge["total_cost_netto"] = 0.0
+            charge["total_vat_amount"] = 0.0
+            charge["total_cost_brutto"] = 0.0
+            charge["power_history"] = []
+            charge["ai_result"] = None
+            charge["ai_tick"] = 0
+            charge["devices"] = [new_device_entry(1, "lamp")]
+            charge["current_device_idx"] = 0
+        relay_control(True)
+        logger.info(">>> QR-CODE GESCANNT -> RELAIS SOFORT EIN & BEREIT FÜR STROMFLUSS <<<")
+        return redirect(url_for('index'))
     return "Ungültiger Token.", 403
 
 @app.route('/reset_session', methods=['POST', 'GET'])
@@ -1095,15 +961,6 @@ def reset_session():
     logger.info(">>> SITZUNG ZURÜCKGESETZT -> RELAIS SOFORT EIN & BEREIT FÜR STROMFLUSS <<<")
     return jsonify({"status": "ok"})
 
-@app.route('/claim_control', methods=['POST'])
-def claim_control():
-    cid = get_client_id()
-    with lock:
-        charge["owner_client_id"] = cid
-        charge["owner_since"] = time.time()
-        logger.info(f"📲 Steuerung der Station exklusiv auf Client {cid} übertragen!")
-        return jsonify({"status": "ok", "is_owner": True, "client_id": cid})
-
 
 # =====================================================================
 # KI-LADEASSISTENT & CHATBOT BACKEND
@@ -1122,10 +979,9 @@ class StationChatbot:
         w = station_state.get("watt", 0.0)
         wh = station_state.get("wh", 0.0)
         cost = station_state.get("cost_brutto", 0.0)
-        batt = station_state.get("battery_state") or {}
-        soc = batt.get("soc_percent", 50)
-        phase = batt.get("phase_name", "Hauptladung")
-        eta = batt.get("eta_minutes_100", 0)
+        nom_wh = active_dev.get("nominal_wh", 500.0)
+        is_batt = active_dev.get("is_battery", False) or active_dev.get("mode") == "battery"
+        cur_wh = active_dev.get("wh", 0.0)
 
         # 1. Feedback / Feature Requests
         if any(k in t for k in ["feedback", "vorschlag", "feature", "idee", "verbesser", "wunsch", "könnt ihr", "bitte einbauen"]):
@@ -1135,10 +991,13 @@ class StationChatbot:
         # 2. Restzeit & Dauer
         if any(k in t for k in ["restzeit", "dauer", "wie lange", "wann fertig", "zeit", "fertig"]):
             if w > 0.5:
-                if eta > 0:
-                    return f"⏱️ Bei aktueller Leistung ({w:.1f} W) benötigt {dev_name} noch ca. **{eta} Minuten** bis zur vollständigen Ladung (100%). Der aktuelle Ladestand liegt bei ca. **{soc}%**."
+                if is_batt and nom_wh > 0:
+                    wh_left = max(0.0, nom_wh - cur_wh)
+                    eta_min = int(round((wh_left / w) * 60))
+                    soc_pct = int(round(min(100.0, (cur_wh / nom_wh) * 100.0)))
+                    return f"⏱️ Bei aktueller Ladeleistung ({w:.1f} W) benötigt {dev_name} noch ca. **{eta_min} Minuten** bis zur vollständigen Ladung (100%)."
                 else:
-                    return f"⚡ {dev_name} lädt aktuell mit **{w:.1f} W**. Der Akku ist bereits nahezu vollständig geladen (< 5 Min Restzeit)."
+                    return f"⚡ {dev_name} bezieht aktuell kontinuierlich **{w:.1f} W**."
             else:
                 return f"⏸️ Aktuell fließt kein Strom (0.0 W). Sobald Strom fließt, berechne ich die genaue Restzeit für {dev_name}."
 
@@ -1149,7 +1008,7 @@ class StationChatbot:
         # 4. Ladephase & Drosselung
         if any(k in t for k in ["phase", "cv", "cc", "drossel", "langsamer", "warum weniger", "balanc"]):
             return (
-                f"🔋 **Aktuelle Ladephase:** {phase}\n\n"
+                f"🔋 **Akku-Ladephasen Erklärung:**\n\n"
                 f"• **CC-Phase (Hauptladung):** Maximaler Ladestrom bis ca. 75–80%.\n"
                 f"• **CV-Phase (Sättigung):** Die Spannung erreicht das Maximum und der Strom wird kontinuierlich gedrosselt, um die Akkuzellen zu schonen.\n"
                 f"• **Balancing (95–100%):** Minimaler Reststrom zum perfekten Ausgleich der Zellen."
@@ -1205,24 +1064,11 @@ def ai_chat():
         curr_idx = charge["current_device_idx"]
         devs = charge["devices"]
         active_dev = devs[curr_idx] if 0 <= curr_idx < len(devs) else {}
-        batt_state = None
-        if active_dev.get("is_battery"):
-            hist_watts = [float(item[1]) if isinstance(item, (tuple, list)) else float(item) for item in charge.get("power_history", [])]
-            pw = max(hist_watts or [shelly["watt"]])
-            batt_state = DeviceAI.estimate_battery_state(
-                active_dev.get("key", "ebike"),
-                shelly["watt"],
-                pw,
-                active_dev.get("wh", 0.0),
-                active_dev.get("nominal_wh", 500.0),
-                charge.get("power_history", [])
-            )
         state_snap = {
             "active_device": active_dev,
             "watt": shelly["watt"],
             "wh": charge["total_wh"],
             "cost_brutto": charge["total_cost_brutto"],
-            "battery_state": batt_state,
             "paused": charge["paused"],
             "active": charge["active"]
         }
@@ -1257,42 +1103,7 @@ def get_status():
             live_watt = round(shelly["watt"], 3)
             live_amp  = round(shelly["amp"], 3)
 
-        # KI-Berechnung von Ladephase und SoC für das aktive Gerät
-        batt_state = None
-        is_batt = active_dev.get("is_battery", False) or active_dev.get("mode") == "battery"
-        if is_batt:
-            hist_watts = [float(item[1]) if isinstance(item, (tuple, list)) else float(item) for item in charge.get("power_history", [])]
-            pw = max(hist_watts or [live_watt])
-            batt_state = DeviceAI.estimate_battery_state(
-                active_dev.get("key", "ebike"),
-                live_watt,
-                pw,
-                active_dev.get("wh", 0.0),
-                active_dev.get("nominal_wh", 500.0),
-                charge.get("power_history", [])
-            )
-
-        cid = get_client_id()
-        owner = charge.get("owner_client_id")
-
-        if owner is None:
-            charge["owner_client_id"] = cid
-            charge["owner_since"] = time.time()
-            owner = cid
-            is_owner = True
-        else:
-            is_owner = (owner == cid)
-
-        other_clients = {k: v for k, v in active_clients.items() if k != cid}
-        has_other_clients = len(other_clients) > 0
-        other_dev_type = list(other_clients.values())[0]["type"] if other_clients else "Anderes Gerät"
-
         return jsonify({
-            "is_owner": is_owner,
-            "has_owner": True,
-            "has_other_clients": has_other_clients,
-            "other_device_type": other_dev_type,
-            "battery_state": batt_state,
             "active": charge["active"],
             "paused": charge["paused"],
             "terminated": charge["terminated"],
@@ -1612,10 +1423,6 @@ def battery_action():
             return jsonify({"status": "ok", "charge_to_100": True})
         elif action == "finish":
             return logout()
-        elif action == "change_device":
-            return jsonify({"status": "ok", "action": "change_device"})
-        elif action == "dismiss":
-            return jsonify({"status": "ok", "action": "dismiss"})
 
     return jsonify({"status": "error"}), 400
 
@@ -1682,7 +1489,6 @@ def logout():
         charge["active"] = False
         charge["paused"] = False
         charge["terminated"] = True
-        charge["owner_client_id"] = None
         charge["unplug_modal"] = None
         charge["battery_modal"] = None
         charge["power_shift_modal"] = None
@@ -1928,46 +1734,6 @@ def admin_override():
 # HTML UI TEMPLATES
 # =====================================================================
 
-LOCK_HTML = """<!DOCTYPE html>
-<html lang="de"><head><meta charset="utf-8"><title>Smart Power Hub</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<style>
-*{box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:0;padding:0}
-body{background:#090d16;color:#f8fafc;display:flex;justify-content:center;align-items:center;min-height:100vh;padding:16px}
-.card{background:#111827;border-radius:24px;padding:32px 24px;border:1px solid #1f2937;text-align:center;max-width:440px;width:100%;box-shadow:0 25px 50px -12px rgba(0,0,0,.5)}
-h1{font-size:22px;font-weight:800;margin:16px 0 8px}
-p{font-size:13.5px;color:#94a3b8;line-height:1.5;margin-bottom:20px}
-.tbox{background:#0f172a;border:1px dashed #3b82f6;border-radius:14px;padding:14px;margin-bottom:20px;text-align:left}
-.tlbl{font-size:11px;text-transform:uppercase;color:#60a5fa;font-weight:700;margin-bottom:4px}
-.tcode{font-family:monospace;font-size:13px;word-break:break-all}
-.btn{display:block;width:100%;padding:14px;font-size:15px;font-weight:700;background:#3b82f6;color:#fff;border:none;border-radius:14px;text-decoration:none;cursor:pointer;margin-top:10px}
-.btn2{background:transparent;border:1px solid #1f2937;color:#94a3b8;font-size:12px;padding:9px}
-
-.chat-chip {
-  background: #eff6ff;
-  color: #1e40af;
-  border: 1px solid #bfdbfe;
-  font-size: 11px;
-  font-weight: 700;
-  padding: 4px 10px;
-  border-radius: 12px;
-  cursor: pointer;
-  display: inline-block;
-}
-.chat-chip:hover {
-  background: #dbeafe;
-}
-
-</style></head><body>
-<div class="card">
-<div style="font-size:54px">🔒</div>
-<h1>Vor-Ort-Sicherheitsprüfung</h1>
-<p>Scanne den QR-Code an der Ladestation.</p>
-<div class="tbox"><div class="tlbl">Token:</div><div class="tcode">{{ required_token }}</div></div>
-<a href="/scan/{{ required_token }}" class="btn">📲 Station freischalten</a>
-<a href="/admin" class="btn btn2" style="margin-top:12px;text-decoration:none">⚙️ Admin</a>
-</div></body></html>"""
-
 
 ADMIN_HTML = """<!DOCTYPE html>
 <html lang="de"><head><meta charset="utf-8"><title>Admin Cockpit – Smart Power Hub</title>
@@ -1991,42 +1757,26 @@ body{background:var(--bg);color:var(--text);padding:16px;display:flex;justify-co
 .btn-act{padding:8px 14px;border-radius:10px;border:none;cursor:pointer;font-weight:700;font-size:12px}
 .btn-on{background:var(--green);color:#fff}
 .btn-off{background:var(--red);color:#fff}
-
-.chat-chip {
-  background: #eff6ff;
-  color: #1e40af;
-  border: 1px solid #bfdbfe;
-  font-size: 11px;
-  font-weight: 700;
-  padding: 4px 10px;
-  border-radius: 12px;
-  cursor: pointer;
-  display: inline-block;
-}
-.chat-chip:hover {
-  background: #dbeafe;
-}
-
 </style></head><body>
 
 <!-- CHATBOT FLOATING ACTION BUTTON -->
-<div id="chatFab" onclick="toggleChat()" style="position:fixed;bottom:20px;right:20px;z-index:9000;background:var(--blue);color:#fff;border-radius:30px;padding:10px 16px;box-shadow:0 4px 14px rgba(37,99,235,0.35);cursor:pointer;display:flex;align-items:center;gap:8px;font-size:13px;font-weight:700">
+<div id="chatFab" onclick="toggleChat()" style="position:fixed;bottom:20px;right:20px;z-index:9000;background:#2563eb;color:#fff;border-radius:30px;padding:10px 16px;box-shadow:0 4px 14px rgba(37,99,235,0.35);cursor:pointer;display:flex;align-items:center;gap:8px;font-size:13px;font-weight:700">
   <span style="font-size:18px">💬</span> <span id="chatFabTxt">KI-Assistent</span>
 </div>
 
 <!-- CHATBOT DRAWER FENSTER -->
-<div id="chatDrawer" style="display:none;position:fixed;bottom:75px;right:20px;width:340px;max-width:calc(100vw - 40px);height:420px;background:#fff;border-radius:18px;box-shadow:0 10px 30px rgba(0,0,0,0.18);border:1px solid var(--border);z-index:9000;flex-direction:column;overflow:hidden">
-  <div style="background:var(--card);border-bottom:1px solid var(--border);padding:12px 16px;display:flex;justify-content:space-between;align-items:center">
+<div id="chatDrawer" style="display:none;position:fixed;bottom:75px;right:20px;width:340px;max-width:calc(100vw - 40px);height:420px;background:#fff;border-radius:18px;box-shadow:0 10px 30px rgba(0,0,0,0.18);border:1px solid #e2e8f0;z-index:9000;flex-direction:column;overflow:hidden">
+  <div style="background:#f8fafc;border-bottom:1px solid #e2e8f0;padding:12px 16px;display:flex;justify-content:space-between;align-items:center">
     <div style="display:flex;align-items:center;gap:8px">
       <span style="font-size:20px">🤖</span>
       <div>
-        <div style="font-size:13.5px;font-weight:800;color:var(--text)">Smart Lade-Assistent</div>
+        <div style="font-size:13.5px;font-weight:800;color:#090d16">Smart Lade-Assistent</div>
         <div style="font-size:10.5px;color:#059669;display:flex;align-items:center;gap:4px">
           <span style="width:6px;height:6px;background:#059669;border-radius:50%"></span> Online & Live verbunden
         </div>
       </div>
     </div>
-    <button onclick="toggleChat()" style="background:none;border:none;font-size:18px;cursor:pointer;color:var(--muted);padding:4px">✕</button>
+    <button onclick="toggleChat()" style="background:none;border:none;font-size:18px;cursor:pointer;color:#64748b;padding:4px">✕</button>
   </div>
   
   <div id="chatMsgList" style="flex:1;overflow-y:auto;padding:12px 14px;display:flex;flex-direction:column;gap:10px;background:#f8fafc;font-size:12.5px">
@@ -2036,99 +1786,78 @@ body{background:var(--bg);color:var(--text);padding:16px;display:flex;justify-co
   </div>
   
   <div style="padding:6px 12px;background:#fff;border-top:1px solid #f1f5f9;display:flex;gap:6px;overflow-x:auto;white-space:nowrap">
-    <span class="chat-chip" onclick="sendQuickPrompt('Wie lange dauert das Laden noch?')">🔋 Restzeit?</span>
-    <span class="chat-chip" onclick="sendQuickPrompt('Was kostet das Laden bisher?')">💶 Kosten?</span>
-    <span class="chat-chip" onclick="sendQuickPrompt('Was bedeutet die Ladephase?')">💡 Ladephase?</span>
+    <span style="background:#eff6ff;color:#1e40af;border:1px solid #bfdbfe;font-size:11px;font-weight:700;padding:4px 10px;border-radius:12px;cursor:pointer" onclick="sendQuickPrompt('Wie lange dauert das Laden noch?')">🔋 Restzeit?</span>
+    <span style="background:#eff6ff;color:#1e40af;border:1px solid #bfdbfe;font-size:11px;font-weight:700;padding:4px 10px;border-radius:12px;cursor:pointer" onclick="sendQuickPrompt('Was kostet das Laden bisher?')">💶 Kosten?</span>
+    <span style="background:#eff6ff;color:#1e40af;border:1px solid #bfdbfe;font-size:11px;font-weight:700;padding:4px 10px;border-radius:12px;cursor:pointer" onclick="sendQuickPrompt('Was bedeutet die Ladephase?')">💡 Ladephase?</span>
   </div>
   
-  <form onsubmit="handleChatSubmit(event)" style="display:flex;gap:6px;padding:10px 12px;background:#fff;border-top:1px solid var(--border);margin:0">
-    <input id="chatInput" type="text" placeholder="Frage stellen oder Feedback..." style="flex:1;padding:9px 12px;border:1.5px solid var(--border);border-radius:20px;font-size:12.5px;outline:none" />
-    <button type="submit" style="background:var(--blue);color:#fff;border:none;border-radius:50%;width:34px;height:34px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:14px">➤</button>
+  <form onsubmit="handleChatSubmit(event)" style="display:flex;gap:6px;padding:10px 12px;background:#fff;border-top:1px solid #e2e8f0;margin:0">
+    <input id="chatInput" type="text" placeholder="Frage stellen oder Feedback..." style="flex:1;padding:9px 12px;border:1.5px solid #e2e8f0;border-radius:20px;font-size:12.5px;outline:none" />
+    <button type="submit" style="background:#2563eb;color:#fff;border:none;border-radius:50%;width:34px;height:34px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:14px">➤</button>
   </form>
 </div>
 
 <div class="wrap">
   <div class="hdr">
-    <div>
-      <div class="title">⚙️ Administrator Dashboard</div>
-      <div style="font-size:12px;color:var(--muted);margin-top:2px">
-        Shelly Plug S (Gen 3) | ID: <code>{{ device_id }}</code> | Station Token: <code>{{ physical_token }}</code>
-      </div>
-    </div>
-    <div style="display:flex;align-items:center;gap:8px">
-      <a href="/scan/{{ physical_token }}" class="btn-act" style="background:#2563eb;color:#fff;text-decoration:none">📲 Zum Cockpit</a>
-    </div>
+    <div class="title">⚡ Smart Power Hub • Admin Cockpit</div>
+    <div><a href="/" style="color:var(--blue);text-decoration:none;font-size:13px;font-weight:700">📲 Zum Lade-Cockpit</a></div>
   </div>
-
   <div class="grid">
-    <div class="scard">
-      <div class="slbl">Live Leistung</div>
-      <div class="sval" style="color:var(--blue)">{{ "%.1f"|format(live_watt) }} W</div>
-      <div class="ssub">{{ "%.3f"|format(live_amp) }} A | {{ "%.1f"|format(live_volt) }} V</div>
-    </div>
-    <div class="scard">
-      <div class="slbl">Einnahmen Heute</div>
-      <div class="sval" style="color:var(--green)">{{ "%.4f"|format(today_revenue) }} €</div>
-      <div class="ssub">{{ today_sessions }} Ladevorgänge | {{ "%.1f"|format(today_wh) }} Wh</div>
-    </div>
-    <div class="scard">
-      <div class="slbl">Einnahmen Gesamt</div>
-      <div class="sval" style="color:#a855f7">{{ "%.4f"|format(total_revenue) }} €</div>
-      <div class="ssub">{{ total_sessions }} Sitzungen | {{ "%.3f"|format(total_kwh) }} kWh</div>
-    </div>
-    <div class="scard">
-      <div class="slbl">Relais-Status</div>
-      <div class="sval" style="color:{% if relay_on %}var(--green){% else %}var(--red){% endif %}">
-        {% if relay_on %}⚡ EIN{% else %}⏹️ AUS{% endif %}
-      </div>
-      <div class="ssub">Session: {% if live_active %}Aktiv{% else %}Inaktiv / Bereit{% endif %}</div>
+    <div class="scard"><div class="slbl">Einnahmen Heute (Brutto)</div><div class="sval" style="color:var(--green)">{{ "%.4f"|format(today_revenue) }} €</div><div class="ssub">{{ today_sessions }} Ladesitzungen</div></div>
+    <div class="scard"><div class="slbl">Gesamteinnahmen</div><div class="sval" style="color:var(--blue)">{{ "%.4f"|format(total_revenue) }} €</div><div class="ssub">{{ total_sessions }} Sitzungen gesamt</div></div>
+    <div class="scard"><div class="slbl">Geladene Energie Heute</div><div class="sval">{{ "%.2f"|format(today_wh) }} Wh</div><div class="ssub">{{ "%.4f"|format(today_wh / 1000.0) }} kWh</div></div>
+    <div class="scard"><div class="slbl">Gesamtenergie</div><div class="sval">{{ "%.4f"|format(total_kwh) }} kWh</div><div class="ssub">Verbrauch aller Sitzungen</div></div>
+  </div>
+  <div class="box">
+    <div style="font-size:15px;font-weight:800;margin-bottom:12px">⚡ Live-Status & Relais-Steuerung</div>
+    <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap">
+      <div>Status: <b>{{ "AKTIV (Strom ein)" if live_active else "STANDBY / AUS" }}</b></div>
+      <div>Leistung: <b>{{ "%.1f"|format(live_watt) }} W</b></div>
+      <div>Strom: <b>{{ "%.3f"|format(live_amp) }} A</b></div>
+      <div>Spannung: <b>{{ "%.1f"|format(live_volt) }} V</b></div>
+      <button class="btn-act btn-on" onclick="fetch('/admin_api/override',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'force_on'})}).then(()=>location.reload())">⚡ Relais EIN</button>
+      <button class="btn-act btn-off" onclick="fetch('/admin_api/override',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'force_off'})}).then(()=>location.reload())">🛑 Relais AUS</button>
     </div>
   </div>
-
   <div class="box">
-    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
-      <div>
-        <div style="font-size:16px;font-weight:800">Hardware-Steuerung</div>
-        <div style="font-size:12px;color:var(--muted)">Manuelle Schaltung der Shelly Plug S Steckdose.</div>
-      </div>
-      <div style="display:flex;gap:8px">
-        <button class="btn-act btn-on" onclick="overrideRelay('force_on')">⚡ Relais EIN (Force ON)</button>
-        <button class="btn-act btn-off" onclick="overrideRelay('force_off')">⏹️ Relais AUS (Force OFF)</button>
-      </div>
-    </div>
-  </div>
-
-  <div class="box">
-    <div style="font-size:16px;font-weight:800;margin-bottom:8px">Abgeschlossene Ladevorgänge (Letzte 30)</div>
+    <div style="font-size:15px;font-weight:800;margin-bottom:8px">📋 Letzte Ladesitzungen</div>
     <table class="tbl">
-      <thead><tr><th>Rechnungs-ID</th><th>Datum</th><th>Dauer</th><th>Verbrauch</th><th>Land</th><th>Betrag</th></tr></thead>
+      <thead><tr><th>Datum</th><th>Geräte</th><th>Dauer</th><th>Verbrauch</th><th>Umsatz (Brutto)</th></tr></thead>
       <tbody>
-        {% if history_records %}
-          {% for r in history_records %}
-          <tr>
-            <td><b>{{ r.get('invoice_id', '-') }}</b></td>
-            <td>{{ r.get('date', '-') }}</td>
-            <td>{{ r.get('time_formatted', '-') }}</td>
-            <td>{{ "%.2f"|format(r.get('total_wh', 0) or 0.0) }} Wh</td>
-            <td>{{ r.get('country_flag', '') }} {{ r.get('country_name', '-') }}</td>
-            <td><b style="color:var(--green)">{{ "%.4f"|format(r.get('total_cost_brutto', 0) or 0.0) }} €</b></td>
-          </tr>
-          {% endfor %}
+        {% for r in history_records %}
+        <tr><td>{{ r.date }}</td><td>{{ r.devices|length }} Gerät(e)</td><td>{{ r.time_formatted }}</td><td>{{ "%.2f"|format(r.total_wh or 0) }} Wh</td><td><b>{{ "%.4f"|format(r.total_cost_brutto or r.total_cost or 0) }} €</b></td></tr>
         {% else %}
-          <tr><td colspan="6" style="text-align:center;color:var(--muted);padding:16px">Bisher keine abgeschlossenen Sitzungen in der Historie.</td></tr>
-        {% endif %}
+        <tr><td colspan="5" style="color:var(--muted);text-align:center;padding:20px">Noch keine abgeschlossenen Sitzungen aufgezeichnet.</td></tr>
+        {% endfor %}
       </tbody>
     </table>
   </div>
 </div>
-
-<script>
-function overrideRelay(act){
-  fetch('/admin_api/override',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:act})})
-    .then(r=>r.json()).then(d=>alert(d.message || 'Ausgeführt'));
-}
-</script>
 </body></html>"""
+
+LOCK_HTML = """<!DOCTYPE html>
+<html lang="de"><head><meta charset="utf-8"><title>Smart Power Hub</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<style>
+*{box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:0;padding:0}
+body{background:#090d16;color:#f8fafc;display:flex;justify-content:center;align-items:center;min-height:100vh;padding:16px}
+.card{background:#111827;border-radius:24px;padding:32px 24px;border:1px solid #1f2937;text-align:center;max-width:440px;width:100%;box-shadow:0 25px 50px -12px rgba(0,0,0,.5)}
+h1{font-size:22px;font-weight:800;margin:16px 0 8px}
+p{font-size:13.5px;color:#94a3b8;line-height:1.5;margin-bottom:20px}
+.tbox{background:#0f172a;border:1px dashed #3b82f6;border-radius:14px;padding:14px;margin-bottom:20px;text-align:left}
+.tlbl{font-size:11px;text-transform:uppercase;color:#60a5fa;font-weight:700;margin-bottom:4px}
+.tcode{font-family:monospace;font-size:13px;word-break:break-all}
+.btn{display:block;width:100%;padding:14px;font-size:15px;font-weight:700;background:#3b82f6;color:#fff;border:none;border-radius:14px;text-decoration:none;cursor:pointer;margin-top:10px}
+.btn2{background:transparent;border:1px solid #1f2937;color:#94a3b8;font-size:12px;padding:9px}
+</style></head><body>
+<div class="card">
+<div style="font-size:54px">🔒</div>
+<h1>Vor-Ort-Sicherheitsprüfung</h1>
+<p>Scanne den QR-Code an der Ladestation.</p>
+<div class="tbox"><div class="tlbl">Token:</div><div class="tcode">{{ required_token }}</div></div>
+<a href="/scan/{{ required_token }}" class="btn">📲 Station freischalten</a>
+<a href="/admin/{{ admin_token }}" class="btn btn2" style="margin-top:12px;text-decoration:none">⚙️ Admin</a>
+</div></body></html>"""
 
 
 MAIN_HTML = """<!DOCTYPE html>
@@ -2277,93 +2006,7 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 .rtbl td{padding:8px 4px;border-bottom:1px solid var(--border)}
 .tbox{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:14px;padding:14px;text-align:right;margin-top:14px}
 .ein{width:100%;padding:11px;border:1px solid var(--border);border-radius:10px;font-size:13.5px;margin-bottom:8px}
-
-.chat-chip {
-  background: #eff6ff;
-  color: #1e40af;
-  border: 1px solid #bfdbfe;
-  font-size: 11px;
-  font-weight: 700;
-  padding: 4px 10px;
-  border-radius: 12px;
-  cursor: pointer;
-  display: inline-block;
-}
-.chat-chip:hover {
-  background: #dbeafe;
-}
-
 </style></head><body>
-
-<!-- MODAL: SICHERHEITS- & ZUGANGS-MODUS WAHL -->
-<div id="modalSecurityModeChooser" class="modal" style="display:none;z-index:99999">
-<div class="mbox" style="text-align:center;border:2px solid var(--blue);max-width:440px">
-  <div style="font-size:44px;margin-bottom:6px">🛡️📱</div>
-  <div style="font-size:18px;font-weight:800;margin-bottom:6px;color:#1e40af">Station bereits geöffnet</div>
-  <p style="font-size:13px;color:var(--muted);margin-bottom:18px;line-height:1.45">
-    Diese Ladestation ist aktuell auf einem anderen Gerät (<b id="secOtherDevType" style="color:var(--text)">Laptop / PC-Browser</b>) geöffnet.<br/>
-    <span style="font-size:12px;color:#059669;font-weight:700">Wie möchtest du diese Station nutzen?</span>
-  </p>
-  
-  <div style="display:flex;flex-direction:column;gap:10px">
-    <button class="btn bp" style="background:#059669;padding:13px;font-size:14px;font-weight:700" onclick="chooseSecurityMode('takeover')">
-      📲 Alleinige Steuerung auf dieses Gerät übertragen
-    </button>
-    <button class="btn bs" style="background:#eff6ff;color:#1e40af;border:1.5px solid #bfdbfe;padding:13px;font-size:14px;font-weight:700" onclick="chooseSecurityMode('spectator')">
-      👁️ Nur Lesemodus (Zuschauer / Live-Werte ansehen)
-    </button>
-    <button class="btn bs" style="background:#f8fafc;color:var(--text);border:1px solid #cbd5e1;padding:11px;font-size:13px" onclick="chooseSecurityMode('new_device')">
-      ➕ Eigenes Gerät anstecken & laden
-    </button>
-  </div>
-</div>
-</div>
-
-<!-- MODAL: STEUERUNG UEBERNEHMEN BESTAETIGEN -->
-<div id="modalConfirmTakeover" class="modal" style="display:none">
-<div class="mbox" style="text-align:center;border:2px solid #dc2626">
-  <div style="font-size:42px;margin-bottom:6px">🔐📲</div>
-  <div style="font-size:18px;font-weight:800;margin-bottom:6px;color:#991b1b">Alleinige Steuerung übernehmen?</div>
-  <p style="font-size:13px;color:var(--muted);margin-bottom:16px;line-height:1.4">
-    Diese Ladestation wird aktuell von einem anderen Smartphone / Browser gesteuert.<br/>
-    <b>Möchtest du die alleinige Bedienung jetzt auf dieses Gerät übertragen?</b>
-  </p>
-  
-  <div style="display:flex;flex-direction:column;gap:8px">
-    <button class="btn bp" style="background:#dc2626;padding:13px;font-size:14px" onclick="executeTakeover()">
-      ✅ Ja, Steuerung auf dieses Gerät übertragen
-    </button>
-    <button class="btn bs" style="padding:11px;font-size:13px" onclick="hideM('modalConfirmTakeover')">
-      👁️ Nein, nur als Zuschauer ansehen
-    </button>
-  </div>
-</div>
-</div>
-
-<!-- MODAL: BEREITS LAUFENDE SITZUNG UEBERNEHMEN ODER NEUES GERAET -->
-<div id="modalJoinSession" class="modal" style="display:none">
-<div class="mbox" style="text-align:center;border:2px solid var(--blue)">
-  <div style="font-size:38px;margin-bottom:6px">⚡📲</div>
-  <div style="font-size:18px;font-weight:800;margin-bottom:6px;color:#1e40af">Aktive Ladung an der Station</div>
-  <p style="font-size:13px;color:var(--muted);margin-bottom:16px;line-height:1.4">
-    An dieser Steckdose läuft bereits ein Ladevorgang:<br/>
-    <b id="joinDevName">Gerät 1</b> · <b id="joinWh">0.00 Wh</b> (<b id="joinCost">0.00 €</b>)<br/>
-    <span style="font-size:11.5px;color:#059669;font-weight:700">Was möchtest du tun?</span>
-  </p>
-  
-  <div style="display:flex;flex-direction:column;gap:8px">
-    <button class="btn bp" style="background:#059669;padding:12px;font-size:13.5px" onclick="chooseJoinOption('takeover')">
-      📲 Bestehende Ladung & Kosten übernehmen
-    </button>
-    <button class="btn bs" style="background:#eff6ff;color:#1e40af;border:1px solid #bfdbfe;padding:12px;font-size:13.5px" onclick="chooseJoinOption('new_device')">
-      ➕ Mein eigenes Gerät als neues Gerät einstecken
-    </button>
-    <button class="btn bd" style="padding:10px;font-size:12px" onclick="chooseJoinOption('fresh_start')">
-      🔄 Neue Gesamtsitzung starten (Zurücksetzen)
-    </button>
-  </div>
-</div>
-</div>
 
 <!-- DIALOG 1: WURDE GERÄT ABGESTECKT ODER SCHLAFMODUS? -->
 <div id="modalAskUnplug" class="modal">
@@ -2514,26 +2157,18 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 </div>
 
 <!-- DIALOG: 100% AKKU VOLLGELADEN -->
-<div id="modalBattery100" class="modal" style="display:none">
+<div id="modalBattery100" class="modal">
 <div class="mbox" style="text-align:center;border:2px solid #2563eb">
   <div style="font-size:42px;margin-bottom:6px">✅🔋</div>
-  <div style="font-size:18px;font-weight:800;margin-bottom:6px;color:#1e40af">Akku ist voll geladen (~100%)</div>
-  <p style="font-size:13px;color:var(--muted);margin-bottom:16px;line-height:1.4">
-    Die Ladeleistung wurde auf ein Minimum gedrosselt (BMS-Ladeschluss).<br/>
-    <b>Dein Akku ist jetzt vollständig geladen!</b>
+  <div style="font-size:18px;font-weight:800;margin-bottom:6px;color:#1e40af">100% Akku voll geladen!</div>
+  <p style="font-size:13px;color:var(--muted);margin-bottom:18px;line-height:1.4">
+    Der Ladevorgang ist <b>vollständig abgeschlossen (100%)</b>.<br/>
+    Die Steckdose wurde automatisch stromlos geschaltet.
   </p>
   
-  <div style="display:flex;flex-direction:column;gap:8px">
-    <button class="btn bp" style="background:#059669;padding:13px;font-size:14px" onclick="handleBatteryAction('finish')">
-      🧾 Ladevorgang beenden & Quittung anzeigen
-    </button>
-    <button class="btn bs" style="background:#eff6ff;color:#1e40af;border:1px solid #bfdbfe;padding:12px;font-size:13px;font-weight:700" onclick="handleBatteryAction('change_device')">
-      🔄 Anderes Gerät anschließen
-    </button>
-    <button class="btn bd" style="padding:10px;font-size:12px;background:#f1f5f9;color:var(--muted);border:1px solid var(--border)" onclick="handleBatteryAction('dismiss')">
-      ⚡ Erhaltungsladung aktiv lassen (Schließen)
-    </button>
-  </div>
+  <button class="btn bp" style="background:var(--blue);padding:14px;font-size:15px" onclick="handleBatteryAction('finish')">
+    🧾 Beenden & Quittung anzeigen
+  </button>
 </div>
 </div>
 
@@ -2646,23 +2281,23 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 <!-- HAUPTANSICHT -->
 
 <!-- CHATBOT FLOATING ACTION BUTTON -->
-<div id="chatFab" onclick="toggleChat()" style="position:fixed;bottom:20px;right:20px;z-index:9000;background:var(--blue);color:#fff;border-radius:30px;padding:10px 16px;box-shadow:0 4px 14px rgba(37,99,235,0.35);cursor:pointer;display:flex;align-items:center;gap:8px;font-size:13px;font-weight:700">
+<div id="chatFab" onclick="toggleChat()" style="position:fixed;bottom:20px;right:20px;z-index:9000;background:#2563eb;color:#fff;border-radius:30px;padding:10px 16px;box-shadow:0 4px 14px rgba(37,99,235,0.35);cursor:pointer;display:flex;align-items:center;gap:8px;font-size:13px;font-weight:700">
   <span style="font-size:18px">💬</span> <span id="chatFabTxt">KI-Assistent</span>
 </div>
 
 <!-- CHATBOT DRAWER FENSTER -->
-<div id="chatDrawer" style="display:none;position:fixed;bottom:75px;right:20px;width:340px;max-width:calc(100vw - 40px);height:420px;background:#fff;border-radius:18px;box-shadow:0 10px 30px rgba(0,0,0,0.18);border:1px solid var(--border);z-index:9000;flex-direction:column;overflow:hidden">
-  <div style="background:var(--card);border-bottom:1px solid var(--border);padding:12px 16px;display:flex;justify-content:space-between;align-items:center">
+<div id="chatDrawer" style="display:none;position:fixed;bottom:75px;right:20px;width:340px;max-width:calc(100vw - 40px);height:420px;background:#fff;border-radius:18px;box-shadow:0 10px 30px rgba(0,0,0,0.18);border:1px solid #e2e8f0;z-index:9000;flex-direction:column;overflow:hidden">
+  <div style="background:#f8fafc;border-bottom:1px solid #e2e8f0;padding:12px 16px;display:flex;justify-content:space-between;align-items:center">
     <div style="display:flex;align-items:center;gap:8px">
       <span style="font-size:20px">🤖</span>
       <div>
-        <div style="font-size:13.5px;font-weight:800;color:var(--text)">Smart Lade-Assistent</div>
+        <div style="font-size:13.5px;font-weight:800;color:#090d16">Smart Lade-Assistent</div>
         <div style="font-size:10.5px;color:#059669;display:flex;align-items:center;gap:4px">
           <span style="width:6px;height:6px;background:#059669;border-radius:50%"></span> Online & Live verbunden
         </div>
       </div>
     </div>
-    <button onclick="toggleChat()" style="background:none;border:none;font-size:18px;cursor:pointer;color:var(--muted);padding:4px">✕</button>
+    <button onclick="toggleChat()" style="background:none;border:none;font-size:18px;cursor:pointer;color:#64748b;padding:4px">✕</button>
   </div>
   
   <div id="chatMsgList" style="flex:1;overflow-y:auto;padding:12px 14px;display:flex;flex-direction:column;gap:10px;background:#f8fafc;font-size:12.5px">
@@ -2672,14 +2307,14 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
   </div>
   
   <div style="padding:6px 12px;background:#fff;border-top:1px solid #f1f5f9;display:flex;gap:6px;overflow-x:auto;white-space:nowrap">
-    <span class="chat-chip" onclick="sendQuickPrompt('Wie lange dauert das Laden noch?')">🔋 Restzeit?</span>
-    <span class="chat-chip" onclick="sendQuickPrompt('Was kostet das Laden bisher?')">💶 Kosten?</span>
-    <span class="chat-chip" onclick="sendQuickPrompt('Was bedeutet die Ladephase?')">💡 Ladephase?</span>
+    <span style="background:#eff6ff;color:#1e40af;border:1px solid #bfdbfe;font-size:11px;font-weight:700;padding:4px 10px;border-radius:12px;cursor:pointer" onclick="sendQuickPrompt('Wie lange dauert das Laden noch?')">🔋 Restzeit?</span>
+    <span style="background:#eff6ff;color:#1e40af;border:1px solid #bfdbfe;font-size:11px;font-weight:700;padding:4px 10px;border-radius:12px;cursor:pointer" onclick="sendQuickPrompt('Was kostet das Laden bisher?')">💶 Kosten?</span>
+    <span style="background:#eff6ff;color:#1e40af;border:1px solid #bfdbfe;font-size:11px;font-weight:700;padding:4px 10px;border-radius:12px;cursor:pointer" onclick="sendQuickPrompt('Was bedeutet die Ladephase?')">💡 Ladephase?</span>
   </div>
   
-  <form onsubmit="handleChatSubmit(event)" style="display:flex;gap:6px;padding:10px 12px;background:#fff;border-top:1px solid var(--border);margin:0">
-    <input id="chatInput" type="text" placeholder="Frage stellen oder Feedback..." style="flex:1;padding:9px 12px;border:1.5px solid var(--border);border-radius:20px;font-size:12.5px;outline:none" />
-    <button type="submit" style="background:var(--blue);color:#fff;border:none;border-radius:50%;width:34px;height:34px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:14px">➤</button>
+  <form onsubmit="handleChatSubmit(event)" style="display:flex;gap:6px;padding:10px 12px;background:#fff;border-top:1px solid #e2e8f0;margin:0">
+    <input id="chatInput" type="text" placeholder="Frage stellen oder Feedback..." style="flex:1;padding:9px 12px;border:1.5px solid #e2e8f0;border-radius:20px;font-size:12.5px;outline:none" />
+    <button type="submit" style="background:#2563eb;color:#fff;border:none;border-radius:50%;width:34px;height:34px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:14px">➤</button>
   </form>
 </div>
 
@@ -2690,17 +2325,6 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
   <span class="country-badge" onclick="showM('countryModal')">
     <span id="hdrFlag">🇩🇪</span> <span id="hdrCountryText">DE · 19% MwSt.</span> ▾
   </span>
-</div>
-
-<!-- SPECTATOR / GESPERRT BANNER -->
-<div id="spectatorBanner" style="display:none;background:#fef2f2;border:1.5px solid #fecaca;border-radius:14px;padding:10px 14px;margin-bottom:12px;justify-content:space-between;align-items:center;gap:8px">
-  <div style="text-align:left">
-    <div style="font-size:12px;font-weight:800;color:#991b1b">🔒 Nur Lese-Modus (Zuschauer)</div>
-    <div style="font-size:11px;color:#b91c1c">Wird aktuell von anderem Gerät gesteuert.</div>
-  </div>
-  <button class="btn bp" style="width:auto;padding:7px 12px;font-size:11.5px;background:#dc2626;white-space:nowrap;margin:0" onclick="showTakeoverPrompt()">
-    📲 Steuerung anfordern
-  </button>
 </div>
 
 <div class="badges">
@@ -2770,21 +2394,13 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
     </div>
   </div>
 
-  <!-- 2. AKKU-LADEMODUS PROGNOSE & KI-LADEPHASEN ERKENNUNG -->
+  <!-- 2. AKKU-LADEMODUS PROGNOSE -->
   <div id="panelBattery" class="prognosis-panel panel-battery" style="display:none">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
-      <div class="prog-head" style="margin-bottom:0">🔋 Akku-Ladephase & Ladestand (SoC)</div>
-      <span id="battPhaseBadge" style="font-size:10px;font-weight:800;background:#d1fae5;color:#065f46;padding:2px 8px;border-radius:10px;border:1px solid #a7f3d0">⚡ CC-Hauptladung</span>
-    </div>
-    
-    <div id="battPhaseDesc" style="font-size:11px;color:#065f46;margin-bottom:8px;line-height:1.35">
-      Akku nimmt maximale Ladeleistung auf (Schnellladebereich 15–75%)
-    </div>
-
+    <div class="prog-head">🔋 Akku-Ladefortschritt & Restbedarf bis 100%</div>
     <div class="soc-track"><div class="soc-bar" id="socBar" style="width:10%"></div></div>
     <div class="soc-labels">
-      <span>Geschätzter Ladestand: <b id="socPctText">--%</b></span>
-      <span id="socEtaText">Restzeit: ~ -- Min</span>
+      <span>Ladestand: <b id="socPctText">10%</b></span>
+      <span id="socEtaText">~ -- Min</span>
     </div>
     <div class="prog-grid2" style="margin-top:10px">
       <div class="prog-chip">
@@ -2933,52 +2549,6 @@ function post(u,d){
 }
 
 
-function chooseJoinOption(opt){
-  hideM('modalJoinSession');
-  sessionStorage.setItem('join_handled', '1');
-  if(opt === 'takeover'){
-    executeTakeover();
-  } else if(opt === 'new_device'){
-    executeTakeover();
-    showM('devModal');
-  } else if(opt === 'fresh_start'){
-    executeTakeover();
-    startFreshSession();
-  }
-}
-window.chooseJoinOption = chooseJoinOption;
-
-function showTakeoverPrompt(){
-  showM('modalConfirmTakeover');
-}
-
-function executeTakeover(){
-  hideM('modalConfirmTakeover');
-  post('/claim_control').then(function(res){
-    if(res && res.status === 'ok'){
-      sessionStorage.setItem('join_handled', '1');
-      poll();
-    }
-  });
-}
-
-window.showTakeoverPrompt = showTakeoverPrompt;
-window.executeTakeover = executeTakeover;
-
-function chooseSecurityMode(mode){
-  hideM('modalSecurityModeChooser');
-  sessionStorage.setItem('security_mode_chosen', mode);
-  if(mode === 'takeover'){
-    executeTakeover();
-  } else if(mode === 'spectator'){
-    poll();
-  } else if(mode === 'new_device'){
-    executeTakeover();
-    showM('devModal');
-  }
-}
-window.chooseSecurityMode = chooseSecurityMode;
-
 function toggleChat(){
   var cd = document.getElementById('chatDrawer');
   if(!cd) return;
@@ -3008,13 +2578,13 @@ function handleChatSubmit(e){
   var list = document.getElementById('chatMsgList');
   if(list){
     var uDiv = document.createElement('div');
-    uDiv.style.cssText = 'align-self:flex-end;background:var(--blue);color:#fff;padding:9px 12px;border-radius:14px;border-top-right-radius:3px;max-width:85%;line-height:1.4;box-shadow:0 1px 3px rgba(37,99,235,0.2)';
+    uDiv.style.cssText = 'align-self:flex-end;background:#2563eb;color:#fff;padding:9px 12px;border-radius:14px;border-top-right-radius:3px;max-width:85%;line-height:1.4;box-shadow:0 1px 3px rgba(37,99,235,0.2)';
     uDiv.innerText = msg;
     list.appendChild(uDiv);
     
     var bDiv = document.createElement('div');
     bDiv.id = 'chatTypingBubble';
-    bDiv.style.cssText = 'align-self:flex-start;background:#fff;border:1px solid #e2e8f0;padding:9px 12px;border-radius:14px;border-top-left-radius:3px;max-width:85%;line-height:1.4;color:var(--muted)';
+    bDiv.style.cssText = 'align-self:flex-start;background:#fff;border:1px solid #e2e8f0;padding:9px 12px;border-radius:14px;border-top-left-radius:3px;max-width:85%;line-height:1.4;color:#64748b';
     bDiv.innerText = 'Antworte...';
     list.appendChild(bDiv);
     list.scrollTop = list.scrollHeight;
@@ -3024,7 +2594,7 @@ function handleChatSubmit(e){
       if(typ && typ.parentNode) typ.parentNode.removeChild(typ);
       
       var repDiv = document.createElement('div');
-      repDiv.style.cssText = 'align-self:flex-start;background:#fff;border:1px solid #e2e8f0;padding:10px 12px;border-radius:14px;border-top-left-radius:3px;max-width:85%;line-height:1.4;box-shadow:0 1px 3px rgba(0,0,0,0.05);color:var(--text)';
+      repDiv.style.cssText = 'align-self:flex-start;background:#fff;border:1px solid #e2e8f0;padding:10px 12px;border-radius:14px;border-top-left-radius:3px;max-width:85%;line-height:1.4;box-shadow:0 1px 3px rgba(0,0,0,0.05);color:#090d16';
       var rep = (res && res.reply) ? res.reply : 'Entschuldigung, ich konnte keine Antwort abrufen.';
       var formatted = rep.split('**').map(function(part, i){ return i % 2 === 1 ? ('<b>' + part + '</b>') : part; }).join('').replace(/\n/g, '<br/>');
       repDiv.innerHTML = formatted;
@@ -3040,9 +2610,6 @@ function handleChatSubmit(e){
 window.toggleChat = toggleChat;
 window.sendQuickPrompt = sendQuickPrompt;
 window.handleChatSubmit = handleChatSubmit;
-
-
-
 
 function startFreshSession(){
   lastActionLocalTime = Date.now();
@@ -3172,8 +2739,6 @@ function handleBatteryAction(action){
   post('/battery_action', { action: action }).then(function(res){
     if(action === 'finish'){
       showReceipt(res);
-    } else if(action === 'change_device'){
-      showM('devModal');
     } else {
       poll();
     }
@@ -3304,29 +2869,11 @@ function updateWysiwygLook(dev, curW, curWh){
     var costNeededNetto = (whNeeded / 1000.0) * STROMPREIS_NETTO;
     var costNeededBrutto = costNeededNetto * vatFactor;
 
-    if(window.lastStatusPayload && window.lastStatusPayload.battery_state){
-      var bs = window.lastStatusPayload.battery_state;
-      document.getElementById('battPhaseBadge').innerText = bs.phase_badge || '🔋 Akku';
-      document.getElementById('battPhaseDesc').innerText = bs.phase_desc || '';
-      document.getElementById('socBar').style.width = bs.soc_percent + '%';
-      document.getElementById('socPctText').innerText = bs.soc_percent + '%';
-      
-      var etaTxt = bs.eta_minutes_100 > 0 ? ('Restzeit: ~' + bs.eta_minutes_100 + ' Min') : (curW > 0.3 ? 'Fast voll (< 5 Min)' : 'Warte auf Strom...');
-      if(bs.soc_percent < 80 && bs.eta_minutes_80 > 0){
-        etaTxt += ' (bis 80%: ~' + bs.eta_minutes_80 + ' Min)';
-      }
-      document.getElementById('socEtaText').innerText = etaTxt;
-      document.getElementById('battWhNeeded').innerText = (bs.wh_needed_100 || 0).toFixed(1) + ' Wh';
-      var cNeededNetto = ((bs.wh_needed_100 || 0) / 1000.0) * STROMPREIS_NETTO;
-      var cNeededBrutto = cNeededNetto * vatFactor;
-      document.getElementById('battCostNeeded').innerText = '+' + cNeededBrutto.toFixed(4) + ' €';
-    } else {
-      document.getElementById('socBar').style.width = socPct + '%';
-      document.getElementById('socPctText').innerText = socPct + '%';
-      document.getElementById('socEtaText').innerText = curW > 0.5 ? ('Restzeit: ~' + etaMin + ' Min') : 'Warte auf Strom...';
-      document.getElementById('battWhNeeded').innerText = whNeeded.toFixed(2) + ' Wh';
-      document.getElementById('battCostNeeded').innerText = '+' + costNeededBrutto.toFixed(4) + ' €';
-    }
+    document.getElementById('socBar').style.width = socPct + '%';
+    document.getElementById('socPctText').innerText = socPct + '%';
+    document.getElementById('socEtaText').innerText = curW > 0.5 ? ('Restzeit: ~' + etaMin + ' Min') : 'Warte auf Strom...';
+    document.getElementById('battWhNeeded').innerText = whNeeded.toFixed(2) + ' Wh';
+    document.getElementById('battCostNeeded').innerText = '+' + costNeededBrutto.toFixed(4) + ' €';
   } else {
     pBatt.style.display = 'none';
     pCont.style.display = 'block';
@@ -3504,7 +3051,6 @@ function renderDevicePills(devs, activeIdx){
 function poll(){
   if(done) return;
   fetch('/status', {cache: 'no-store'}).then(function(r){return r.json()}).then(function(d){
-    window.lastStatusPayload = d;
     if(d.session_terminated && d.report){
       showReceipt(d.report);
       return;
@@ -3518,27 +3064,6 @@ function poll(){
     var idleSec = d.total_idle_seconds || 0.0;
 
     allRecordedDevices = d.devices || [];
-        // Prompte Sicherheitsabfrage bei zweitem Geraet
-    if(!sessionStorage.getItem('security_mode_chosen') && (d.has_other_clients || d.is_owner === false)){
-      var sdt = document.getElementById('secOtherDevType');
-      if(sdt && d.other_device_type) sdt.innerText = d.other_device_type;
-      // showM('modalSecurityModeChooser');
-    }
-    var specB = document.getElementById('spectatorBanner');
-    if(specB){ specB.style.display = (d.is_owner === false) ? 'flex' : 'none'; }
-    // QR-Join Erkennung bei neu gescanntem Geraet
-    var urlP = new URLSearchParams(window.location.search);
-    if(urlP.get('join') === '1' && !sessionStorage.getItem('join_handled') && (d.wh > 0.01 || (d.devices && d.devices.length > 1) || d.active)){
-      var curDName = (d.active_device && d.active_device.name) ? d.active_device.name : 'Gerät 1';
-      var jdn = document.getElementById('joinDevName');
-      var jwh = document.getElementById('joinWh');
-      var jc = document.getElementById('joinCost');
-      if(jdn) jdn.innerText = curDName;
-      if(jwh) jwh.innerText = (d.wh || 0).toFixed(2) + ' Wh';
-      if(jc) jc.innerText = (d.cost_brutto || 0).toFixed(4) + ' €';
-      showM('modalJoinSession');
-    }
-
 
     // Land
     if(d.country){
