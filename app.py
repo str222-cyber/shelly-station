@@ -485,14 +485,14 @@ def poll_shelly():
     if now < shelly["poll_time"]:
         return
 
-    # Sofort nächsten Poll-Zeitpunkt in die Zukunft setzen (verhindert gleichzeitige Calls)
-    shelly["poll_time"] = now + 2.8
+    # Nächsten regulären Poll-Zeitpunkt auf +3.5s setzen (sicher unter Shelly Cloud Rate Limit)
+    shelly["poll_time"] = now + 3.5
 
     try:
         r = http_requests.post(
             f"{SHELLY_CLOUD_URL}/device/status",
             data={"auth_key": AUTH_KEY, "id": DEVICE_ID},
-            timeout=3.5
+            timeout=4.0
         )
         if r.status_code == 200:
             j = r.json()
@@ -513,14 +513,21 @@ def poll_shelly():
                     shelly["ok"] = True
                     shelly["error"] = ""
             else:
-                shelly["error"] = j.get("error", "isok=false")
+                err = j.get("error", "isok=false")
+                shelly["error"] = err
+                # Bei Rate Limit: 7 Sekunden Pause einlegen
+                if "TOO_MANY" in str(err).upper() or "REQUESTS" in str(err).upper():
+                    shelly["poll_time"] = now + 7.0
+                    logger.warning("⚠️ Shelly Cloud Rate-Limit erreicht -> 7s Cooldown aktiviert.")
         elif r.status_code == 429:
             shelly["error"] = "Rate Limit (429)"
-            shelly["poll_time"] = now + 4.5
+            shelly["poll_time"] = now + 8.0
         else:
             shelly["error"] = f"HTTP {r.status_code}"
+            shelly["poll_time"] = now + 4.0
     except Exception as e:
         shelly["error"] = str(e)[:80]
+        shelly["poll_time"] = now + 4.0
 
 
 def relay_control(turn_on):
@@ -533,13 +540,6 @@ def relay_control(turn_on):
             logger.error(f"Relay control error: {e}")
         charge["relay_on"] = turn_on
         logger.info(f"Relay -> {'EIN' if turn_on else 'AUS'}")
-        if turn_on:
-            # Nach Einschalten sofort nach 0.7s frischen Poll machen, damit Strom sofort erkannt wird
-            time.sleep(0.7)
-            shelly["poll_time"] = 0.0
-            poll_shelly()
-            with lock:
-                accumulate_energy()
     threading.Thread(target=_do, daemon=True).start()
 
 
