@@ -504,46 +504,45 @@ def poll_shelly():
     if now < shelly["poll_time"]:
         return
 
-    if not poll_lock.acquire(blocking=False):
-        return
-
-    next_poll = now + 2.8
-    try:
-        r = http_requests.post(
-            f"{SHELLY_CLOUD_URL}/device/status",
-            data={"auth_key": AUTH_KEY, "id": DEVICE_ID},
-            timeout=4.0
-        )
-        if r.status_code == 200:
-            j = r.json()
-            if j.get("isok"):
-                ds = j.get("data", {}).get("device_status", {})
-                if "switch:0" in ds:
-                    sw = ds["switch:0"]
-                    shelly["watt"] = float(sw.get("apower", 0) or 0)
-                    shelly["amp"]  = float(sw.get("current", 0) or 0)
-                    shelly["volt"] = float(sw.get("voltage", 230) or 230)
-                    shelly["ok"] = True
-                    shelly["error"] = ""
-                elif "meters" in ds and ds["meters"]:
-                    m = ds["meters"][0]
-                    shelly["watt"] = float(m.get("power", 0) or 0)
-                    shelly["amp"]  = float(m.get("current", shelly["watt"]/230 if shelly["watt"] > 0 else 0))
-                    shelly["volt"] = float(m.get("voltage", 230) or 230)
-                    shelly["ok"] = True
-                    shelly["error"] = ""
+    with poll_lock:
+        if now < shelly["poll_time"]:
+            return
+        next_poll = now + 2.8
+        try:
+            r = http_requests.post(
+                f"{SHELLY_CLOUD_URL}/device/status",
+                data={"auth_key": AUTH_KEY, "id": DEVICE_ID},
+                timeout=4.0
+            )
+            if r.status_code == 200:
+                j = r.json()
+                if j.get("isok"):
+                    ds = j.get("data", {}).get("device_status", {})
+                    if "switch:0" in ds:
+                        sw = ds["switch:0"]
+                        shelly["watt"] = float(sw.get("apower", 0) or 0)
+                        shelly["amp"]  = float(sw.get("current", 0) or 0)
+                        shelly["volt"] = float(sw.get("voltage", 230) or 230)
+                        shelly["ok"] = True
+                        shelly["error"] = ""
+                    elif "meters" in ds and ds["meters"]:
+                        m = ds["meters"][0]
+                        shelly["watt"] = float(m.get("power", 0) or 0)
+                        shelly["amp"]  = float(m.get("current", shelly["watt"]/230 if shelly["watt"] > 0 else 0))
+                        shelly["volt"] = float(m.get("voltage", 230) or 230)
+                        shelly["ok"] = True
+                        shelly["error"] = ""
+                else:
+                    shelly["error"] = j.get("error", "isok=false")
+            elif r.status_code == 429:
+                shelly["error"] = "Rate Limit (429)"
+                next_poll = now + 4.5
             else:
-                shelly["error"] = j.get("error", "isok=false")
-        elif r.status_code == 429:
-            shelly["error"] = "Rate Limit (429)"
-            next_poll = now + 5.0
-        else:
-            shelly["error"] = f"HTTP {r.status_code}"
-    except Exception as e:
-        shelly["error"] = str(e)[:80]
-    finally:
-        shelly["poll_time"] = next_poll
-        poll_lock.release()
+                shelly["error"] = f"HTTP {r.status_code}"
+        except Exception as e:
+            shelly["error"] = str(e)[:80]
+        finally:
+            shelly["poll_time"] = next_poll
 
 
 def relay_control(turn_on):
@@ -911,7 +910,9 @@ def reset_session():
 
 @app.route('/status')
 def get_status():
+    poll_shelly()
     with lock:
+        accumulate_energy()
         elapsed = get_session_elapsed()
         curr_idx = charge["current_device_idx"]
         devices = [dict(d) for d in charge["devices"]]
