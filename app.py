@@ -184,6 +184,11 @@ charge = {
     # --- PRÄZISER ABSTECK- & WECHSEL-WORKFLOW MIT SCHONFRIST ---
     "unplug_modal": None,            # None | "ASK_UNPLUG" | "ASK_NEXT_DEVICE"
     "battery_modal": None,           # None | "BATTERY_80" | "BATTERY_100"
+    "power_shift_modal": None,       # None | {"from_w": 12.0, "to_w": 85.0}
+    "power_shift_cooldown_until": 0.0,
+    "last_stable_w": 0.0,
+    "stable_samples_count": 0,
+    
     "unplug_cooldown_until": 0.0,    # Timestamp: Bis wann kein Absteck-Popup getriggert werden darf (Schonfrist)
     "flow_continuous_seconds": 0.0,  # Zählt zusammenhängende Sekunden stabilen Stromflusses
     "waiting_for_new_plug": False,   # True, wenn Relais wieder EIN ist und auf Strom gewartet wird
@@ -191,7 +196,7 @@ charge = {
     "had_flowing": False,            # True, erst nachdem Strom mindestens 3s stabil floss
     "is_flowing": False,
     
-    # --- DURCHGEHENDER SITZUNGS-TIMER (STOPPT NIE) ---
+    # --- DURCHGEHENDER SERVER-MASTER-TIMER (STOPPT NIE) ---
     "session_start_time": None,      # Timestamp des ersten Starts in dieser Sitzung
     "total_session_seconds": 0.0,
     "total_flow_seconds": 0.0,       # Reine Stromflusszeit
@@ -243,7 +248,7 @@ class DeviceAI:
 
     @classmethod
     def learn_from_feedback(cls, key, power_history, current_w=0.0):
-        """Lernt kontinuierlich von Benutzer-Bestätigungen und Geräte-Verhaltensmustern"""
+        """Lernt kontinuierlich von Benutzer-Bestätigungen und Geräte-Verhaltensmustern (inkl. Standby/Sleep-Dynamik)"""
         if not key or key not in DEVICE_PROFILES:
             return
         
@@ -333,12 +338,12 @@ class DeviceAI:
         if not valid_watts:
             return {
                 "suggested_key": "lamp",
-                "name": "Kein Stromfluss",
+                "name": "Standby / Schlafmodus (0 W)",
                 "icon": "🔌",
                 "mode": "continuous",
                 "is_battery": False,
                 "confidence": 0,
-                "reason": "Stecker abgezogen oder Gerät im Standby",
+                "reason": "Gerät im Schlafmodus, Standby oder Stecker abgezogen",
                 "learned_match": False,
                 "total_learned_confirmations": total_learned,
                 "peak_w": 0.0, "avg_w": 0.0, "current_w": cw
@@ -424,10 +429,10 @@ class DeviceAI:
             confidence = min(92, 40 + n * 6)
             if pw < 25:
                 s_key = "phone"
-                reason = f"Ladekurve bis {pw:.1f} W typisch für Smartphone/Tablet"
+                reason = f"Ladekurve bis {pw:.1f} W typisch für Smartphone/Tablet (auch im Standby aktiv)"
             elif pw < 100:
                 s_key = "laptop"
-                reason = f"Ladekurve bis {pw:.1f} W typisch für Laptop"
+                reason = f"Ladekurve bis {pw:.1f} W typisch für Laptop (auch bei geschlossenem Display)"
             elif pw < 350:
                 s_key = "ebike"
                 reason = f"Starke Ladeleistung ({pw:.1f} W) typisch für E-Bike"
@@ -495,7 +500,7 @@ DeviceAI.load_learned()
 # =====================================================================
 def poll_shelly():
     now = time.time()
-    if now < shelly["poll_time"] + 2.0:
+    if now < shelly["poll_time"] + 1.8:
         return
 
     try:
@@ -526,7 +531,7 @@ def poll_shelly():
                 shelly["error"] = j.get("error", "isok=false")
         elif r.status_code == 429:
             shelly["error"] = "Rate Limit (429)"
-            shelly["poll_time"] = now + 4.0
+            shelly["poll_time"] = now + 3.0
             return
         else:
             shelly["error"] = f"HTTP {r.status_code}"
@@ -625,6 +630,8 @@ def accumulate_energy():
         charge["unplug_cooldown_until"] = now + 10.0
         charge["flow_continuous_seconds"] = 0.0
         charge["had_flowing"] = False
+        charge["last_stable_w"] = w
+        charge["stable_samples_count"] = 1
         
         if charge.get("target_is_new", True):
             next_num = len(charge["devices"]) + 1
@@ -642,7 +649,7 @@ def accumulate_energy():
         charge["ai_tick"] = 0
 
     # =====================================================================
-    # 2. STABILER STROMFLUSS-AUFBAU (Schonfrist & Entprellung)
+    # 2. STABILER STROMFLUSS-AUFBAU (Schonfrist & Standby-Berücksichtigung)
     # =====================================================================
     if last and last > 0:
         dt = min(15.0, max(0.0, now - last))
@@ -667,7 +674,35 @@ def accumulate_energy():
             logger.info("🔌 Ampere auf 0.0 A abgefallen -> Ladevorgang pausiert, Relais AUS, Modal ASK_UNPLUG geöffnet!")
 
     # =====================================================================
-    # 4. ENERGIE- & ZEIT-AKKUMULATION + 80% / 100% AKKUSCHUTZ
+    # 4. ERKENNUNG: DRASTISCHER LASTWECHSEL / STATUSÄNDERUNG (Gerätewechsel?)
+    # =====================================================================
+    if charge["active"] and is_flowing and now > charge.get("power_shift_cooldown_until", 0.0) and now > charge.get("unplug_cooldown_until", 0.0):
+        base_w = charge.get("last_stable_w", 0.0)
+        s_cnt = charge.get("stable_samples_count", 0)
+        
+        if s_cnt >= 6 and base_w > 3.0:
+            ratio = w / base_w
+            delta = abs(w - base_w)
+            
+            # Signifikanter Lastsprung (z.B. von 12W auf 85W oder 120W auf 10W bei Delta > 18W)
+            if (ratio >= 2.6 or ratio <= 0.38) and delta >= 18.0:
+                charge["power_shift_modal"] = {
+                    "from_w": round(base_w, 1),
+                    "to_w": round(w, 1)
+                }
+                charge["power_shift_cooldown_until"] = now + 30.0  # 30s Cooldown
+                logger.info(f"⚡ Signifikanter Lastsprung: {base_w:.1f} W -> {w:.1f} W (Delta {delta:.1f} W)!")
+
+        # Laufende Aktualisierung der stabilen Referenzleistung
+        if abs(w - base_w) < max(4.0, base_w * 0.30):
+            charge["stable_samples_count"] = s_cnt + 1
+            charge["last_stable_w"] = (base_w * 0.85) + (w * 0.15)
+        else:
+            charge["stable_samples_count"] = 1
+            charge["last_stable_w"] = w
+
+    # =====================================================================
+    # 5. ENERGIE- & ZEIT-AKKUMULATION + 80% / 100% AKKUSCHUTZ
     # =====================================================================
     if last and last > 0 and charge["session_start_time"] is not None:
         dt = now - last
@@ -759,6 +794,24 @@ def accumulate_energy():
                     cur_dev["nominal_wh"] = s_prof["nominal_wh"]
 
 
+# =====================================================================
+# KONTINUIERLICHER SERVER-SEITIGER HINTERGRUND-THREAD (24/7 DAEMON)
+# =====================================================================
+def background_energy_daemon():
+    """Zählt auch bei Screensaver, Schlafmodus oder ausgeschaltetem Handy-Display 100% akkurat weiter!"""
+    while True:
+        try:
+            poll_shelly()
+            with lock:
+                accumulate_energy()
+        except Exception as e:
+            logger.error(f"Energy daemon error: {e}")
+        time.sleep(1.0)
+
+daemon_thread = threading.Thread(target=background_energy_daemon, daemon=True)
+daemon_thread.start()
+
+
 def fmt_time(s):
     s = int(max(0, s))
     return f"{s//3600:02d}:{(s%3600)//60:02d}:{s%60:02d}"
@@ -792,6 +845,10 @@ def scan(token):
             charge["paused"] = False
             charge["unplug_modal"] = None
             charge["battery_modal"] = None
+            charge["power_shift_modal"] = None
+            charge["power_shift_cooldown_until"] = 0.0
+            charge["last_stable_w"] = 0.0
+            charge["stable_samples_count"] = 0
             charge["unplug_cooldown_until"] = 0.0
             charge["flow_continuous_seconds"] = 0.0
             charge["waiting_for_new_plug"] = False
@@ -825,6 +882,10 @@ def reset_session():
         charge["paused"] = False
         charge["unplug_modal"] = None
         charge["battery_modal"] = None
+        charge["power_shift_modal"] = None
+        charge["power_shift_cooldown_until"] = 0.0
+        charge["last_stable_w"] = 0.0
+        charge["stable_samples_count"] = 0
         charge["unplug_cooldown_until"] = 0.0
         charge["flow_continuous_seconds"] = 0.0
         charge["waiting_for_new_plug"] = False
@@ -851,10 +912,7 @@ def reset_session():
 
 @app.route('/status')
 def get_status():
-    poll_shelly()
-
     with lock:
-        accumulate_energy()
         elapsed = get_session_elapsed()
         curr_idx = charge["current_device_idx"]
         devices = [dict(d) for d in charge["devices"]]
@@ -878,7 +936,7 @@ def get_status():
             "shelly_ok": shelly["ok"],
             "shelly_error": shelly["error"],
             
-            # Laufzeiten (kontinuierlich)
+            # Laufzeiten (kontinuierlich auf dem Server)
             "elapsed_seconds": round(elapsed, 1),
             "total_flow_seconds": round(charge["total_flow_seconds"], 1),
             "total_idle_seconds": round(charge["total_idle_seconds"], 1),
@@ -887,9 +945,10 @@ def get_status():
             "wh": round(charge["total_wh"], 4),
             "kwh": round(charge["total_kwh"], 6),
             
-            # Absteck- & Akku-Status
+            # Absteck-, Lastwechsel- & Akku-Status
             "unplug_modal": charge["unplug_modal"],
             "battery_modal": charge["battery_modal"],
+            "power_shift_modal": charge["power_shift_modal"],
             "waiting_for_new_plug": charge["waiting_for_new_plug"],
             "had_flowing": charge["had_flowing"],
             "is_flowing": charge["is_flowing"],
@@ -942,11 +1001,14 @@ def start_charge():
         charge["paused"] = False
         charge["unplug_modal"] = None
         charge["battery_modal"] = None
+        charge["power_shift_modal"] = None
         charge["unplug_cooldown_until"] = now + 10.0
         charge["flow_continuous_seconds"] = 0.0
         charge["had_flowing"] = False
         charge["waiting_for_new_plug"] = False
         charge["last_wh_time"] = now
+        charge["last_stable_w"] = shelly["watt"]
+        charge["stable_samples_count"] = 1
         if not charge["devices"]:
             charge["devices"] = [new_device_entry(1, "lamp")]
             charge["current_device_idx"] = 0
@@ -1029,6 +1091,43 @@ def unplug_action():
             charge["unplug_modal"] = None
             charge["waiting_for_new_plug"] = False
             return logout()
+
+    return jsonify({"status": "error"}), 400
+
+# =====================================================================
+# LASTWECHSEL / STATUSÄNDERUNGS-ENDPOINT
+# =====================================================================
+@app.route('/power_shift_action', methods=['POST'])
+def power_shift_action():
+    data = request.get_json() or {}
+    action = data.get("action")  # "new_device" | "same_device"
+    now = time.time()
+
+    with lock:
+        charge["power_shift_modal"] = None
+        charge["power_shift_cooldown_until"] = now + 25.0
+
+        if action == "new_device":
+            # Neues separates Gerät erstellen
+            next_num = len(charge["devices"]) + 1
+            new_dev = new_device_entry(next_num, "lamp")
+            charge["devices"].append(new_dev)
+            charge["current_device_idx"] = len(charge["devices"]) - 1
+            charge["power_history"] = []
+            charge["ai_result"] = None
+            logger.info(f"Lastwechsel: Neues Gerät #{next_num} durch Lastsprung angelegt.")
+            return jsonify({"status": "ok", "device": new_dev})
+
+        elif action == "same_device":
+            # Bestätigt: Gleiches Gerät (z.B. Display an / Standby / Schlafmodus beendet)
+            idx = charge["current_device_idx"]
+            devs = charge["devices"]
+            if 0 <= idx < len(devs):
+                cur_d = devs[idx]
+                if cur_d.get("key") in DEVICE_PROFILES:
+                    DeviceAI.learn_from_feedback(cur_d["key"], charge.get("power_history", []), shelly["watt"])
+                logger.info(f"Lastwechsel: Gleiches Gerät bestätigt ({cur_d['name']}). Dynamik gelernt.")
+            return jsonify({"status": "ok", "state": "same_device_confirmed"})
 
     return jsonify({"status": "error"}), 400
 
@@ -1118,6 +1217,7 @@ def logout():
         charge["terminated"] = True
         charge["unplug_modal"] = None
         charge["battery_modal"] = None
+        charge["power_shift_modal"] = None
         charge["waiting_for_new_plug"] = False
         
         elapsed = get_session_elapsed()
@@ -1192,7 +1292,7 @@ def download_invoice():
 def generate_pdf(report):
     buf = io.BytesIO()
     if REPORTLAB_AVAILABLE:
-        doc = SimpleDocTemplate(buf, pagesize=A4, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
+        doc = SimpleDocTemplate(buf, pagesize=A4, rightMargin=36, leftMargin=36, topMargin=36)
         styles = getSampleStyleSheet()
         story = []
         
@@ -1210,7 +1310,7 @@ def generate_pdf(report):
         story.append(Paragraph(
             f"Beleg-Nr.: <b>{report.get('invoice_id')}</b> | Datum: {report.get('date')}<br/>"
             f"Steuerland: <b>{c_name}</b> | Tarif: {STROMPREIS_PER_KWH:.2f} €/kWh (Netto)<br/>"
-            f"Gesamtlaufzeit: <b>{report.get('time_formatted', '00:00:00')}</b> (davon aktiv Strom gezogen: <b>{report.get('flow_time_formatted', '00:00:00')}</b> | Pausen/Leerlauf: <b>{report.get('idle_time_formatted', '00:00:00')}</b>)", ms))
+            f"Gesamtlaufzeit: <b>{report.get('time_formatted', '00:00:00')}</b> (davon aktiv Strom gezogen: <b>{report.get('flow_time_formatted', '00:00:00')}</b> | Pausen/Standby: <b>{report.get('idle_time_formatted', '00:00:00')}</b>)", ms))
         story.append(HRFlowable(width="100%", thickness=1.5, color=colors.HexColor("#2563eb"), spaceAfter=12))
 
         tbl = [["Pos", "Gerät & Modus", "Ladezeit", "Ø Leistung", "Energie", "Netto (€)", f"{vat_name} ({vat_rate:.1f}%)", "Brutto (€)"]]
@@ -1304,6 +1404,7 @@ def debug():
         "charge_paused": charge["paused"],
         "unplug_modal": charge["unplug_modal"],
         "battery_modal": charge["battery_modal"],
+        "power_shift_modal": charge["power_shift_modal"],
         "unplug_cooldown_until": charge["unplug_cooldown_until"],
         "flow_continuous_seconds": charge["flow_continuous_seconds"],
         "waiting_for_new_plug": charge["waiting_for_new_plug"],
@@ -1531,21 +1632,21 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 .ein{width:100%;padding:11px;border:1px solid var(--border);border-radius:10px;font-size:13.5px;margin-bottom:8px}
 </style></head><body>
 
-<!-- DIALOG 1: WURDE GERÄT ABGESTECKT? -->
+<!-- DIALOG 1: WURDE GERÄT ABGESTECKT ODER SCHLAFMODUS? -->
 <div id="modalAskUnplug" class="modal">
 <div class="mbox" style="text-align:center;border:2px solid var(--red)">
-  <div style="font-size:42px;margin-bottom:6px">🔌⚠️</div>
+  <div style="font-size:42px;margin-bottom:6px">🔌💤</div>
   <div style="font-size:18px;font-weight:800;margin-bottom:6px;color:#991b1b">Stromfluss auf 0.0 A abgefallen</div>
   <p style="font-size:13px;color:var(--muted);margin-bottom:18px;line-height:1.4">
-    Das Strom-Zählen wurde pausiert und die Steckdose sicherheitshalber <b>ausgeschaltet</b>.<br/>
-    <b>Wurde das Gerät ausgesteckt?</b>
+    Das Strom-Zählen wurde pausiert.<br/>
+    <b>Wurde das Gerät ausgesteckt oder ist es im Standby / Schlafmodus?</b>
   </p>
   
   <div style="display:flex;flex-direction:column;gap:10px">
-    <button class="btn bp" style="background:#059669;padding:14px;font-size:14.5px" onclick="handleUnplugResponse('no_resume')">
-      ❌ Nein, gleiches Gerät (Weiterladen)
+    <button class="btn bp" style="background:#059669;padding:14px;font-size:14px" onclick="handleUnplugResponse('no_resume')">
+      💤 Gleiches Gerät (Standby / Weiterladen)
     </button>
-    <button class="btn bs" style="background:#fee2e2;color:#b91c1c;border:1px solid #fca5a5;padding:14px;font-size:14.5px;font-weight:800" onclick="handleUnplugResponse('yes_unplugged')">
+    <button class="btn bs" style="background:#fee2e2;color:#b91c1c;border:1px solid #fca5a5;padding:14px;font-size:14px;font-weight:800" onclick="handleUnplugResponse('yes_unplugged')">
       ✅ Ja, Gerät ist ausgesteckt
     </button>
   </div>
@@ -1574,6 +1675,27 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
   <button class="btn bs" style="background:#f1f5f9;color:var(--text);padding:11px;font-size:13px" onclick="handleUnplugResponse('finish')">
     🧾 Sitzung beenden & Quittung
   </button>
+</div>
+</div>
+
+<!-- DIALOG 3: DRASTISCHER LASTWECHSEL ERKANNT (NEUES GERÄT ODER DISPLAY/STANDBY?) -->
+<div id="modalPowerShift" class="modal">
+<div class="mbox" style="text-align:center;border:2px solid var(--amber)">
+  <div style="font-size:42px;margin-bottom:6px">⚡📈</div>
+  <div style="font-size:18px;font-weight:800;margin-bottom:6px;color:#b45309">Signifikanter Lastwechsel erkannt!</div>
+  <p style="font-size:13px;color:var(--muted);margin-bottom:16px;line-height:1.4">
+    Die Leistung hat sich sprunghaft verändert von <b id="psFromW" style="color:var(--text)">-- W</b> auf <b id="psToW" style="color:var(--blue)">-- W</b>.<br/>
+    <b>Wurde ein neues / anderes Gerät eingesteckt?</b>
+  </p>
+  
+  <div style="display:flex;flex-direction:column;gap:10px">
+    <button class="btn bp" style="background:var(--blue);padding:13px;font-size:14px" onclick="handlePowerShift('new_device')">
+      🔄 Ja, neues separates Gerät erfassen
+    </button>
+    <button class="btn bs" style="background:#f8fafc;color:var(--text);padding:12px;font-size:13.5px" onclick="handlePowerShift('same_device')">
+      ✅ Nein, gleiches Gerät (Lastwechsel / Display / Aufwachen)
+    </button>
+  </div>
 </div>
 </div>
 
@@ -1733,7 +1855,7 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 <div class="badges">
   <span class="pill pill-g">🔒 Verifiziert</span>
   <span class="pill pill-off" id="sPill"><span class="dot"></span><span id="sTxt">Bereit</span></span>
-  <span class="pill pill-warn" id="unplugPill" style="display:none">⚠️ 0.0 A (Kein Strom)</span>
+  <span class="pill pill-warn" id="unplugPill" style="display:none">⚠️ 0.0 A (Standby / Pause)</span>
 </div>
 
 <!-- BANNER WENN AUF NEUES GERAET GEWARTET WIRD -->
@@ -1825,7 +1947,7 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 </div>
 <div class="g2">
   <div class="st bl"><div class="st-l">Wirkleistung (P)</div><div class="st-v"><span id="watt">0.000</span> W</div><div class="st-s" id="wSub">Kein Strom</div></div>
-  <div class="st"><div class="st-l">Gesamtlaufzeit (Daueruhr)</div><div class="st-v" id="timer">00:00:00</div></div>
+  <div class="st"><div class="st-l">Gesamtlaufzeit (Server-Master)</div><div class="st-v" id="timer">00:00:00</div></div>
 </div>
 <div class="g2">
   <div class="st bl"><div class="st-l">Verbrauch (Wh)</div><div class="st-v"><span id="wh">0.0000</span> Wh</div><div class="st-s"><span id="mwh">0.0</span> mWh</div></div>
@@ -1904,6 +2026,20 @@ var currentDevice = { num: 1, name: 'Gerät 1: Lampe / Beleuchtung', mode: 'cont
 var latestAiSuggestion = null;
 var allRecordedDevices = [];
 
+// Screen WakeLock
+async function requestWakeLock(){
+  try {
+    if('wakeLock' in navigator){ await navigator.wakeLock.request('screen'); }
+  } catch(e){}
+}
+
+document.addEventListener('visibilitychange', function(){
+  if(!document.hidden){
+    requestWakeLock();
+    poll();
+  }
+});
+
 function fs(s){
   s = Math.floor(Math.max(0, s));
   var h = Math.floor(s / 3600);
@@ -1960,6 +2096,7 @@ function startFreshSession(){
     document.getElementById('waitingPlugBanner').style.display = 'none';
     hideM('modalAskUnplug');
     hideM('modalAskNextDevice');
+    hideM('modalPowerShift');
     hideM('modalBattery80');
     hideM('modalBattery100');
     poll();
@@ -1969,6 +2106,7 @@ function startFreshSession(){
 function doStart(){
   if(done) return;
   lastActionLocalTime = Date.now();
+  requestWakeLock();
   sessionStarted = true;
   startContinuousTimer();
   document.getElementById('sPill').className = 'pill pill-on';
@@ -2008,6 +2146,15 @@ function handleUnplugResponse(action, devIdx){
     } else {
       poll();
     }
+  });
+}
+
+// LASTWECHSEL-ANTWORTEN
+function handlePowerShift(action){
+  lastActionLocalTime = Date.now();
+  hideM('modalPowerShift');
+  post('/power_shift_action', { action: action }).then(function(res){
+    poll();
   });
 }
 
@@ -2176,7 +2323,7 @@ function updateDynamicTimeline(devs, totalFlowSec, totalIdleSec, totalElapsedSec
 
   var flowPct = Math.min(100, Math.round((totalFlowSec / tot) * 100));
   var idlePct = 100 - flowPct;
-  document.getElementById('timelineFlowPct').innerText = flowPct + '% Strom aktiv (' + idlePct + '% Pausen)';
+  document.getElementById('timelineFlowPct').innerText = flowPct + '% Strom aktiv (' + idlePct + '% Standby/Pausen)';
 
   // 1. Segmente für jedes Gerät
   (devs || []).forEach(function(d, idx){
@@ -2198,7 +2345,7 @@ function updateDynamicTimeline(devs, totalFlowSec, totalIdleSec, totalElapsedSec
     grid.appendChild(chip);
   });
 
-  // 2. Segment für Pausen
+  // 2. Segment für Standby / Pausen
   if(totalIdleSec > 0 || totalFlowSec === 0){
     var pausePct = ((totalIdleSec / tot) * 100).toFixed(1);
     var pSeg = document.createElement('div');
@@ -2208,7 +2355,7 @@ function updateDynamicTimeline(devs, totalFlowSec, totalIdleSec, totalElapsedSec
 
     var pChip = document.createElement('div');
     pChip.className = 'time-chip';
-    pChip.innerHTML = '<div class="time-chip-left"><span class="time-chip-dot" style="background:#94a3b8"></span><span>⏸️ Pausen (0 W)</span></div><div class="time-chip-val" style="color:#64748b">' + fs(totalIdleSec) + ' <span style="font-size:9.5px">(' + pausePct + '%)</span></div>';
+    pChip.innerHTML = '<div class="time-chip-left"><span class="time-chip-dot" style="background:#94a3b8"></span><span>⏸️ Standby (0 W)</span></div><div class="time-chip-val" style="color:#64748b">' + fs(totalIdleSec) + ' <span style="font-size:9.5px">(' + pausePct + '%)</span></div>';
     grid.appendChild(pChip);
   }
 }
@@ -2234,7 +2381,7 @@ function showReceipt(rp){
   document.getElementById('rCountryName').innerText = cName;
   document.getElementById('rVatRate').innerText = vatRate.toFixed(1);
   document.getElementById('rVatName').innerText = vatName;
-  document.getElementById('rTimelinePct').innerText = 'Gesamtdauer: ' + fs(totalSec) + ' · ' + flowPct + '% Stromfluss | ' + (100 - flowPct) + '% Pausen';
+  document.getElementById('rTimelinePct').innerText = 'Gesamtdauer: ' + fs(totalSec) + ' · ' + flowPct + '% Stromfluss | ' + (100 - flowPct) + '% Standby';
 
   var rGrid = document.getElementById('rTimeChipsGrid');
   rGrid.innerHTML = '';
@@ -2246,7 +2393,7 @@ function showReceipt(rp){
   });
   var pChip = document.createElement('div');
   pChip.className = 'time-chip';
-  pChip.innerHTML = '<div class="time-chip-left"><span class="time-chip-dot" style="background:#94a3b8"></span><span>⏸️ Pausen/Leerlauf</span></div><div class="time-chip-val" style="color:#64748b">' + fs(idleSec) + '</div>';
+  pChip.innerHTML = '<div class="time-chip-left"><span class="time-chip-dot" style="background:#94a3b8"></span><span>⏸️ Standby/Pausen</span></div><div class="time-chip-val" style="color:#64748b">' + fs(idleSec) + '</div>';
   rGrid.appendChild(pChip);
 
   var tb = document.getElementById('recB');
@@ -2308,11 +2455,11 @@ function poll(){
       updateCountryDisplays();
     }
 
-    // Kontinuierliche Daueruhr (stoppt nie!)
+    // Kontinuierliche Daueruhr (Master auf Server)
     if(d.session_started){
       sessionStarted = true;
       startContinuousTimer();
-      if(Math.abs(localElapsed - srvSec) > 2.0){
+      if(Math.abs(localElapsed - srvSec) > 1.5){
         localElapsed = Math.floor(srvSec);
         updateTimerDisplay();
       }
@@ -2333,34 +2480,47 @@ function poll(){
       document.getElementById('sTxt').innerText = 'Bereit';
     }
 
-    // Modal Status Management (mit Schonfrist)
+    // Modal Status Management
     var isRecentAction = (Date.now() - lastActionLocalTime < 6000);
     
     // 1. Absteck-Modale
     if(d.unplug_modal === 'ASK_UNPLUG' && !isRecentAction){
       showM('modalAskUnplug');
       hideM('modalAskNextDevice');
+      hideM('modalPowerShift');
       hideM('modalBattery80');
       hideM('modalBattery100');
     } else if(d.unplug_modal === 'ASK_NEXT_DEVICE' && !isRecentAction){
       hideM('modalAskUnplug');
       renderReusableDevices(d.devices);
       showM('modalAskNextDevice');
+      hideM('modalPowerShift');
+      hideM('modalBattery80');
+      hideM('modalBattery100');
+    } else if(d.power_shift_modal && !isRecentAction){
+      document.getElementById('psFromW').innerText = d.power_shift_modal.from_w + ' W';
+      document.getElementById('psToW').innerText = d.power_shift_modal.to_w + ' W';
+      hideM('modalAskUnplug');
+      hideM('modalAskNextDevice');
+      showM('modalPowerShift');
       hideM('modalBattery80');
       hideM('modalBattery100');
     } else if(d.battery_modal === 'BATTERY_80' && !isRecentAction){
       hideM('modalAskUnplug');
       hideM('modalAskNextDevice');
+      hideM('modalPowerShift');
       showM('modalBattery80');
       hideM('modalBattery100');
     } else if(d.battery_modal === 'BATTERY_100' && !isRecentAction){
       hideM('modalAskUnplug');
       hideM('modalAskNextDevice');
+      hideM('modalPowerShift');
       hideM('modalBattery80');
       showM('modalBattery100');
-    } else if(!d.unplug_modal && !d.battery_modal || isRecentAction){
+    } else if(!d.unplug_modal && !d.battery_modal && !d.power_shift_modal || isRecentAction){
       hideM('modalAskUnplug');
       hideM('modalAskNextDevice');
+      hideM('modalPowerShift');
       hideM('modalBattery80');
       hideM('modalBattery100');
     }
@@ -2380,7 +2540,7 @@ function poll(){
       wb.style.display = 'none';
     }
 
-    // Stecker gezogen Indikator
+    // Stecker gezogen / Standby Indikator
     var unplugPill = document.getElementById('unplugPill');
     if(!d.is_flowing && (d.active || d.paused) && d.had_flowing){
       unplugPill.style.display = 'inline-flex';
@@ -2412,7 +2572,7 @@ function poll(){
     document.getElementById('costNetto').innerText = netto.toFixed(5) + ' €';
     document.getElementById('vatAmount').innerText = vatAmt.toFixed(5) + ' €';
 
-    document.getElementById('wSub').innerText = (curW > 0.1) ? 'Strom fließt' : 'Kein Strom';
+    document.getElementById('wSub').innerText = (curW > 0.1) ? 'Strom fließt' : 'Standby / 0 W';
 
     // KI & Aktives Gerät
     if(d.active_device){
@@ -2421,7 +2581,6 @@ function poll(){
 
     latestAiSuggestion = d.ai_result || {};
     var conf = latestAiSuggestion.confidence || 0;
-    var learnedCount = d.learned_profiles_count || 0;
     
     if(latestAiSuggestion.learned_match){
       document.getElementById('aiConf').innerText = '🎯 Gelernt (' + conf + '% Match)';
