@@ -476,156 +476,6 @@ def save_history():
 load_history()
 DeviceAI.load_learned()
 
-USER_FEEDBACK_FILE = "user_feedback_log.json"
-user_feedback_entries = []
-
-class AssistantBot:
-    @classmethod
-    def load_feedback(cls):
-        global user_feedback_entries
-        if os.path.exists(USER_FEEDBACK_FILE):
-            try:
-                with open(USER_FEEDBACK_FILE, "r", encoding="utf-8") as f:
-                    user_feedback_entries = json.load(f)
-                    logger.info(f"💬 [Feedback-Log] {len(user_feedback_entries)} Interaktionen geladen.")
-            except Exception as e:
-                logger.error(f"Fehler beim Laden des Feedback-Logs: {e}")
-
-    @classmethod
-    def log_interaction(cls, user_msg, bot_response, context_snapshot, executed_action=None):
-        global user_feedback_entries
-        entry = {
-            "timestamp": time.time(),
-            "datetime": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "user_message": user_msg,
-            "bot_response": bot_response,
-            "executed_action": executed_action,
-            "context": context_snapshot
-        }
-        user_feedback_entries.insert(0, entry)
-        if len(user_feedback_entries) > 200:
-            user_feedback_entries = user_feedback_entries[:200]
-        try:
-            with open(USER_FEEDBACK_FILE, "w", encoding="utf-8") as f:
-                json.dump(user_feedback_entries, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            logger.error(f"Fehler beim Speichern des Feedback-Logs: {e}")
-
-    @classmethod
-    def respond(cls, user_msg, charge_state, shelly_state):
-        msg = user_msg.strip().lower()
-        now = time.time()
-        
-        curr_idx = charge_state.get("current_device_idx", 0)
-        devs = charge_state.get("devices", [])
-        cur_d = devs[curr_idx] if 0 <= curr_idx < len(devs) else None
-        
-        w = shelly_state.get("watt", 0.0)
-        a = shelly_state.get("amp", 0.0)
-        v = shelly_state.get("volt", 230.0)
-        wh = charge_state.get("total_wh", 0.0)
-        cost = charge_state.get("total_cost_brutto", 0.0)
-        is_active = charge_state.get("active", False) and not charge_state.get("paused", False)
-        is_paused = charge_state.get("paused", False)
-        
-        dev_name = cur_d["name"] if cur_d else "Gerät 1"
-        is_batt = cur_d.get("is_battery", False) if cur_d else False
-        nom_wh = cur_d.get("nominal_wh", 0.0) if cur_d else 0.0
-        cur_wh = cur_d.get("wh", 0.0) if cur_d else 0.0
-        soc_pct = min(100.0, (cur_wh / nom_wh * 100.0)) if is_batt and nom_wh > 0 else None
-
-        executed_action = None
-        action_payload = None
-
-        # 1. AKTION: PAUSE
-        if any(kw in msg for kw in ["paus", "stopp", "halt", "aus schalten", "ausschalten", "steckdose aus"]):
-            executed_action = "pause"
-            bot_text = f"⏸️ Ich habe die Stromzufuhr für **{dev_name}** pausiert. Die Steckdose ist jetzt abgeschaltet (0.0 W). Du kannst jederzeit mit 'Fortsetzen' oder über den Button weiterladen!"
-
-        # 2. AKTION: FORTSETZEN
-        elif any(kw in msg for kw in ["fortsetz", "weiter", "start", "einschalten", "wieder an", "an schalten", "steckdose an", "lade"]):
-            executed_action = "resume"
-            bot_text = f"▶️ Ladevorgang für **{dev_name}** fortgesetzt! Das Relais wurde eingeschaltet und Strom fließt wieder."
-
-        # 3. AKTION: WECHSEL AUF GERÄT X
-        elif "wechsel" in msg or "zu gerät" in msg or "auf gerät" in msg:
-            target_idx = None
-            for idx, d in enumerate(devs):
-                if str(d.get("num", idx+1)) in msg:
-                    target_idx = idx
-                    break
-            if target_idx is not None and 0 <= target_idx < len(devs):
-                executed_action = "switch_device"
-                action_payload = {"device_idx": target_idx}
-                bot_text = f"👉 Ich habe die aktive Erfassung auf **{devs[target_idx]['name']}** umgeschaltet. Alle weiteren Messwerte fließen jetzt hierhin."
-            else:
-                bot_text = f"ℹ️ Du hast {len(devs)} Geräte erfasst. Klicke einfach oben auf den Reiter des gewünschten Geräts oder sage mir z. B. 'Wechsle zu Gerät 1'."
-
-        # 4. AKTION: 100% AKKU FREIGEBEN
-        elif "100" in msg or "voll" in msg:
-            executed_action = "charge_100"
-            bot_text = f"⚡ 100%-Modus aktiviert! Der 80%-Schutzstop wird übersprungen und **{dev_name}** wird bis zur vollen Kapazität ({nom_wh:.0f} Wh) geladen."
-
-        # 5. FRAGE: AKKUSTAND / RESTDAUER
-        elif any(kw in msg for kw in ["wie lange", "dauer", "akku", "prozent", "fertig", "wann voll"]):
-            if is_batt and nom_wh > 0:
-                needed_wh = max(0.0, nom_wh * 0.8 - cur_wh) if not cur_d.get("charge_to_100") else max(0.0, nom_wh - cur_wh)
-                target_pct = 100 if cur_d.get("charge_to_100") else 80
-                if w > 1.0:
-                    hours_left = needed_wh / w
-                    mins_left = int(hours_left * 60)
-                    bot_text = f"🔋 **{dev_name}** ist zu ca. **{soc_pct:.0f}%** geladen ({cur_wh:.1f} von {nom_wh:.0f} Wh). Bei aktueller Leistung ({w:.1f} W) dauert es noch ca. **{mins_left} Minuten** bis zu den optimalen **{target_pct}%**."
-                else:
-                    bot_text = f"🔋 **{dev_name}** hat bisher **{cur_wh:.2f} Wh** geladen ({soc_pct:.0f}%). Aktuell fließt kein messbarer Strom ({w:.1f} W)."
-            else:
-                bot_text = f"ℹ️ **{dev_name}** ist als Dauerbetrieb konfiguriert ({w:.1f} W). Hier gibt es keine feste Akkugrenze. Du kannst es jederzeit über 'Ändern' als Akku-Gerät einstellen."
-
-        # 6. FRAGE: WATT-SCHWANKUNGEN / 0 WATT
-        elif any(kw in msg for kw in ["0 watt", "0w", "schwankt", "warum 0", "warum schwankt", "warum steht 0", "warum so wenig"]):
-            bot_text = f"⚡ **Warum schwankt die Leistung?**\n" \
-                       f"• Moderne Netzteile & Akkus (z. B. Smartphone / E-Bike) regulieren die Stromstärke dynamisch: Am Anfang laden sie mit voller Leistung, gegen Ende sinkt die Wattzahl stetig (CV-Phase).\n" \
-                       f"• Steht 0.0 W, ist das Gerät entweder voll geladen, im Standby oder die Steckdose wurde pausiert. Aktuelle Spannung: {v:.1f} V."
-
-        # 7. FRAGE: KOSTEN / PREIS
-        elif any(kw in msg for kw in ["preis", "kosten", "teuer", "kwh", "euro", "cent"]):
-            c_info = COUNTRY_VAT_RATES.get(charge_state.get("selected_country"), COUNTRY_VAT_RATES["DE"])
-            bot_text = f"💶 **Kostenübersicht:**\n" \
-                       f"• Bisheriger Verbrauch: **{wh:.3f} Wh** ({wh/1000.0:.6f} kWh)\n" \
-                       f"• Aktueller Gesamtbetrag: **{cost:.4f} €** (inkl. {c_info['rate']}% {c_info['vat_name']})\n" \
-                       f"• Tarif: **0.40 € pro kWh** (0.336 € netto)."
-
-        # 8. FRAGE / ANLEITUNG: GERÄTEWECHSEL
-        elif any(kw in msg for kw in ["umstecken", "abstecken", "neues gerät", "wie wechsel"]):
-            bot_text = f"🔄 **So funktioniert der Gerätewechsel:**\n" \
-                       f"1. Ziehe einfach den Stecker des aktuellen Geräts ab.\n" \
-                       f"2. Es öffnet sich automatisch das Wechsel-Menü, wo du das nächste Gerät (z. B. Smartphone oder Laptop) antippen kannst.\n" \
-                       f"3. Alternativ kannst du jederzeit oben auf den Button **[➕ Neues Gerät]** tippen oder zwischen den Reitern wechseln."
-
-        # 9. FEEDBACK / ALLGEMEIN
-        else:
-            bot_text = f"🤖 **Ich habe deine Nachricht erfasst:** „*{user_msg}*“.\n\n" \
-                       f"💡 **Aktueller Live-Status:**\n" \
-                       f"• Gerät: **{dev_name}** ({w:.1f} W | {wh:.2f} Wh)\n" \
-                       f"• Status: {'🟢 Aktiv lädt' if is_active else ('⏸️ Pausiert' if is_paused else 'Bereit')}\n" \
-                       f"• Tippe unten auf eine Frage oder sage mir z. B. *'Pausiere'*, *'Wie lange noch?'* oder *'Auf 100% laden'*."
-
-        context_snapshot = {
-            "watt": round(w, 2),
-            "amp": round(a, 3),
-            "volt": round(v, 1),
-            "wh": round(wh, 4),
-            "cost_brutto": round(cost, 4),
-            "active_device": dev_name,
-            "is_active": is_active,
-            "is_paused": is_paused,
-            "device_count": len(devs)
-        }
-
-        cls.log_interaction(user_msg, bot_text, context_snapshot, executed_action)
-        return bot_text, executed_action, action_payload
-
-AssistantBot.load_feedback()
-
 
 # =====================================================================
 # SHELLY CLOUD - ZENTRALER GEPUFFERTER POLLER (RATE-LIMIT SCHUTZ)
@@ -704,6 +554,82 @@ def get_session_elapsed():
         return time.time() - charge["session_start_time"]
     return 0.0
 
+
+
+USER_FEEDBACK_FILE = "user_feedback_log.json"
+user_feedback_entries = []
+
+def load_user_feedback():
+    global user_feedback_entries
+    if os.path.exists(USER_FEEDBACK_FILE):
+        try:
+            with open(USER_FEEDBACK_FILE, "r", encoding="utf-8") as f:
+                user_feedback_entries = json.load(f)
+        except Exception:
+            user_feedback_entries = []
+
+def save_user_feedback(entry):
+    global user_feedback_entries
+    user_feedback_entries.insert(0, entry)
+    try:
+        with open(USER_FEEDBACK_FILE, "w", encoding="utf-8") as f:
+            json.dump(user_feedback_entries[:300], f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+load_user_feedback()
+
+class AssistantBot:
+    @classmethod
+    def respond(cls, user_msg, charge_state, shelly_state):
+        msg = user_msg.strip().lower()
+        now = time.time()
+        
+        curr_idx = charge_state.get("current_device_idx", 0)
+        devs = charge_state.get("devices", [])
+        cur_d = devs[curr_idx] if 0 <= curr_idx < len(devs) else None
+        
+        w = shelly_state.get("watt", 0.0)
+        a = shelly_state.get("amp", 0.0)
+        v = shelly_state.get("volt", 230.0)
+        wh = charge_state.get("total_wh", 0.0)
+        cost = charge_state.get("total_cost_brutto", 0.0)
+        
+        dev_name = cur_d["name"] if cur_d else "Gerät 1"
+        is_batt = cur_d.get("is_battery", False) if cur_d else False
+        nom_wh = cur_d.get("nominal_wh", 0.0) if cur_d else 0.0
+        cur_wh = cur_d.get("wh", 0.0) if cur_d else 0.0
+        soc_pct = min(100.0, (cur_wh / nom_wh * 100.0)) if is_batt and nom_wh > 0 else None
+
+        executed_action = None
+        action_payload = None
+
+        if any(kw in msg for kw in ["paus", "stopp", "halt", "aus schalten", "ausschalten", "steckdose aus"]):
+            executed_action = "pause"
+            bot_text = f"⏸️ Ich habe die Stromzufuhr für **{dev_name}** pausiert. Die Steckdose ist jetzt abgeschaltet (0.0 W)."
+
+        elif any(kw in msg for kw in ["fortsetz", "weiter", "start", "einschalten", "wieder an", "an schalten", "lade"]):
+            executed_action = "resume"
+            bot_text = f"▶️ Ladevorgang für **{dev_name}** fortgesetzt! Das Relais ist eingeschaltet."
+
+        elif any(kw in msg for kw in ["dauer", "akku", "lange", "prozent", "voll", "soc", "wann"]):
+            if is_batt:
+                wh_left_80 = max(0.0, (nom_wh * 0.8) - cur_wh)
+                min_80 = round((wh_left_80 / w) * 60) if w > 0.5 else 0
+                bot_text = f"🔋 **{dev_name}** ist zu ca. **{soc_pct:.0f}%** geladen ({cur_wh:.1f} von {nom_wh:.0f} Wh). Bei aktueller Ladeleistung ({w:.1f} W) dauert es ca. **{min_80} Min** bis zum 80%-Schutz."
+            else:
+                bot_text = f"ℹ️ **{dev_name}** ist als Dauerbetrieb konfiguriert (kein Akku). Die Station läuft kontinuierlich bei {w:.1f} W."
+
+        elif any(kw in msg for kw in ["schwank", "watt", "0", "null", "wenig", "leistung", "w"]):
+            bot_text = f"⚡ **Warum schwankt die Leistung?**\n• Netzteile & Akkus regeln den Ladestrom dynamisch (CC/CV-Kennlinie).\n• Aktuell fließen **{w:.1f} W** ({a:.3f} A bei {v:.1f} V)."
+
+        elif any(kw in msg for kw in ["kost", "preis", "euro", "geld", "cent", "rechnung"]):
+            bot_text = f"💶 **Bisherige Kosten:**\n• Gesamtbetrag: **{cost:.5f} €** (Brutto inkl. MwSt.)\n• Energie: **{wh:.2f} Wh** ({wh/1000.0:.4f} kWh)\n• Tarif: 0.35 € / kWh (Netto)."
+
+        else:
+            bot_text = f"🤖 **Smart Power Bot:** Ich überwache den Ladevorgang von **{dev_name}** ({w:.1f} W / {wh:.2f} Wh). Du kannst mich jederzeit nach Restdauer, Kosten oder Watt-Werten fragen!"
+
+        return bot_text, executed_action, action_payload
 
 def new_device_entry(num, key="lamp"):
     prof = DEVICE_PROFILES.get(key, DEVICE_PROFILES["lamp"])
@@ -1022,6 +948,73 @@ def check_worker_daemon():
 def headers(r):
     r.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     return r
+
+
+@app.route('/assistant_chat', methods=['POST'])
+def assistant_chat():
+    data = request.get_json() or {}
+    user_msg = data.get("message", "").strip()
+    if not user_msg:
+        return jsonify({"status": "error", "message": "Leere Nachricht"}), 400
+
+    with lock:
+        bot_text, action, payload = AssistantBot.respond(user_msg, charge, shelly)
+        
+        if action == "pause":
+            accumulate_energy()
+            charge["active"] = False
+            charge["paused"] = True
+            charge["relay_on"] = False
+            charge["last_wh_time"] = None
+            shelly["watt"] = 0.0
+            shelly["amp"] = 0.0
+            relay_control(False)
+        elif action == "resume":
+            now = time.time()
+            if charge["session_start_time"] is None:
+                charge["session_start_time"] = now
+            charge["active"] = True
+            charge["paused"] = False
+            charge["relay_on"] = True
+            charge["unplug_modal"] = None
+            charge["battery_modal"] = None
+            charge["power_shift_modal"] = None
+            charge["unplug_cooldown_until"] = now + 15.0
+            charge["last_wh_time"] = now
+            relay_control(True)
+
+        curr_dev = charge["devices"][charge["current_device_idx"]] if charge["devices"] else {}
+        feedback_entry = {
+            "datetime": time.strftime('%d.%m.%Y %H:%M:%S'),
+            "timestamp": time.time(),
+            "user_message": user_msg,
+            "bot_response": bot_text,
+            "executed_action": action,
+            "context": {
+                "watt": shelly.get("watt", 0.0),
+                "amp": shelly.get("amp", 0.0),
+                "wh": charge.get("total_wh", 0.0),
+                "cost_brutto": charge.get("total_cost_brutto", 0.0),
+                "active_device": curr_dev.get("name", "Gerät 1"),
+                "is_battery": curr_dev.get("is_battery", False)
+            }
+        }
+        save_user_feedback(feedback_entry)
+
+        return jsonify({
+            "status": "ok",
+            "reply": bot_text,
+            "action": action,
+            "payload": payload
+        })
+
+@app.route('/feedback_api')
+def feedback_api():
+    return jsonify({
+        "status": "ok",
+        "count": len(user_feedback_entries),
+        "entries": user_feedback_entries
+    })
 
 @app.route('/')
 def index():
@@ -1518,66 +1511,6 @@ def set_device():
                 return jsonify({"status": "ok", "device": dev})
     return jsonify({"status": "error"}), 400
 
-@app.route('/assistant_chat', methods=['POST'])
-def assistant_chat():
-    data = request.get_json() or {}
-    user_msg = data.get("message", "").strip()
-    if not user_msg:
-        return jsonify({"status": "error", "message": "Leere Nachricht"}), 400
-
-    with lock:
-        bot_text, action, payload = AssistantBot.respond(user_msg, charge, shelly)
-        
-        # Ausführen von Live-Aktionen direkt on-the-fly
-        if action == "pause":
-            accumulate_energy()
-            charge["active"] = False
-            charge["paused"] = True
-            charge["relay_on"] = False
-            shelly["watt"] = 0.0
-            shelly["amp"] = 0.0
-            relay_control(False)
-            logger.info("🤖 [KI-Assistent] Aktion PAUSE ausgeführt.")
-        elif action == "resume":
-            now = time.time()
-            charge["active"] = True
-            charge["paused"] = False
-            charge["relay_on"] = True
-            charge["unplug_cooldown_until"] = now + 15.0
-            charge["power_shift_cooldown_until"] = now + 45.0
-            charge["last_wh_time"] = now
-            relay_control(True)
-            logger.info("🤖 [KI-Assistent] Aktion FORTSETZEN ausgeführt.")
-        elif action == "switch_device" and payload:
-            idx = payload.get("device_idx", 0)
-            if 0 <= idx < len(charge["devices"]):
-                charge["current_device_idx"] = idx
-                logger.info(f"🤖 [KI-Assistent] Aktion WECHSEL AUF GERÄT #{idx+1} ausgeführt.")
-        elif action == "charge_100":
-            idx = charge["current_device_idx"]
-            if 0 <= idx < len(charge["devices"]):
-                charge["devices"][idx]["charge_to_100"] = True
-                charge["active"] = True
-                charge["paused"] = False
-                charge["relay_on"] = True
-                relay_control(True)
-                logger.info(f"🤖 [KI-Assistent] Aktion 100% VOLLLADUNG freigegeben.")
-
-    return jsonify({
-        "status": "ok",
-        "reply": bot_text,
-        "action": action,
-        "active_device_idx": charge["current_device_idx"]
-    })
-
-@app.route('/feedback_api')
-def get_feedback_log():
-    return jsonify({
-        "status": "ok",
-        "count": len(user_feedback_entries),
-        "entries": user_feedback_entries
-    })
-
 @app.route('/logout', methods=['POST', 'GET'])
 def logout():
     with lock:
@@ -1794,6 +1727,7 @@ def debug():
         "server_time": time.time()
     })
 
+
 ADMIN_PASSWORD = "admin2026"
 
 def get_admin_stats():
@@ -1804,7 +1738,6 @@ def get_admin_stats():
         "24h": {"seconds": 86400, "label": "Letzte 24 Stunden", "devices": {}, "sessions": 0, "wh": 0.0, "cost": 0.0}
     }
     
-    # 1. Abgeschlossene Sitzungen (DSGVO-anonymisiert)
     for r in history_records:
         r_ts = float(r.get("timestamp") or 0.0)
         if r_ts == 0.0 and r.get("date"):
@@ -1828,7 +1761,6 @@ def get_admin_stats():
                     d_key = f"{d_ico} {d_name}"
                     win["devices"][d_key] = win["devices"].get(d_key, 0) + 1
 
-    # 2. Laufende Sitzung (falls aktiv)
     if charge.get("active") or float(charge.get("total_wh") or 0.0) > 0:
         cur_wh = float(charge.get("total_wh") or 0.0)
         cur_cost = float(charge.get("total_cost_brutto") or 0.0)
@@ -1870,7 +1802,6 @@ def admin_page(token=None):
     today_wh_val = sum(float(r.get("total_wh") or 0.0) for r in today_recs)
     tot_kwh_val = float(history_stats.get("kwh") or 0.0)
 
-    # Zusammenfassung der KI-Chat Themen
     chat_summary = {
         "total": len(user_feedback_entries),
         "restdauer": sum(1 for e in user_feedback_entries if any(k in e.get("user_message","").lower() for k in ["dauer", "akku", "lange", "prozent"])),
@@ -1904,25 +1835,6 @@ def admin_logout():
     session.pop("admin_auth", None)
     return redirect(url_for('admin_page'))
 
-@app.route('/admin_api/override', methods=['POST'])
-def admin_override():
-    data = request.get_json() or {}
-    action = data.get("action")
-    if action == "force_on":
-        relay_control(True)
-        return jsonify({"status": "ok", "message": "Relais EIN"})
-    elif action == "force_off":
-        relay_control(False)
-        with lock:
-            charge["active"] = False
-        return jsonify({"status": "ok", "message": "Relais AUS"})
-    return jsonify({"status": "error"}), 400
-
-
-# =====================================================================
-# HTML UI TEMPLATES
-# =====================================================================
-
 LOCK_HTML = """<!DOCTYPE html>
 <html lang="de"><head><meta charset="utf-8"><title>Smart Power Hub</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
@@ -1946,6 +1858,7 @@ p{font-size:13.5px;color:#94a3b8;line-height:1.5;margin-bottom:20px}
 <a href="/scan/{{ required_token }}" class="btn">📲 Station freischalten</a>
 <a href="/admin/{{ admin_token }}" class="btn btn2" style="margin-top:12px;text-decoration:none">⚙️ Admin</a>
 </div></body></html>"""
+
 
 
 ADMIN_LOGIN_HTML = """<!DOCTYPE html>
@@ -1995,7 +1908,6 @@ body{background:var(--bg);color:var(--text);padding:16px;display:flex;justify-co
 .title{font-size:22px;font-weight:800;display:flex;align-items:center;gap:8px}
 .dsgvo-pill{background:#064e3b;color:#6ee7b7;font-size:11px;font-weight:700;padding:4px 10px;border-radius:20px;display:inline-flex;align-items:center;gap:5px}
 
-/* ZEITFENSTER-VERGLEICHSKARTEN (1h, 6h, 24h) */
 .win-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px;margin-bottom:20px}
 .wcard{background:var(--card);border:1.5px solid var(--card-border);border-radius:20px;padding:18px;position:relative;overflow:hidden}
 .wcard.w1h{border-color:#3b82f6}
@@ -2044,22 +1956,14 @@ body{background:var(--bg);color:var(--text);padding:16px;display:flex;justify-co
     </div>
   </div>
 
-  <!-- DSGVO ZEITFENSTER-VERGLEICH (1h vs. 6h vs. 24h) -->
   <div style="font-size:13px;font-weight:800;text-transform:uppercase;color:var(--muted);margin-bottom:10px;letter-spacing:.5px">
     📊 Anonyme Lade- & Gerätestatistiken nach Zeitfenster
   </div>
 
   <div class="win-grid">
-    <!-- 1 STUNDE -->
     <div class="wcard w1h">
-      <div class="wcard-hdr">
-        <div class="wcard-title">⏱️ Letzte 1 Stunde</div>
-        <span class="wcard-badge">Echtzeit</span>
-      </div>
-      <div class="wstat-row">
-        <div class="wstat-val" style="color:#93c5fd">{{ "%.2f"|format(stats['1h']['wh']) }} Wh</div>
-        <div class="wstat-sub"><b style="color:#a7f3d0">{{ "%.4f"|format(stats['1h']['cost']) }} €</b></div>
-      </div>
+      <div class="wcard-hdr"><div class="wcard-title">⏱️ Letzte 1 Stunde</div><span class="wcard-badge">Echtzeit</span></div>
+      <div class="wstat-row"><div class="wstat-val" style="color:#93c5fd">{{ "%.2f"|format(stats['1h']['wh']) }} Wh</div><div class="wstat-sub"><b style="color:#a7f3d0">{{ "%.4f"|format(stats['1h']['cost']) }} €</b></div></div>
       <div style="font-size:11.5px;color:var(--muted);margin-bottom:6px">Ladevorgänge: <b>{{ stats['1h']['sessions'] }}</b></div>
       <div class="wdev-box">
         <div class="wdev-title">Angeschlossene Geräte-Typen:</div>
@@ -2073,16 +1977,9 @@ body{background:var(--bg);color:var(--text);padding:16px;display:flex;justify-co
       </div>
     </div>
 
-    <!-- 6 STUNDEN -->
     <div class="wcard w6h">
-      <div class="wcard-hdr">
-        <div class="wcard-title">⏱️ Letzte 6 Stunden</div>
-        <span class="wcard-badge">Halbtag</span>
-      </div>
-      <div class="wstat-row">
-        <div class="wstat-val" style="color:#a7f3d0">{{ "%.2f"|format(stats['6h']['wh']) }} Wh</div>
-        <div class="wstat-sub"><b style="color:#a7f3d0">{{ "%.4f"|format(stats['6h']['cost']) }} €</b></div>
-      </div>
+      <div class="wcard-hdr"><div class="wcard-title">⏱️ Letzte 6 Stunden</div><span class="wcard-badge">Halbtag</span></div>
+      <div class="wstat-row"><div class="wstat-val" style="color:#a7f3d0">{{ "%.2f"|format(stats['6h']['wh']) }} Wh</div><div class="wstat-sub"><b style="color:#a7f3d0">{{ "%.4f"|format(stats['6h']['cost']) }} €</b></div></div>
       <div style="font-size:11.5px;color:var(--muted);margin-bottom:6px">Ladevorgänge: <b>{{ stats['6h']['sessions'] }}</b></div>
       <div class="wdev-box">
         <div class="wdev-title">Angeschlossene Geräte-Typen:</div>
@@ -2096,16 +1993,9 @@ body{background:var(--bg);color:var(--text);padding:16px;display:flex;justify-co
       </div>
     </div>
 
-    <!-- 24 STUNDEN -->
     <div class="wcard w24h">
-      <div class="wcard-hdr">
-        <div class="wcard-title">⏱️ Letzte 24 Stunden</div>
-        <span class="wcard-badge">24h Bilanz</span>
-      </div>
-      <div class="wstat-row">
-        <div class="wstat-val" style="color:#ddd6fe">{{ "%.2f"|format(stats['24h']['wh']) }} Wh</div>
-        <div class="wstat-sub"><b style="color:#a7f3d0">{{ "%.4f"|format(stats['24h']['cost']) }} €</b></div>
-      </div>
+      <div class="wcard-hdr"><div class="wcard-title">⏱️ Letzte 24 Stunden</div><span class="wcard-badge">24h Bilanz</span></div>
+      <div class="wstat-row"><div class="wstat-val" style="color:#ddd6fe">{{ "%.2f"|format(stats['24h']['wh']) }} Wh</div><div class="wstat-sub"><b style="color:#a7f3d0">{{ "%.4f"|format(stats['24h']['cost']) }} €</b></div></div>
       <div style="font-size:11.5px;color:var(--muted);margin-bottom:6px">Ladevorgänge: <b>{{ stats['24h']['sessions'] }}</b></div>
       <div class="wdev-box">
         <div class="wdev-title">Angeschlossene Geräte-Typen:</div>
@@ -2126,7 +2016,6 @@ body{background:var(--bg);color:var(--text);padding:16px;display:flex;justify-co
     <button class="tab" onclick="showTab('tabHist')">📜 Lade-Historie ({{ history_records|length }})</button>
   </div>
 
-  <!-- PANE 1: KI-CHAT & FEEDBACK -->
   <div id="tabChat" class="pane active">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:8px">
       <div>
@@ -2182,7 +2071,6 @@ body{background:var(--bg);color:var(--text);padding:16px;display:flex;justify-co
     </table>
   </div>
 
-  <!-- PANE 2: LIVE STEUERUNG -->
   <div id="tabCtrl" class="pane">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:12px">
       <div>
@@ -2198,7 +2086,6 @@ body{background:var(--bg);color:var(--text);padding:16px;display:flex;justify-co
     </div>
   </div>
 
-  <!-- PANE 3: HISTORIE -->
   <div id="tabHist" class="pane">
     <div style="font-size:16px;font-weight:800;margin-bottom:12px">Abgeschlossene Ladesitzungen</div>
     <table class="tbl">
@@ -2368,6 +2255,11 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 .dev-opt-nm{font-size:13.5px;font-weight:700;color:var(--text)}
 .dev-opt-sub{font-size:11px;color:var(--muted)}
 .dev-opt-tag{font-size:10px;font-weight:700;padding:3px 7px;border-radius:6px}
+.chat-chip{background:#f1f5f9;border:1px solid #cbd5e1;color:#334155;font-size:11px;font-weight:700;padding:5px 9px;border-radius:12px;white-space:nowrap;cursor:pointer;display:inline-block}
+.chat-chip:hover{background:#e2e8f0}
+.chat-msg{padding:8px 12px;border-radius:12px;font-size:12.5px;line-height:1.45}
+.chat-msg.bot{background:#ffffff;border:1px solid #e2e8f0;color:#0f172a;align-self:flex-start}
+.chat-msg.user{background:#2563eb;color:#ffffff;align-self:flex-end}
 
 .reuse-card{border:1.5px solid #bfdbfe;background:#eff6ff;border-radius:14px;padding:12px;margin-bottom:8px;cursor:pointer;transition:transform .1s, background .15s}
 .reuse-card:hover{background:#dbeafe}
@@ -2381,29 +2273,10 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 .rtbl td{padding:8px 4px;border-bottom:1px solid var(--border)}
 .tbox{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:14px;padding:14px;text-align:right;margin-top:14px}
 .ein{width:100%;padding:11px;border:1px solid var(--border);border-radius:10px;font-size:13.5px;margin-bottom:8px}
-
-/* FLOATING KI-ASSISTENT & CHAT-DRAWER */
-.fab-chat{position:fixed !important;bottom:24px !important;right:20px !important;background:#2563eb !important;color:#ffffff !important;border:2px solid #93c5fd !important;border-radius:30px !important;padding:12px 18px !important;font-size:13.5px !important;font-weight:800 !important;box-shadow:0 10px 30px rgba(37,99,235,.45) !important;cursor:pointer !important;z-index:999999 !important;display:flex !important;align-items:center !important;gap:8px !important;transition:transform .2s,box-shadow .2s}
-.fab-chat:hover{transform:translateY(-2px);box-shadow:0 14px 34px rgba(37,99,235,.55) !important}
-.fab-dot{width:9px;height:9px;background:#4ade80;border-radius:50%;box-shadow:0 0 8px #4ade80}
-.chat-drawer{position:fixed !important;bottom:80px !important;right:18px !important;width:360px !important;max-width:calc(100vw - 36px) !important;height:490px !important;max-height:calc(100vh - 110px) !important;background:#ffffff !important;border-radius:22px !important;box-shadow:0 24px 60px rgba(0,0,0,.3) !important;border:1.5px solid #cbd5e1 !important;display:none;flex-direction:column;z-index:1000000 !important;overflow:hidden;animation:pop .2s ease-out}
-.chat-hdr{background:#0f172a;color:#ffffff;padding:12px 16px;display:flex;align-items:center;justify-content:space-between}
-.chat-title{font-size:13.5px;font-weight:800;display:flex;align-items:center;gap:6px}
-.chat-body{flex:1;padding:12px;overflow-y:auto;display:flex;flex-direction:column;gap:8px;background:#f8fafc}
-.chat-msg{max-width:86%;padding:8px 12px;border-radius:14px;font-size:12px;line-height:1.45;word-wrap:break-word}
-.chat-msg.bot{background:#ffffff;color:#0f172a;align-self:flex-start;border:1px solid #e2e8f0;border-bottom-left-radius:3px}
-.chat-msg.user{background:#2563eb;color:#ffffff;align-self:flex-end;border-bottom-right-radius:3px}
-.chat-chips{display:flex;gap:5px;overflow-x:auto;padding:6px 10px;background:#ffffff;border-top:1px solid #e2e8f0;scrollbar-width:none}
-.chat-chip{background:#f1f5f9;border:1px solid #cbd5e1;color:#334155;font-size:10.5px;font-weight:700;padding:4px 8px;border-radius:12px;white-space:nowrap;cursor:pointer;transition:background .15s}
-.chat-chip:hover{background:#e2e8f0}
-.chat-input-bar{display:flex;padding:8px 10px;background:#ffffff;border-top:1px solid #e2e8f0;gap:6px}
-.chat-in{flex:1;padding:8px 12px;border:1.5px solid #cbd5e1;border-radius:20px;font-size:12px;outline:none;font-family:inherit}
-.chat-in:focus{border-color:#2563eb}
-.chat-send{background:#2563eb;color:#fff;border:none;border-radius:50%;width:32px;height:32px;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:13px;flex-shrink:0}
 </style></head><body>
 
 <!-- DIALOG 1: WURDE GERÄT ABGESTECKT ODER SCHLAFMODUS? -->
-<div id="modalAskUnplug" class="modal" style="display:none">
+<div id="modalAskUnplug" class="modal">
 <div class="mbox" style="text-align:center;border:2px solid var(--red)">
   <div style="font-size:42px;margin-bottom:6px">🔌💤</div>
   <div style="font-size:18px;font-weight:800;margin-bottom:6px;color:#991b1b">Stromfluss auf 0.0 A abgefallen</div>
@@ -2424,7 +2297,7 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 </div>
 
 <!-- DIALOG 2: FRÜHERES GERÄT WIEDERVERWENDEN ODER NEUES GERÄT? -->
-<div id="modalAskNextDevice" class="modal" style="display:none">
+<div id="modalAskNextDevice" class="modal">
 <div class="mbox" style="text-align:left;border:2px solid var(--blue)">
   <div style="text-align:center;margin-bottom:12px">
     <div style="font-size:38px;margin-bottom:4px">🔄⚡</div>
@@ -2504,7 +2377,7 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 </div>
 
 <!-- DIALOG 3: DRASTISCHER LASTWECHSEL ERKANNT (NEUES GERÄT ODER DISPLAY/STANDBY?) -->
-<div id="modalPowerShift" class="modal" style="display:none">
+<div id="modalPowerShift" class="modal">
 <div class="mbox" style="text-align:center;border:2px solid var(--amber)">
   <div style="font-size:42px;margin-bottom:6px">⚡📈</div>
   <div style="font-size:18px;font-weight:800;margin-bottom:6px;color:#b45309">Lastwechsel erkannt</div>
@@ -2530,7 +2403,7 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 </div>
 
 <!-- DIALOG: 80% AKKUSCHUTZ ERREICHT -->
-<div id="modalBattery80" class="modal" style="display:none">
+<div id="modalBattery80" class="modal">
 <div class="mbox" style="text-align:center;border:2px solid #059669">
   <div style="font-size:42px;margin-bottom:6px">🛡️🔋</div>
   <div style="font-size:18px;font-weight:800;margin-bottom:6px;color:#065f46">80% Akkuschutz erreicht!</div>
@@ -2551,7 +2424,7 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 </div>
 
 <!-- DIALOG: 100% AKKU VOLLGELADEN -->
-<div id="modalBattery100" class="modal" style="display:none">
+<div id="modalBattery100" class="modal">
 <div class="mbox" style="text-align:center;border:2px solid #2563eb">
   <div style="font-size:42px;margin-bottom:6px">✅🔋</div>
   <div style="font-size:18px;font-weight:800;margin-bottom:6px;color:#1e40af">100% Akku voll geladen!</div>
@@ -2566,8 +2439,39 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 </div>
 </div>
 
+
+<!-- MODAL: KI-LADEASSISTENT -->
+<div id="chatModal" class="modal" style="display:none">
+<div class="mbox" style="max-width:400px;padding:18px;display:flex;flex-direction:column;max-height:85vh;text-align:left">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid var(--border)">
+    <div style="font-size:16px;font-weight:800;display:flex;align-items:center;gap:6px">🤖 KI-Ladeassistent</div>
+    <button style="background:none;border:none;font-size:20px;cursor:pointer;color:var(--muted)" onclick="hideM('chatModal')">✕</button>
+  </div>
+  
+  <div id="chatBody" style="flex:1;max-height:280px;overflow-y:auto;padding:8px;background:#f8fafc;border-radius:12px;display:flex;flex-direction:column;gap:8px;margin-bottom:10px;border:1px solid var(--border)">
+    <div class="chat-msg bot">
+      👋 <b>Hallo! Ich bin dein intelligenter Ladeassistent.</b><br/>
+      Ich überwache deinen Stromfluss in Echtzeit. Frag mich nach Restladedauer, Kosten oder sage mir „Pausiere“!
+    </div>
+  </div>
+
+  <div style="display:flex;gap:5px;overflow-x:auto;padding-bottom:6px;margin-bottom:8px;scrollbar-width:none">
+    <span class="chat-chip" onclick="sendQuickChip('Wie lange lädt mein Akku noch?')">🔋 Restzeit?</span>
+    <span class="chat-chip" onclick="sendQuickChip('Warum schwankt die Watt-Anzeige?')">⚡ Watt-Schwankung?</span>
+    <span class="chat-chip" onclick="sendQuickChip('Was kostet der Strom bisher?')">💶 Kosten?</span>
+    <span class="chat-chip" onclick="sendQuickChip('Pausiere bitte mal kurz')">⏸️ Pause</span>
+    <span class="chat-chip" onclick="sendQuickChip('Setze das Laden fort')">▶️ Fortsetzen</span>
+  </div>
+
+  <div style="display:flex;gap:6px">
+    <input type="text" id="chatIn" style="flex:1;padding:10px 14px;border:1.5px solid var(--border);border-radius:14px;font-size:13px;outline:none" placeholder="Frage stellen oder Befehl..." onkeydown="if(event.key==='Enter') sendChatMessage()">
+    <button class="btn bp" style="width:auto;padding:10px 16px;background:var(--blue)" onclick="sendChatMessage()">➔</button>
+  </div>
+</div>
+</div>
+
 <!-- MODAL: LAND & MWST WAHLEN -->
-<div id="countryModal" class="modal" style="display:none">
+<div id="countryModal" class="modal">
 <div class="mbox">
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
   <div style="font-size:16px;font-weight:800">🌍 Land & MwSt. / VAT wählen</div>
@@ -2621,7 +2525,7 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 </div>
 
 <!-- MODAL: GERAET / PROFIL WAHLEN -->
-<div id="devModal" class="modal" style="display:none">
+<div id="devModal" class="modal">
 <div class="mbox">
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
   <div style="font-size:16px;font-weight:800">⚡ Gerät / Profil wählen</div>
@@ -2797,6 +2701,14 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 </div>
 </div>
 
+
+<div style="display:flex;justify-content:space-between;align-items:center;margin-top:16px;padding-top:12px;border-top:1px solid var(--border);font-size:12px">
+  <button style="background:#eff6ff;color:#2563eb;border:1px solid #bfdbfe;border-radius:20px;padding:6px 12px;font-size:12px;font-weight:700;cursor:pointer" onclick="showM('chatModal')">💬 KI-Assistent fragen</button>
+  <a href="/admin" target="_blank" style="color:var(--muted);text-decoration:none;font-weight:700">⚙️ Admin-Dashboard</a>
+</div>
+
+</div>
+
 <!-- QUITTUNGS-ANSICHT -->
 <div class="card receipt" id="recC" style="margin-top:0">
 <div style="text-align:center;margin-bottom:14px">
@@ -2840,55 +2752,7 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 <button class="btn bp" style="background:#059669;margin-top:14px;padding:14px;font-size:15px;display:flex;align-items:center;justify-content:center;gap:8px" onclick="startFreshSession()">
   <span>⚡</span> <span>Neue Ladesitzung starten</span>
 </button>
-
-<div style="text-align:center;margin-top:16px;padding-top:12px;border-top:1px solid var(--border)">
-  <a href="/admin" target="_blank" style="font-size:12px;color:var(--muted);text-decoration:none;font-weight:700;display:inline-flex;align-items:center;gap:5px">
-    ⚙️ Administrator-Portal (Passwort-geschützt)
-  </a>
 </div>
-</div>
-</div>
-
-<!-- FLOATING CHAT BUTTON -->
-<button class="fab-chat" id="fabChat" onclick="toggleChatDrawer()">
-  <span class="fab-dot"></span>
-  💬 KI-Assistent
-</button>
-
-<!-- SLIDING CHAT DRAWER -->
-<div class="chat-drawer" id="chatDrawer" style="display:none">
-  <div class="chat-hdr">
-    <div class="chat-title">🤖 <span>Smart Power Bot</span></div>
-    <div style="display:flex;align-items:center;gap:8px">
-      <span style="font-size:10px;color:#86efac;font-weight:700">🟢 Live</span>
-      <button style="background:none;border:none;color:#94a3b8;font-size:18px;cursor:pointer;padding:0" onclick="toggleChatDrawer()">✕</button>
-    </div>
-  </div>
-  
-  <div class="chat-body" id="chatBody">
-    <div class="chat-msg bot">
-      👋 <b>Hallo! Ich bin dein intelligenter Ladeassistent.</b><br/>
-      Ich überwache deinen Stromfluss in Echtzeit. Frag mich z. B.:<br/>
-      • <i>„Wie lange lädt der Akku noch?“</i><br/>
-      • <i>„Warum schwankt die Watt-Zahl?“</i><br/>
-      • Oder sage mir einfach <i>„Pausiere“</i> oder <i>„Auf 100% laden“</i>!
-    </div>
-  </div>
-
-  <div class="chat-chips">
-    <span class="chat-chip" onclick="sendQuickChip('Wie lange lädt mein Akku noch?')">🔋 Restdauer?</span>
-    <span class="chat-chip" onclick="sendQuickChip('Pausiere bitte mal kurz')">⏸️ Pause</span>
-    <span class="chat-chip" onclick="sendQuickChip('Setze das Laden fort')">▶️ Fortsetzen</span>
-    <span class="chat-chip" onclick="sendQuickChip('Warum schwankt die Watt-Anzeige?')">⚡ Watt-Schwankung?</span>
-    <span class="chat-chip" onclick="sendQuickChip('Lade meinen Akku bis 100% voll')">⚡ 100% laden</span>
-    <span class="chat-chip" onclick="sendQuickChip('Wie wechsle ich das Gerät?')">🔄 Gerät wechseln?</span>
-    <span class="chat-chip" onclick="sendQuickChip('Was kostet der Strom bisher?')">💶 Kosten?</span>
-  </div>
-
-  <div class="chat-input-bar">
-    <input type="text" id="chatIn" class="chat-in" placeholder="Frage stellen oder Befehl eingeben..." onkeydown="if(event.key==='Enter') sendChatMessage()">
-    <button class="chat-send" onclick="sendChatMessage()">➔</button>
-  </div>
 </div>
 
 <script>
@@ -3595,19 +3459,6 @@ function sendEm(){
   });
 }
 
-// KI-LADEASSISTENT CHATBOT JS
-var chatOpen = false;
-function toggleChatDrawer(){
-  var d = document.getElementById('chatDrawer');
-  if(!d) return;
-  chatOpen = !chatOpen;
-  d.style.display = chatOpen ? 'flex' : 'none';
-  if(chatOpen){
-    var inp = document.getElementById('chatIn');
-    if(inp) inp.focus();
-    scrollChat();
-  }
-}
 
 function scrollChat(){
   var b = document.getElementById('chatBody');
@@ -3654,16 +3505,16 @@ function sendChatMessage(){
       appendChatMsg('bot', res.reply);
       setTimeout(poll, 300);
     } else {
-      appendChatMsg('bot', '⚠️ Fehler bei der Verbindung zum Assistenten.');
+      appendChatMsg('bot', '⚠️ Fehler bei der Verbindung.');
     }
   }).catch(function(){
     var t = document.getElementById('chatTyping');
     if(t) t.remove();
-    appendChatMsg('bot', '⚠️ Netzwerkfehler. Bitte erneut versuchen.');
+    appendChatMsg('bot', '⚠️ Netzwerkfehler.');
   });
 }
 
-// Global functions for inline onclick handlers
+// Global window bindings
 window.doStart = doStart;
 window.doStop = doStop;
 window.devAct = devAct;
@@ -3676,7 +3527,6 @@ window.chooseDevice = chooseDevice;
 window.handleUnplugResponse = handleUnplugResponse;
 window.handlePowerShift = handlePowerShift;
 window.handleBatteryAction = handleBatteryAction;
-window.toggleChatDrawer = toggleChatDrawer;
 window.sendQuickChip = sendQuickChip;
 window.sendChatMessage = sendChatMessage;
 window.sendEm = sendEm;
