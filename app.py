@@ -587,10 +587,15 @@ def new_device_entry(num, key="lamp"):
         "peak_w": 0.0
     }
 
+charge["devices"] = [new_device_entry(1, "lamp")]
 
 def accumulate_energy():
     now = time.time()
     last = charge.get("last_wh_time")
+
+    if not charge.get("devices"):
+        charge["devices"] = [new_device_entry(1, "lamp")]
+        charge["current_device_idx"] = 0
 
     c_info = COUNTRY_VAT_RATES.get(charge["selected_country"], COUNTRY_VAT_RATES["DE"])
     vat_rate = c_info["rate"]
