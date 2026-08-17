@@ -178,16 +178,20 @@ charge = {
     "relay_on": False,
     "selected_country": "DE",  # Standard: Deutschland (19% MwSt.)
     
-    # --- PRÄZISE PHYSIKALISCHE STECKER-ERKENNUNG (Debounced State Machine) ---
+    # --- PRÄZISE PHYSIKALISCHE STECKER-ERKENNUNG (6s Debounce) ---
     # plug_state: "CONNECTED" | "UNPLUG_PENDING" | "UNPLUGGED"
     "plug_state": "CONNECTED",
-    "zero_current_start": None,     # Timestamp, wann Strom auf 0 fiel
-    "replug_prompt": False,         # True, wenn nach echtem Unplug wieder Strom fließt -> Frage an Nutzer
+    "zero_current_start": None,
+    "replug_prompt": False,
     "replug_watt": 0.0,
     "replug_amp": 0.0,
     "is_flowing": False,
     
+    # --- ZEIT-METRIKEN (Stromfluss vs. Pausen/Leerlauf) ---
     "accumulated_seconds": 0.0,
+    "total_flow_seconds": 0.0,       # Zeit mit echtem Stromfluss (>0.3 W)
+    "total_idle_seconds": 0.0,       # Pausen / Zeiten ohne Stromfluss
+    
     "last_start_time": None,
     "last_wh_time": None,
     "total_wh": 0.0,
@@ -238,7 +242,7 @@ class DeviceAI:
                 "mode": "continuous",
                 "is_battery": False,
                 "confidence": 0,
-                "reason": "Stecker abgezogen oder Gerät ausgeschaltet",
+                "reason": "Stecker abgezogen oder Gerät im Standby",
                 "peak_w": 0.0, "avg_w": 0.0, "current_w": cw
             }
 
@@ -414,7 +418,6 @@ def get_elapsed():
 
 
 def new_device_entry(num, key="lamp"):
-    """Erstellt einen sauberen Geräteeintrag mit korrekter Nummerierung (Gerät 1, Gerät 2, etc.)"""
     prof = DEVICE_PROFILES.get(key, DEVICE_PROFILES["lamp"])
     return {
         "num": num,
@@ -427,6 +430,9 @@ def new_device_entry(num, key="lamp"):
         "nominal_wh": prof["nominal_wh"],
         "user_confirmed": False,
         "duration_sec": 0.0,
+        "flow_duration_sec": 0.0,
+        "idle_duration_sec": 0.0,
+        "avg_flow_w": 0.0,
         "wh": 0.0,
         "cost_netto": 0.0,
         "vat_amount": 0.0,
@@ -449,29 +455,26 @@ def accumulate_energy():
     w = shelly["watt"]
     a = shelly["amp"]
     
-    # Echte Stromfluss-Erkennung
-    is_flowing = (a >= 0.025 or w >= 0.3)
+    # Echter Stromfluss (> 0.25 W oder > 0.015 A)
+    is_flowing = (a >= 0.018 or w >= 0.25)
     charge["is_flowing"] = is_flowing
 
     # =====================================================================
-    # PRÄZISE PHYSIKALISCHE STECKER-ERKENNUNG (4-Sekunden Entprellung)
+    # PRÄZISE PHYSIKALISCHE STECKER-ERKENNUNG (6.0s Entprellung)
     # =====================================================================
     if not is_flowing:
-        # Kein Strom
         if charge["zero_current_start"] is None:
             charge["zero_current_start"] = now
             charge["plug_state"] = "UNPLUG_PENDING"
         else:
             zero_duration = now - charge["zero_current_start"]
-            # Erst wenn mindestens 4.0 Sekunden durchgehend 0 Strom fließt: Echter Steckerabzug!
-            if zero_duration >= 4.0 and charge["plug_state"] != "UNPLUGGED":
+            # Erst wenn mindestens 6.0 Sekunden durchgehend 0 Strom fließt: Echter Steckerabzug!
+            if zero_duration >= 6.0 and charge["plug_state"] != "UNPLUGGED":
                 charge["plug_state"] = "UNPLUGGED"
                 logger.info(f"🔌 Stecker physisch abgezogen (Nullstrom seit {zero_duration:.1f}s)")
     else:
-        # Strom fließt
         if charge["plug_state"] == "UNPLUGGED":
-            # NACH einem verifizierten Unplug fließt jetzt wieder Strom -> Replug erkannt!
-            # Frage Nutzer, ob selbes oder neues Gerät!
+            # Nach echtem Unplug fließt jetzt wieder Strom -> Frage Nutzer!
             charge["replug_prompt"] = True
             charge["replug_watt"] = round(w, 1)
             charge["replug_amp"] = round(a, 3)
@@ -483,7 +486,7 @@ def accumulate_energy():
             charge["plug_state"] = "CONNECTED"
 
     # =====================================================================
-    # ENERGIE- & KOSTEN-AKKUMULATION
+    # ENERGIE- & ZEIT-AKKUMULATION (Stromfluss vs. Pausen)
     # =====================================================================
     if last and last > 0:
         dt = now - last
@@ -497,16 +500,30 @@ def accumulate_energy():
             charge["total_vat_amount"] = charge["total_cost_netto"] * (vat_rate / 100.0)
             charge["total_cost_brutto"] = charge["total_cost_netto"] + charge["total_vat_amount"]
 
+            # Gesamte Zeiten aufschlüsseln
+            if is_flowing:
+                charge["total_flow_seconds"] += dt
+            else:
+                charge["total_idle_seconds"] += dt
+
             charge["power_history"].append((now, w))
             if len(charge["power_history"]) > 120:
                 charge["power_history"] = charge["power_history"][-120:]
 
+            # Auf aktives Gerät verbuchen
             idx = charge["current_device_idx"]
             devs = charge["devices"]
             if 0 <= idx < len(devs):
                 d = devs[idx]
                 d["duration_sec"] = d.get("duration_sec", 0) + dt
-                d["wh"] = d.get("wh", 0) + delta_wh
+                if is_flowing:
+                    d["flow_duration_sec"] = d.get("flow_duration_sec", 0.0) + dt
+                    d["wh"] = d.get("wh", 0) + delta_wh
+                    if d["flow_duration_sec"] > 0:
+                        d["avg_flow_w"] = (d["wh"] * 3600.0) / d["flow_duration_sec"]
+                else:
+                    d["idle_duration_sec"] = d.get("idle_duration_sec", 0.0) + dt
+                
                 d["cost_netto"] = (d["wh"] / 1000.0) * STROMPREIS_PER_KWH
                 d["vat_amount"] = d["cost_netto"] * (vat_rate / 100.0)
                 d["cost_brutto"] = d["cost_netto"] + d["vat_amount"]
@@ -571,6 +588,8 @@ def scan(token):
             charge["zero_current_start"] = None
             charge["replug_prompt"] = False
             charge["accumulated_seconds"] = 0.0
+            charge["total_flow_seconds"] = 0.0
+            charge["total_idle_seconds"] = 0.0
             charge["last_start_time"] = None
             charge["last_wh_time"] = None
             charge["total_wh"] = 0.0
@@ -598,6 +617,8 @@ def reset_session():
         charge["zero_current_start"] = None
         charge["replug_prompt"] = False
         charge["accumulated_seconds"] = 0.0
+        charge["total_flow_seconds"] = 0.0
+        charge["total_idle_seconds"] = 0.0
         charge["last_start_time"] = None
         charge["last_wh_time"] = None
         charge["total_wh"] = 0.0
@@ -643,10 +664,12 @@ def get_status():
             "shelly_ok": shelly["ok"],
             "shelly_error": shelly["error"],
             "elapsed_seconds": round(elapsed, 1),
+            "total_flow_seconds": round(charge["total_flow_seconds"], 1),
+            "total_idle_seconds": round(charge["total_idle_seconds"], 1),
             "wh": round(charge["total_wh"], 4),
             "kwh": round(charge["total_kwh"], 6),
             
-            # Stecker-Zustand
+            # Stecker-Zustand & Replug
             "plug_state": charge["plug_state"],
             "replug_prompt": charge["replug_prompt"],
             "replug_watt": charge["replug_watt"],
@@ -677,6 +700,8 @@ def start_charge():
             charge["terminated"] = False
             charge["last_report"] = None
             charge["accumulated_seconds"] = 0.0
+            charge["total_flow_seconds"] = 0.0
+            charge["total_idle_seconds"] = 0.0
             charge["last_start_time"] = None
             charge["last_wh_time"] = None
             charge["total_wh"] = 0.0
@@ -730,7 +755,7 @@ def handle_replug():
     with lock:
         charge["replug_prompt"] = False
         if action == "same":
-            logger.info(f"Replug: Benutzer setzt bisheriges Gerät ({charge['devices'][charge['current_device_idx']]['name']}) fort.")
+            logger.info(f"Replug: Selbes Gerät ({charge['devices'][charge['current_device_idx']]['name']}) fortgesetzt.")
             return jsonify({"status": "ok", "action": "same"})
         elif action == "new":
             next_num = len(charge["devices"]) + 1
@@ -816,7 +841,11 @@ def logout():
             "invoice_id": invoice_id,
             "date": time.strftime('%d.%m.%Y %H:%M'),
             "total_seconds": elapsed,
+            "total_flow_seconds": charge["total_flow_seconds"],
+            "total_idle_seconds": charge["total_idle_seconds"],
             "time_formatted": fmt_time(elapsed),
+            "flow_time_formatted": fmt_time(charge["total_flow_seconds"]),
+            "idle_time_formatted": fmt_time(charge["total_idle_seconds"]),
             "total_wh": charge["total_wh"],
             "total_kwh": charge["total_kwh"],
             
@@ -841,14 +870,15 @@ def logout():
 
     relay_control(False)
     save_history()
-    logger.info(f"LOGOUT {invoice_id} | Netto: {netto:.5f}€ + MwSt({vat_rate}%): {vat_amt:.5f}€ = Brutto: {brutto:.5f}€")
+    logger.info(f"LOGOUT {invoice_id} | Total: {fmt_time(elapsed)} (Aktiv: {fmt_time(charge['total_flow_seconds'])}, Pausen: {fmt_time(charge['total_idle_seconds'])}) | {brutto:.5f}€")
     return jsonify(report)
 
 @app.route('/download_invoice')
 def download_invoice():
     report = charge.get("last_report") or {
         "invoice_id": "SAMPLE", "date": time.strftime('%d.%m.%Y %H:%M'),
-        "total_seconds": 0, "time_formatted": "00:00:00",
+        "total_seconds": 0, "total_flow_seconds": 0, "total_idle_seconds": 0,
+        "time_formatted": "00:00:00", "flow_time_formatted": "00:00:00", "idle_time_formatted": "00:00:00",
         "total_wh": 0, "total_kwh": 0,
         "country_name": "Deutschland", "country_flag": "🇩🇪", "vat_name": "MwSt.", "vat_rate": 19.0,
         "total_cost_netto": 0.0, "total_vat_amount": 0.0, "total_cost_brutto": 0.0, "total_cost": 0.0,
@@ -878,30 +908,33 @@ def generate_pdf(report):
         story.append(Paragraph("⚡ Smart Power Hub • Offizielle Stromquittung", ts))
         story.append(Paragraph(
             f"Beleg-Nr.: <b>{report.get('invoice_id')}</b> | Datum: {report.get('date')}<br/>"
-            f"Steuerland: <b>{c_name}</b> | Arbeitspreis (Netto): {STROMPREIS_PER_KWH:.2f} €/kWh", ms))
-        story.append(HRFlowable(width="100%", thickness=1.5, color=colors.HexColor("#2563eb"), spaceAfter=14))
+            f"Steuerland: <b>{c_name}</b> | Tarif: {STROMPREIS_PER_KWH:.2f} €/kWh (Netto)<br/>"
+            f"Gesamtdauer: <b>{report.get('time_formatted', '00:00:00')}</b> (davon aktiv Strom bezogen: <b>{report.get('flow_time_formatted', '00:00:00')}</b> | Pausen/Leerlauf: <b>{report.get('idle_time_formatted', '00:00:00')}</b>)", ms))
+        story.append(HRFlowable(width="100%", thickness=1.5, color=colors.HexColor("#2563eb"), spaceAfter=12))
 
-        tbl = [["Pos", "Gerät & Modus", "Dauer", "Energie", "Netto (€)", f"{vat_name} ({vat_rate:.1f}%)", "Brutto (€)"]]
+        tbl = [["Pos", "Gerät & Modus", "Ladezeit", "Ø Leistung", "Energie", "Netto (€)", f"{vat_name} ({vat_rate:.1f}%)", "Brutto (€)"]]
         for i, d in enumerate(report.get("devices", []), 1):
             m_label = "Akku" if d.get("is_battery") else "Dauerbetrieb"
             d_netto = d.get("cost_netto", (d.get("wh", 0) / 1000.0) * STROMPREIS_PER_KWH)
             d_vat = d.get("vat_amount", d_netto * (vat_rate / 100.0))
             d_brutto = d.get("cost_brutto", d_netto + d_vat)
+            avg_w = d.get("avg_flow_w", (d.get("wh", 0)*3600.0/max(1, d.get("flow_duration_sec", 1))))
             tbl.append([
                 str(i),
                 f"{d.get('name','Gerät')} ({m_label})",
-                fmt_time(d.get("duration_sec", 0)),
+                fmt_time(d.get("flow_duration_sec", d.get("duration_sec", 0))),
+                f"{avg_w:.1f} W",
                 f"{d.get('wh', 0):.3f} Wh",
                 f"{d_netto:.5f} €",
                 f"{d_vat:.5f} €",
                 f"{d_brutto:.5f} €"
             ])
             
-        t = Table(tbl, colWidths=[24, 150, 60, 75, 65, 75, 75])
+        t = Table(tbl, colWidths=[20, 140, 55, 55, 65, 60, 65, 64])
         t.setStyle(TableStyle([
             ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#f1f5f9")),
             ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0,0), (-1,-1), 8.5),
+            ('FONTSIZE', (0,0), (-1,-1), 8),
             ('BOTTOMPADDING', (0,0), (-1,-1), 5),
             ('TOPPADDING', (0,0), (-1,-1), 5),
             ('ALIGN', (2,0), (-1,-1), 'RIGHT'),
@@ -911,7 +944,6 @@ def generate_pdf(report):
         story.append(t)
         story.append(Spacer(1, 14))
 
-        # Summenblock mit MwSt.-Ausweisung
         sum_tbl = [
             ["Nettobetrag (Zwischensumme):", f"{netto:.5f} €"],
             [f"zzgl. {vat_name} ({vat_rate:.1f}% für {c_name}):", f"+ {vat_amt:.5f} €"],
@@ -971,6 +1003,8 @@ def debug():
         "charge_paused": charge["paused"],
         "plug_state": charge["plug_state"],
         "replug_prompt": charge["replug_prompt"],
+        "total_flow_seconds": charge["total_flow_seconds"],
+        "total_idle_seconds": charge["total_idle_seconds"],
         "country": c_info,
         "accumulated_seconds": charge["accumulated_seconds"],
         "elapsed_calculated": round(elapsed, 1),
@@ -1029,7 +1063,7 @@ LOCK_HTML = """<!DOCTYPE html>
 *{box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:0;padding:0}
 body{background:#090d16;color:#f8fafc;display:flex;justify-content:center;align-items:center;min-height:100vh;padding:16px}
 .card{background:#111827;border-radius:24px;padding:32px 24px;border:1px solid #1f2937;text-align:center;max-width:440px;width:100%;box-shadow:0 25px 50px -12px rgba(0,0,0,.5)}
-h1{font-size:22px;font-weight:800;margin-16px 0 8px}
+h1{font-size:22px;font-weight:800;margin:16px 0 8px}
 p{font-size:13.5px;color:#94a3b8;line-height:1.5;margin-bottom:20px}
 .tbox{background:#0f172a;border:1px dashed #3b82f6;border-radius:14px;padding:14px;margin-bottom:20px;text-align:left}
 .tlbl{font-size:11px;text-transform:uppercase;color:#60a5fa;font-weight:700;margin-bottom:4px}
@@ -1103,6 +1137,21 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 .btn-confirm{flex:1;background:#059669;color:#fff;border:none;border-radius:10px;padding:8px 12px;font-size:12.5px;font-weight:700;cursor:pointer}
 .btn-change{background:#f1f5f9;color:var(--text);border:1px solid var(--border);border-radius:10px;padding:8px 12px;font-size:12.5px;font-weight:700;cursor:pointer}
 
+/* DYNAMISCHES SCHAUBILD (PAUSEN & STROMFLUSS-TIMELINE) */
+.timeline-card{background:#f8fafc;border:1px solid var(--border);border-radius:18px;padding:14px;margin-bottom:12px;text-align:left}
+.timeline-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.timeline-title{font-size:11px;font-weight:800;text-transform:uppercase;color:var(--muted);letter-spacing:.5px}
+.timeline-stat{font-size:11px;font-weight:700;color:var(--text)}
+
+.time-bar{height:12px;background:#e2e8f0;border-radius:12px;display:flex;overflow:hidden;margin-bottom:8px}
+.tb-flow1{background:#2563eb}
+.tb-flow2{background:#10b981}
+.tb-flow3{background:#8b5cf6}
+.tb-pause{background:#cbd5e1;background-image:repeating-linear-gradient(45deg,#cbd5e1,#cbd5e1 4px,#94a3b8 4px,#94a3b8 8px)}
+
+.time-legend{display:flex;justify-content:space-between;font-size:11px;color:var(--muted);font-weight:600}
+.time-legend b{color:var(--text);font-family:ui-monospace,monospace}
+
 /* WYSIWYG ADAPTIVES PROGNOSE-PANEL */
 .prognosis-panel{border-radius:18px;padding:14px;margin-bottom:12px;text-align:left;animation:fadein .25s ease-out}
 @keyframes fadein{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
@@ -1157,30 +1206,30 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 .dev-opt-tag{font-size:10px;font-weight:700;padding:3px 7px;border-radius:6px}
 
 .receipt{display:none}
-.rtbl{width:100%;border-collapse:collapse;margin:14px 0;font-size:12px}
-.rtbl th{background:#f1f5f9;padding:8px 6px;font-size:10.5px;text-transform:uppercase;color:var(--muted)}
-.rtbl td{padding:8px 6px;border-bottom:1px solid var(--border)}
+.rtbl{width:100%;border-collapse:collapse;margin:14px 0;font-size:11.5px}
+.rtbl th{background:#f1f5f9;padding:8px 4px;font-size:10px;text-transform:uppercase;color:var(--muted)}
+.rtbl td{padding:8px 4px;border-bottom:1px solid var(--border)}
 .tbox{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:14px;padding:14px;text-align:right;margin-top:14px}
 .ein{width:100%;padding:11px;border:1px solid var(--border);border-radius:10px;font-size:13.5px;margin-bottom:8px}
 </style></head><body>
 
-<!-- MODAL: UMSTECKEN ERKANNT (AUTOMATISCHER DIALOG) -->
+<!-- MODAL: UMSTECK-FRAGE (IST GERÄT WIRKLICH ABGESTECKT WORDEN?) -->
 <div id="replugModal" class="modal">
 <div class="mbox" style="text-align:center;border:2px solid var(--blue)">
-  <div style="font-size:42px;margin-bottom:6px">🔌⚡</div>
-  <div style="font-size:17px;font-weight:800;margin-bottom:4px">Umstecken erkannt!</div>
-  <div style="font-size:12.5px;color:var(--muted);margin-bottom:16px">
-    Strom fließt wieder (<b id="replugWattDisplay" style="color:var(--blue)">0.0 W</b>).<br/>
-    Welches Gerät wurde angeschlossen?
+  <div style="font-size:38px;margin-bottom:6px">🔌⚡</div>
+  <div style="font-size:17px;font-weight:800;margin-bottom:6px">Ist das Gerät wirklich abgesteckt worden?</div>
+  <p style="font-size:12.5px;color:var(--muted);margin-bottom:16px">
+    Strom fließt wieder (<b id="replugWattDisplay" style="color:var(--blue)">0.0 W</b>). Wurde ein neues Gerät angeschlossen oder steckt noch dasselbe Gerät?
+  </p>
+  
+  <div style="display:flex;flex-direction:column;gap:8px">
+    <button class="btn bs" style="background:#f8fafc;border:1.5px solid #cbd5e1;font-weight:800;font-size:14px;color:#334155;padding:13px" onclick="handleReplugChoice('same')">
+      ❌ Nein, selbes Gerät (<span id="curDevNameModal">Gerät 1</span>)
+    </button>
+    <button class="btn bp" style="background:var(--blue);font-weight:800;font-size:14px;padding:13px" onclick="handleReplugChoice('new_picker')">
+      ✅ Ja, neues Gerät erfassen (<span id="nextDevNameModal">Gerät 2</span>)
+    </button>
   </div>
-  
-  <button class="btn bp" style="background:var(--green);margin-bottom:8px" onclick="handleReplugChoice('same')">
-    ▶️ Dasselbe Gerät fortsetzen (<span id="curDevNameModal">Gerät 1</span>)
-  </button>
-  
-  <button class="btn bp" style="background:var(--blue);margin-bottom:8px" onclick="handleReplugChoice('new_picker')">
-    ➕ Neues Gerät erfassen (<span id="nextDevNameModal">Gerät 2</span>)
-  </button>
 </div>
 </div>
 
@@ -1303,11 +1352,27 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 <div class="badges">
   <span class="pill pill-g">🔒 Verifiziert</span>
   <span class="pill pill-off" id="sPill"><span class="dot"></span><span id="sTxt">Bereit</span></span>
-  <span class="pill pill-warn" id="unplugPill" style="display:none">⚠️ Stecker gezogen (0.0 A)</span>
+  <span class="pill pill-warn" id="unplugPill" style="display:none">⚠️ Kein Stromfluss (0.0 A)</span>
 </div>
 
 <!-- GERÄTE-TABS DER AKTUELLEN SITZUNG -->
 <div class="dev-pills" id="devPillsContainer"></div>
+
+<!-- DYNAMISCHES SCHAUBILD: PAUSEN & STROMFLUSS-ZEITSTRAHL -->
+<div class="timeline-card" id="timelineCard">
+  <div class="timeline-hdr">
+    <span class="timeline-title">📊 Stromfluss & Pausen-Zeitstrahl</span>
+    <span class="timeline-stat" id="timelineFlowPct">0% Strom aktiv</span>
+  </div>
+  <div class="time-bar" id="timeBarVisual">
+    <div id="tbFlowSeg" class="tb-flow1" style="width:0%"></div>
+    <div id="tbPauseSeg" class="tb-pause" style="width:100%"></div>
+  </div>
+  <div class="time-legend">
+    <span>⚡ Aktiv Strom: <b id="timeFlowText">00:00:00</b></span>
+    <span>⏸️ Pausen (0 W): <b id="timeIdleText">00:00:00</b></span>
+  </div>
+</div>
 
 <!-- KI-VORSCHLAG & GERAETE-LEISTE -->
 <div class="ai-box" id="aiBox">
@@ -1410,8 +1475,19 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
   </div>
 </div>
 
+<div class="timeline-card" style="margin-bottom:12px;background:#f8fafc">
+  <div class="timeline-hdr">
+    <span class="timeline-title">⏱️ Nutzungs- & Pausenaufteilung</span>
+    <span class="timeline-stat" id="rTimelinePct">--</span>
+  </div>
+  <div class="time-legend" style="margin-top:4px">
+    <span>⚡ Reine Ladezeit: <b id="rFlowTime">00:00:00</b></span>
+    <span>⏸️ Pausenzeit: <b id="rIdleTime">00:00:00</b></span>
+  </div>
+</div>
+
 <table class="rtbl">
-  <thead><tr><th>Pos / Gerät</th><th style="text-align:center">Dauer</th><th style="text-align:right">Wh</th><th style="text-align:right">Netto</th><th style="text-align:right">Brutto</th></tr></thead>
+  <thead><tr><th>Pos / Gerät</th><th style="text-align:center">Ladezeit</th><th style="text-align:center">Ø W</th><th style="text-align:right">Wh</th><th style="text-align:right">Netto</th><th style="text-align:right">Brutto</th></tr></thead>
   <tbody id="recB"></tbody>
 </table>
 
@@ -1507,6 +1583,10 @@ function startFreshSession(){
     document.getElementById('costBrutto').innerText = '0.00000';
     document.getElementById('costNetto').innerText = '0.00000 €';
     document.getElementById('vatAmount').innerText = '0.00000 €';
+    document.getElementById('timeFlowText').innerText = '00:00:00';
+    document.getElementById('timeIdleText').innerText = '00:00:00';
+    document.getElementById('tbFlowSeg').style.width = '0%';
+    document.getElementById('tbPauseSeg').style.width = '100%';
     poll();
   });
 }
@@ -1546,9 +1626,7 @@ function handleReplugChoice(choice){
   if(choice === 'same'){
     post('/handle_replug', { action: 'same' }).then(function(){ poll(); });
   } else if(choice === 'new_picker'){
-    // Öffne direkt die Geräteprofil-Auswahl
     showM('devModal');
-    // Setze vorab den Wechselbefehl ab
     post('/handle_replug', { action: 'new', key: 'lamp' }).then(function(){ poll(); });
   }
 }
@@ -1687,9 +1765,18 @@ function showReceipt(rp){
   var vatAmt = rp.total_vat_amount || 0.0;
   var brutto = rp.total_cost_brutto || rp.total_cost || 0.0;
 
+  var flowSec = rp.total_flow_seconds || 0;
+  var idleSec = rp.total_idle_seconds || 0;
+  var totalSec = rp.total_seconds || (flowSec + idleSec) || 1;
+  var flowPct = Math.round((flowSec / totalSec) * 100);
+
   document.getElementById('rCountryName').innerText = cName;
   document.getElementById('rVatRate').innerText = vatRate.toFixed(1);
   document.getElementById('rVatName').innerText = vatName;
+
+  document.getElementById('rFlowTime').innerText = fs(flowSec);
+  document.getElementById('rIdleTime').innerText = fs(idleSec);
+  document.getElementById('rTimelinePct').innerText = flowPct + '% Stromfluss | ' + (100 - flowPct) + '% Pausen';
 
   var tb = document.getElementById('recB');
   tb.innerHTML = '';
@@ -1697,8 +1784,9 @@ function showReceipt(rp){
     var m = d.is_battery ? 'Akku' : 'Dauerbetrieb';
     var dNetto = d.cost_netto || (d.wh / 1000.0) * STROMPREIS_NETTO;
     var dBrutto = d.cost_brutto || d.cost || (dNetto * (1 + vatRate/100));
+    var avgW = d.avg_flow_w || (d.flow_duration_sec > 0 ? (d.wh * 3600 / d.flow_duration_sec) : 0);
     var tr = document.createElement('tr');
-    tr.innerHTML = '<td><b>' + (d.icon || '🔌') + ' ' + (d.name || ('Gerät ' + (idx+1))) + '</b><br><span style="font-size:10px;color:#64748b">' + m + '</span></td><td style="text-align:center">' + fs(d.duration_sec || 0) + '</td><td style="text-align:right">' + (d.wh || 0).toFixed(3) + '</td><td style="text-align:right">' + dNetto.toFixed(4) + ' €</td><td style="text-align:right"><b>' + dBrutto.toFixed(4) + ' €</b></td>';
+    tr.innerHTML = '<td><b>' + (d.icon || '🔌') + ' ' + (d.name || ('Gerät ' + (idx+1))) + '</b><br><span style="font-size:9.5px;color:#64748b">' + m + '</span></td><td style="text-align:center">' + fs(d.flow_duration_sec || d.duration_sec || 0) + '</td><td style="text-align:center">' + avgW.toFixed(1) + ' W</td><td style="text-align:right">' + (d.wh || 0).toFixed(3) + '</td><td style="text-align:right">' + dNetto.toFixed(4) + ' €</td><td style="text-align:right"><b>' + dBrutto.toFixed(4) + ' €</b></td>';
     tb.appendChild(tr);
   });
 
@@ -1726,6 +1814,27 @@ function renderDevicePills(devs, activeIdx){
   });
 }
 
+function updateTimelineVisual(flowSec, idleSec){
+  var tot = flowSec + idleSec;
+  if(tot <= 0){
+    document.getElementById('timeFlowText').innerText = '00:00:00';
+    document.getElementById('timeIdleText').innerText = '00:00:00';
+    document.getElementById('timelineFlowPct').innerText = '0% Strom aktiv';
+    document.getElementById('tbFlowSeg').style.width = '0%';
+    document.getElementById('tbPauseSeg').style.width = '100%';
+    return;
+  }
+  var flowPct = Math.min(100, Math.max(0, Math.round((flowSec / tot) * 100)));
+  var pausePct = 100 - flowPct;
+
+  document.getElementById('timeFlowText').innerText = fs(flowSec);
+  document.getElementById('timeIdleText').innerText = fs(idleSec);
+  document.getElementById('timelineFlowPct').innerText = flowPct + '% Strom aktiv (' + pausePct + '% Pausen)';
+
+  document.getElementById('tbFlowSeg').style.width = flowPct + '%';
+  document.getElementById('tbPauseSeg').style.width = pausePct + '%';
+}
+
 function poll(){
   if(done) return;
   fetch('/status', {cache: 'no-store'}).then(function(r){return r.json()}).then(function(d){
@@ -1738,6 +1847,8 @@ function poll(){
     var curW = d.watt || 0.0;
     var curA = d.current_ampere || 0.0;
     var curWh = d.wh || 0.0;
+    var flowSec = d.total_flow_seconds || 0.0;
+    var idleSec = d.total_idle_seconds || 0.0;
 
     // Land
     if(d.country){
@@ -1776,6 +1887,9 @@ function poll(){
     } else {
       unplugPill.style.display = 'none';
     }
+
+    // DYNAMISCHES SCHAUBILD (PAUSEN & STROMFLUSS)
+    updateTimelineVisual(flowSec, idleSec);
 
     // AUTOMATISCHES UMSTECK-DIALOGFENSTER
     if(d.replug_prompt && !isReplugModalOpen){
