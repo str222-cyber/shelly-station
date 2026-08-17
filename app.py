@@ -1341,8 +1341,6 @@ def get_status():
 @app.route('/start', methods=['POST', 'GET'])
 def start_charge():
     with lock:
-        if not check_client_control():
-            return jsonify({"status": "locked", "message": "Nur das aktive Steuerungsgerät darf schalten."}), 403
         now = time.time()
         if charge["terminated"]:
             charge["terminated"] = False
@@ -1391,8 +1389,6 @@ def start_charge():
 @app.route('/stop', methods=['POST', 'GET'])
 def stop_charge():
     with lock:
-        if not check_client_control():
-            return jsonify({"status": "locked", "message": "Nur das aktive Steuerungsgerät darf schalten."}), 403
         accumulate_energy()
         charge["active"] = False
         charge["paused"] = True
@@ -1596,9 +1592,6 @@ def merge_device():
 @app.route('/battery_action', methods=['POST'])
 def battery_action():
     data = request.get_json() or {}
-    with lock:
-        if not check_client_control():
-            return jsonify({"status": "locked", "message": "Nur das aktive Steuerungsgerät darf schalten."}), 403
     action = data.get("action")  # "continue_100" | "finish"
     now = time.time()
 
@@ -1661,9 +1654,6 @@ def switch_active_device():
 @app.route('/set_device', methods=['POST'])
 def set_device():
     data = request.get_json() or {}
-    with lock:
-        if not check_client_control():
-            return jsonify({"status": "locked", "message": "Nur das aktive Steuerungsgerät darf schalten."}), 403
     key = data.get("key")
     dev_idx = data.get("device_idx", None)
 
@@ -3085,10 +3075,6 @@ function startFreshSession(){
 
 function doStart(){
   if(done) return;
-  if(window.lastStatusPayload && window.lastStatusPayload.is_owner === false){
-    showTakeoverPrompt();
-    return;
-  }
   lastActionLocalTime = Date.now();
   requestWakeLock();
   sessionStarted = true;
@@ -3104,10 +3090,6 @@ function doStart(){
 
 function doStop(){
   if(done) return;
-  if(window.lastStatusPayload && window.lastStatusPayload.is_owner === false){
-    showTakeoverPrompt();
-    return;
-  }
   lastActionLocalTime = Date.now();
   document.getElementById('sPill').className = 'pill pill-p';
   document.getElementById('sTxt').innerText = 'Pause';
@@ -3540,7 +3522,7 @@ function poll(){
     if(!sessionStorage.getItem('security_mode_chosen') && (d.has_other_clients || d.is_owner === false)){
       var sdt = document.getElementById('secOtherDevType');
       if(sdt && d.other_device_type) sdt.innerText = d.other_device_type;
-      showM('modalSecurityModeChooser');
+      // showM('modalSecurityModeChooser');
     }
     var specB = document.getElementById('spectatorBanner');
     if(specB){ specB.style.display = (d.is_owner === false) ? 'flex' : 'none'; }
