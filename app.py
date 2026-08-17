@@ -215,100 +215,130 @@ def async_cloud_control(turn_on=True):
             
     threading.Thread(target=_worker, daemon=True).start()
 
-# --- EXAKTER BACKGROUND METER WORKER NACH USER-MUSTER ---
+# --- BACKGROUND METER WORKER ---
+# ARCHITEKTUR: 2-Stufen-Ansatz
+# Stufe 1: Worker holt Shelly-Daten -> global_state (mit Lock, thread-sicher)
+# Stufe 2: Worker akkumuliert Energie für aktive Sessions -> user_sessions (mit Lock)
 def background_meter_worker():
     logger.info("🚀 Autonomer Hintergrund-Mess-Worker erfolgreich gestartet!")
     last_loop = time.time()
     while True:
         now = time.time()
-        # Delta-Zeit (dt) ermitteln: Vergangene Zeit seit dem letzten Schleifendurchlauf
+        # Delta-Zeit (dt): exakte vergangene Zeit, begrenzt auf 1-5 Sekunden
         dt = max(1.0, min(5.0, now - last_loop))
         last_loop = now
 
+        # === STUFE 1: Shelly Cloud abfragen und Rohwerte in global_state schreiben ===
+        watt, amp, volt = 0.0, 0.0, 230.0
+        api_ok = False
         try:
-            active_uid = global_state.get("active_user_id")
-            
-            for uid, u in user_sessions.items():
-                if not u.get("active", False) and not u.get("detection_mode", False): 
-                    continue
-                
-                watt, amp, volt = 0.0, 0.0, 230.0
-                try:
-                    res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data={"auth_key": AUTH_KEY, "id": DEVICE_ID}, timeout=2.0).json()
-                    if res.get("isok"):
-                        status = res.get("data", {}).get("device_status", {})
-                        if "switch:0" in status:
-                            watt = float(status["switch:0"].get("apower", 0.0) or 0.0)
-                            amp = float(status["switch:0"].get("current", 0.0) or 0.0)
-                            volt = float(status["switch:0"].get("voltage", 230.0) or 230.0)
-                        elif "meters" in status and len(status["meters"]) > 0:
-                            watt = float(status["meters"][0].get("power", 0.0) or 0.0)
-                            amp = float(status["meters"][0].get("current", 0.0)) if "current" in status["meters"][0] else (watt / 230.0 if watt > 0 else 0.0)
-                            volt = float(status["meters"][0].get("voltage", 230.0)) if "voltage" in status["meters"][0] else 230.0
-                except:
-                    watt, amp, volt = u.get("current_watt", 0.0), u.get("current_ampere", 0.0), u.get("current_voltage", 230.0)
+            res = requests.post(
+                f"{SHELLY_CLOUD_URL}/device/status",
+                data={"auth_key": AUTH_KEY, "id": DEVICE_ID},
+                timeout=3.0
+            ).json()
+            if res.get("isok"):
+                status = res.get("data", {}).get("device_status", {})
+                if "switch:0" in status:
+                    sw = status["switch:0"]
+                    watt = float(sw.get("apower", 0.0) or 0.0)
+                    amp  = float(sw.get("current", 0.0) or 0.0)
+                    volt = float(sw.get("voltage", 230.0) or 230.0)
+                    api_ok = True
+                    logger.info(f"[METER-WORKER] Shelly OK: P={watt:.2f}W I={amp:.3f}A U={volt:.1f}V")
+                elif "meters" in status and len(status["meters"]) > 0:
+                    m = status["meters"][0]
+                    watt = float(m.get("power", 0.0) or 0.0)
+                    amp  = float(m.get("current", watt / 230.0 if watt > 0 else 0.0))
+                    volt = float(m.get("voltage", 230.0) or 230.0)
+                    api_ok = True
+                    logger.info(f"[METER-WORKER] Shelly OK (meters): P={watt:.2f}W I={amp:.3f}A")
+                else:
+                    logger.warning(f"[METER-WORKER] Unbekannte JSON-Struktur: {list(status.keys())}")
+            else:
+                logger.warning(f"[METER-WORKER] API nicht OK: {res.get('error', 'unbekannt')}")
+        except Exception as e:
+            logger.warning(f"[METER-WORKER] Shelly-Abfrage fehlgeschlagen: {e}")
 
-                # 1. Sofortige Rohwerte speichern (für Ampere, Volt, Leistung)
-                u["current_watt"], u["current_ampere"], u["current_voltage"] = watt, amp, volt
-                
-                # 2. Leistungs-Glättung (verhindert wildes Springen der Anzeige im Frontend)
-                u["smoothed_watt"] = watt if u.get("smoothed_watt") is None else (u["smoothed_watt"] * 0.8) + (watt * 0.2)
-                
-                if uid == active_uid: 
-                    global_state["last_watt"], global_state["last_amp"], global_state["last_volt"] = watt, amp, volt
+        # Rohwerte global speichern (immer, auch bei Fehler - dann bleiben alte Werte)
+        if api_ok:
+            with state_lock:
+                global_state["last_watt"] = watt
+                global_state["last_amp"]  = amp
+                global_state["last_volt"] = volt
 
-                # 3. Wenn aktiv: Laufzeit und Energie (Wh / Kosten) flüssig hochzählen
-                if u.get("active", False):
-                    u["total_seconds"] = u.get("total_seconds", 0.0) + dt
-                    u["accumulated_seconds"] = u["total_seconds"]
-                    
-                    # Die magische Formel: Leistung (Watt) multipliziert mit vergangener Zeit (dt in Sekunden) 
-                    # umgerechnet in Kilowattstunden (kWh)
-                    if watt > 0.05: 
-                        u["total_kwh"] = u.get("total_kwh", 0.0) + (watt * dt) / 3600000.0
-                    
-                    u["total_wh"] = u.get("total_kwh", 0.0) * 1000.0
-                    u["total_cost"] = u.get("total_kwh", 0.0) * STROMPREIS_PER_KWH
+        # === STUFE 2: Energie für aktive Sessions akkumulieren ===
+        try:
+            with state_lock:
+                # Snapshot der aktiven Sessions erstellen (sicher gegen Dict-Mutation)
+                active_sessions = [
+                    (uid, u) for uid, u in user_sessions.items()
+                    if u.get("active", False)
+                ]
 
-                    # Aktuelles Einzelgerät aktualisieren
-                    curr_idx = u.get("current_device_idx", 0)
-                    if 0 <= curr_idx < len(u.get("devices", [])):
-                        dev = u["devices"][curr_idx]
-                        dev["duration_sec"] = dev.get("duration_sec", 0.0) + dt
-                        if watt > 0.05:
-                            dev["wh"] = dev.get("wh", 0.0) + (watt * dt) / 3600.0
-                        dev["cost"] = (dev.get("wh", 0.0) / 1000.0) * STROMPREIS_PER_KWH
-                        dev["peak_w"] = max(dev.get("peak_w", 0.0), watt)
+            for uid, u in active_sessions:
+                # Leistungs-Glättung: None = erster Wert wird direkt übernommen
+                prev_smoothed = u.get("smoothed_watt")
+                if prev_smoothed is None or prev_smoothed == 0.0:
+                    u["smoothed_watt"] = watt
+                else:
+                    u["smoothed_watt"] = (prev_smoothed * 0.8) + (watt * 0.2)
 
-                        prof = DEVICE_PROFILES.get(dev["key"], DEVICE_PROFILES["custom"])
-                        if prof["is_battery"]:
-                            peak_w = max(dev["peak_w"], prof["typical_w"] * 0.7)
-                            nom_wh = prof["nominal_wh"] or 20.0
-                            energy_soc = (dev["wh"] / nom_wh) * 100.0
+                # Rohwerte in der Session speichern (für /status-Route)
+                u["current_watt"]   = watt
+                u["current_ampere"] = amp
+                u["current_voltage"] = volt
 
-                            if watt > peak_w * prof["cv_ratio"]:
-                                dev["stage"] = "Bulk / Schnellladung (CC)"
-                                dev["soc_pct"] = round(min(75.0, max(15.0, 15.0 + energy_soc * 0.6)), 1)
-                            elif watt > prof["trickle_w"]:
-                                dev["stage"] = "Sättigung / CV (Absorption)"
-                                ratio_in_cv = max(0.0, min(1.0, 1.0 - (watt / (peak_w * prof["cv_ratio"] or 1.0))))
-                                dev["soc_pct"] = round(min(98.0, max(75.0, 75.0 + ratio_in_cv * 23.0)), 1)
-                            elif dev["duration_sec"] > 45 and dev["wh"] > 0.5:
-                                dev["stage"] = "Erhaltungsladung / Voll (Trickle)"
-                                dev["soc_pct"] = 100.0
-                            else:
-                                dev["stage"] = "Bereit / Lädt..." if watt > 0.1 else "Standby"
-                                dev["soc_pct"] = round(min(75.0, max(10.0, 10.0 + energy_soc)), 1)
+                # Laufzeit akkumulieren
+                u["total_seconds"]       = u.get("total_seconds", 0.0) + dt
+                u["accumulated_seconds"] = u["total_seconds"]
 
-                            dev["wh_to_100"] = max(0.0, round(nom_wh * (1.0 - (dev["soc_pct"] / 100.0)), 2))
-                        else:
-                            dev["stage"] = "Dauerbetrieb"
+                # Energie akkumulieren (Wh): Formel = Watt * dt_sekunden / 3600
+                if watt > 0.05:
+                    u["total_kwh"]  = u.get("total_kwh", 0.0) + (watt * dt) / 3600000.0
+                u["total_wh"]   = u.get("total_kwh", 0.0) * 1000.0
+                u["total_cost"] = u.get("total_kwh", 0.0) * STROMPREIS_PER_KWH
+
+                # Aktuelles Gerät aktualisieren
+                curr_idx = u.get("current_device_idx", 0)
+                devs = u.get("devices", [])
+                if 0 <= curr_idx < len(devs):
+                    dev = devs[curr_idx]
+                    dev["duration_sec"] = dev.get("duration_sec", 0.0) + dt
+                    if watt > 0.05:
+                        dev["wh"]  = dev.get("wh", 0.0) + (watt * dt) / 3600.0
+                    dev["cost"]   = (dev.get("wh", 0.0) / 1000.0) * STROMPREIS_PER_KWH
+                    dev["peak_w"] = max(dev.get("peak_w", 0.0), watt)
+
+                    prof = DEVICE_PROFILES.get(dev.get("key", "custom"), DEVICE_PROFILES["custom"])
+                    if prof["is_battery"]:
+                        peak_w   = max(dev["peak_w"], prof["typical_w"] * 0.7)
+                        nom_wh   = prof["nominal_wh"] or 20.0
+                        energy_soc = (dev["wh"] / nom_wh) * 100.0
+                        if watt > peak_w * prof["cv_ratio"]:
+                            dev["stage"]   = "Bulk / Schnellladung (CC)"
+                            dev["soc_pct"] = round(min(75.0, max(15.0, 15.0 + energy_soc * 0.6)), 1)
+                        elif watt > prof["trickle_w"]:
+                            dev["stage"]   = "Sättigung / CV (Absorption)"
+                            ratio_in_cv    = max(0.0, min(1.0, 1.0 - (watt / (peak_w * prof["cv_ratio"] or 1.0))))
+                            dev["soc_pct"] = round(min(98.0, max(75.0, 75.0 + ratio_in_cv * 23.0)), 1)
+                        elif dev["duration_sec"] > 45 and dev["wh"] > 0.5:
+                            dev["stage"]   = "Erhaltungsladung / Voll (Trickle)"
                             dev["soc_pct"] = 100.0
-                            dev["wh_to_100"] = 0.0
+                        else:
+                            dev["stage"]   = "Bereit / Lädt..." if watt > 0.1 else "Standby"
+                            dev["soc_pct"] = round(min(75.0, max(10.0, 10.0 + energy_soc)), 1)
+                        dev["wh_to_100"] = max(0.0, round(nom_wh * (1.0 - (dev["soc_pct"] / 100.0)), 2))
+                    else:
+                        dev["stage"]    = "Dauerbetrieb"
+                        dev["soc_pct"]  = 100.0
+                        dev["wh_to_100"] = 0.0
 
-        except: 
-            pass
-        time.sleep(1.0) # Fester 1-Sekunden-Takt für den Loop
+                logger.info(f"[METER-WORKER] {uid[:8]} | t={u['total_seconds']:.0f}s W={watt:.2f} Wh={u['total_wh']:.4f} €={u['total_cost']:.5f}")
+        except Exception as e:
+            logger.error(f"[METER-WORKER] Fehler in Akkumulationsschleife: {e}", exc_info=True)
+
+        time.sleep(1.0)  # Fester 1-Sekunden-Takt für den Loop
 
 # --- ENSURE_WORKER INITIALISIERUNG ---
 worker_started = False
@@ -502,7 +532,7 @@ def get_or_create_user_session():
                 "current_watt": 0.0,
                 "current_ampere": 0.0,
                 "current_voltage": 230.0,
-                "smoothed_watt": 0.0,
+                "smoothed_watt": None,  # None = noch kein Messwert empfangen
                 "battery_80_protection_enabled": True,
                 "battery_80_triggered": False,
                 "battery_100_triggered": False,
@@ -1627,6 +1657,7 @@ def start():
     u["unplug_dialog_active"] = False
     u["stop_reason"] = None
     u["start_timestamp"] = now
+    u["smoothed_watt"] = None  # Zurücksetzen: erster echter Messwert wird direkt übernommen
 
     curr_idx = u.get("current_device_idx", 0)
     if 0 <= curr_idx < len(u.get("devices", [])):
