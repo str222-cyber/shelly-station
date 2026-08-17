@@ -513,8 +513,52 @@ def scan(token):
         session["station_verified"] = True
         session.permanent = True
         session.modified = True
+        # Beim QR-Code-Scannen immer eine frische, saubere Ladesitzung bereitstellen
+        with lock:
+            charge["terminated"] = False
+            charge["last_report"] = None
+            charge["active"] = False
+            charge["paused"] = False
+            charge["accumulated_seconds"] = 0.0
+            charge["last_start_time"] = None
+            charge["last_wh_time"] = None
+            charge["total_wh"] = 0.0
+            charge["total_kwh"] = 0.0
+            charge["total_cost_netto"] = 0.0
+            charge["total_vat_amount"] = 0.0
+            charge["total_cost_brutto"] = 0.0
+            charge["power_history"] = []
+            charge["ai_result"] = None
+            charge["ai_tick"] = 0
+            charge["devices"] = [new_device_entry(1, "lamp")]
+            charge["current_device_idx"] = 0
+        relay_control(False)
         return redirect(url_for('index'))
     return "Ungültiger Token.", 403
+
+@app.route('/reset_session', methods=['POST', 'GET'])
+def reset_session():
+    with lock:
+        charge["terminated"] = False
+        charge["last_report"] = None
+        charge["active"] = False
+        charge["paused"] = False
+        charge["accumulated_seconds"] = 0.0
+        charge["last_start_time"] = None
+        charge["last_wh_time"] = None
+        charge["total_wh"] = 0.0
+        charge["total_kwh"] = 0.0
+        charge["total_cost_netto"] = 0.0
+        charge["total_vat_amount"] = 0.0
+        charge["total_cost_brutto"] = 0.0
+        charge["power_history"] = []
+        charge["ai_result"] = None
+        charge["ai_tick"] = 0
+        charge["devices"] = [new_device_entry(1, "lamp")]
+        charge["current_device_idx"] = 0
+    relay_control(False)
+    logger.info(">>> SITZUNG ZURÜCKGESETZT / BEREIT FÜR NEUEN LADEVORGANG <<<")
+    return jsonify({"status": "ok"})
 
 @app.route('/status')
 def get_status():
@@ -1292,6 +1336,10 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
   <button class="btn bs" style="font-size:13px;padding:9px;margin-top:6px" onclick="window.open('/download_invoice','_blank')">📥 PDF-Quittung herunterladen</button>
   <div id="emFb" style="display:none;font-size:12px;font-weight:600;margin-top:8px"></div>
 </div>
+
+<button class="btn bp" style="background:#059669;margin-top:14px;padding:14px;font-size:15px;display:flex;align-items:center;justify-content:center;gap:8px" onclick="startFreshSession()">
+  <span>⚡</span> <span>Neue Ladesitzung starten</span>
+</button>
 </div>
 </div>
 
@@ -1345,6 +1393,27 @@ function post(u,d){
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(d || {})
   }).then(function(r){return r.json()}).catch(function(){return {}});
+}
+
+function startFreshSession(){
+  post('/reset_session').then(function(){
+    done = false;
+    lastR = null;
+    localElapsed = 0;
+    isChargingActive = false;
+    stopLocalTimer();
+    document.getElementById('recC').style.display = 'none';
+    document.getElementById('mainC').style.display = 'block';
+    document.getElementById('sPill').className = 'pill pill-off';
+    document.getElementById('sTxt').innerText = 'Bereit';
+    document.getElementById('timer').innerText = '00:00:00';
+    document.getElementById('watt').innerText = '0.000';
+    document.getElementById('wh').innerText = '0.0000';
+    document.getElementById('costBrutto').innerText = '0.00000';
+    document.getElementById('costNetto').innerText = '0.00000 €';
+    document.getElementById('vatAmount').innerText = '0.00000 €';
+    poll();
+  });
 }
 
 function doStart(){
