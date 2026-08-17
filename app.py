@@ -34,12 +34,33 @@ AUTH_KEY = "NDcwMzFkdWlkF9839F81801CF17665B14F2EED9BDC41514AEAB2C6C041201D306ABB
 DEVICE_ID = "08927249a904"
 PHYSICAL_STATION_TOKEN = "SEC-STATION-2026-X99Q-ALPHA-77"
 ADMIN_SECRET_TOKEN = "SEC-ADMIN-MASTER-2026-OMEGA"
-STROMPREIS_PER_KWH = 0.35
+STROMPREIS_PER_KWH = 0.35  # Netto-Arbeitspreis in € / kWh
 
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 SMTP_USER = ""
 SMTP_PASSWORD = ""
+
+# =====================================================================
+# LAENDER- & MEHRWERTSTEUER-TABELLE (VAT / MwSt. fuer Strom)
+# =====================================================================
+COUNTRY_VAT_RATES = {
+    "DE": {"code": "DE", "name": "Deutschland", "flag": "🇩🇪", "vat_name": "MwSt.", "rate": 19.0},
+    "AT": {"code": "AT", "name": "Österreich", "flag": "🇦🇹", "vat_name": "USt.", "rate": 20.0},
+    "CH": {"code": "CH", "name": "Schweiz", "flag": "🇨🇭", "vat_name": "MWST", "rate": 8.1},
+    "FR": {"code": "FR", "name": "Frankreich", "flag": "🇫🇷", "vat_name": "TVA", "rate": 20.0},
+    "IT": {"code": "IT", "name": "Italien", "flag": "🇮🇹", "vat_name": "IVA", "rate": 22.0},
+    "ES": {"code": "ES", "name": "Spanien", "flag": "🇪🇸", "vat_name": "IVA", "rate": 21.0},
+    "NL": {"code": "NL", "name": "Niederlande", "flag": "🇳🇱", "vat_name": "BTW", "rate": 21.0},
+    "BE": {"code": "BE", "name": "Belgien", "flag": "🇧🇪", "vat_name": "TVA", "rate": 21.0},
+    "LU": {"code": "LU", "name": "Luxemburg", "flag": "🇱🇺", "vat_name": "TVA", "rate": 17.0},
+    "GB": {"code": "GB", "name": "Großbritannien", "flag": "🇬🇧", "vat_name": "VAT", "rate": 20.0},
+    "PL": {"code": "PL", "name": "Polen", "flag": "🇵🇱", "vat_name": "VAT", "rate": 23.0},
+    "DK": {"code": "DK", "name": "Dänemark", "flag": "🇩🇰", "vat_name": "Moms", "rate": 25.0},
+    "SE": {"code": "SE", "name": "Schweden", "flag": "🇸🇪", "vat_name": "Moms", "rate": 25.0},
+    "NO": {"code": "NO", "name": "Norwegen", "flag": "🇳🇴", "vat_name": "Mva", "rate": 25.0},
+    "CUSTOM_0": {"code": "CUSTOM_0", "name": "Steuerfrei / B2B (0%)", "flag": "🌐", "vat_name": "VAT 0%", "rate": 0.0}
+}
 
 # =====================================================================
 # GERAETE-PROFILE & MODI (Dauerbetrieb vs. Akku)
@@ -155,12 +176,15 @@ charge = {
     "paused": False,
     "terminated": False,
     "relay_on": False,
+    "selected_country": "DE",  # Standard: Deutschland (19% MwSt.)
     "accumulated_seconds": 0.0,
     "last_start_time": None,
     "last_wh_time": None,
     "total_wh": 0.0,
     "total_kwh": 0.0,
-    "total_cost": 0.0,
+    "total_cost_netto": 0.0,
+    "total_vat_amount": 0.0,
+    "total_cost_brutto": 0.0,
     "power_history": [],
     "ai_result": None,
     "ai_tick": 0,
@@ -170,7 +194,7 @@ charge = {
 }
 
 history_records = []
-history_stats = {"sessions": 0, "kwh": 0.0, "revenue": 0.0}
+history_stats = {"sessions": 0, "kwh": 0.0, "revenue_brutto": 0.0}
 HISTORY_FILE = "station_history.json"
 
 
@@ -225,7 +249,6 @@ class DeviceAI:
 
         # Klassifizierung
         if cv < 0.18 and trend_ratio > 0.88:
-            # Stabile Leistung -> Dauerbetrieb
             confidence = min(95, 45 + n * 6)
             if pw < 20:
                 s_key = "lamp"
@@ -240,7 +263,6 @@ class DeviceAI:
                 s_key = "appliance"
                 reason = f"Hohe Dauerlast ({aw:.1f} W)"
         elif trend_ratio < 0.88 or (pw < 120 and cw < pw * 0.75 and n >= 6):
-            # Abnehmende Leistung -> Akkuladung
             confidence = min(92, 40 + n * 6)
             if pw < 25:
                 s_key = "phone"
@@ -255,7 +277,6 @@ class DeviceAI:
                 s_key = "ebike_fast"
                 reason = f"Sehr hohe Ladeleistung ({pw:.1f} W)"
         else:
-            # Vorerst Dauerbetrieb annehmen, bis Trend sichtbar wird
             confidence = 30
             if pw < 30:
                 s_key = "lamp"
@@ -395,6 +416,9 @@ def new_device_entry(idx, key="lamp"):
         "user_confirmed": False,
         "duration_sec": 0.0,
         "wh": 0.0,
+        "cost_netto": 0.0,
+        "vat_amount": 0.0,
+        "cost_brutto": 0.0,
         "cost": 0.0,
         "peak_w": 0.0
     }
@@ -407,6 +431,10 @@ def accumulate_energy():
     now = time.time()
     last = charge.get("last_wh_time")
 
+    # Aktuelle MwSt.-Konfiguration
+    c_info = COUNTRY_VAT_RATES.get(charge["selected_country"], COUNTRY_VAT_RATES["DE"])
+    vat_rate = c_info["rate"]
+
     if last and last > 0:
         dt = now - last
         if 0.2 < dt < 15.0:
@@ -415,7 +443,11 @@ def accumulate_energy():
 
             charge["total_wh"] += delta_wh
             charge["total_kwh"] = charge["total_wh"] / 1000.0
-            charge["total_cost"] = charge["total_kwh"] * STROMPREIS_PER_KWH
+            
+            # Netto, MwSt und Brutto berechnen
+            charge["total_cost_netto"] = charge["total_kwh"] * STROMPREIS_PER_KWH
+            charge["total_vat_amount"] = charge["total_cost_netto"] * (vat_rate / 100.0)
+            charge["total_cost_brutto"] = charge["total_cost_netto"] + charge["total_vat_amount"]
 
             charge["power_history"].append((now, w))
             if len(charge["power_history"]) > 120:
@@ -427,7 +459,10 @@ def accumulate_energy():
                 d = devs[idx]
                 d["duration_sec"] = d.get("duration_sec", 0) + dt
                 d["wh"] = d.get("wh", 0) + delta_wh
-                d["cost"] = (d["wh"] / 1000.0) * STROMPREIS_PER_KWH
+                d["cost_netto"] = (d["wh"] / 1000.0) * STROMPREIS_PER_KWH
+                d["vat_amount"] = d["cost_netto"] * (vat_rate / 100.0)
+                d["cost_brutto"] = d["cost_netto"] + d["vat_amount"]
+                d["cost"] = d["cost_brutto"]
                 d["peak_w"] = max(d.get("peak_w", 0), w)
 
     charge["last_wh_time"] = now
@@ -438,8 +473,6 @@ def accumulate_energy():
         ai = DeviceAI.classify(charge["power_history"])
         charge["ai_result"] = ai
 
-        # Wenn der Benutzer das Gerät noch NICHT manuell bestätigt hat:
-        # Vorschlag automatisch als aktives Profil übernehmen
         idx = charge["current_device_idx"]
         devs = charge["devices"]
         if 0 <= idx < len(devs):
@@ -494,6 +527,13 @@ def get_status():
         devices = [dict(d) for d in charge["devices"]]
         active_dev = devices[curr_idx] if 0 <= curr_idx < len(devices) else new_device_entry(1)
 
+        c_info = COUNTRY_VAT_RATES.get(charge["selected_country"], COUNTRY_VAT_RATES["DE"])
+        vat_rate = c_info["rate"]
+
+        netto = charge["total_cost_netto"]
+        vat_amt = charge["total_vat_amount"]
+        brutto = charge["total_cost_brutto"]
+
         return jsonify({
             "active": charge["active"],
             "paused": charge["paused"],
@@ -507,7 +547,16 @@ def get_status():
             "elapsed_seconds": round(elapsed, 1),
             "wh": round(charge["total_wh"], 4),
             "kwh": round(charge["total_kwh"], 6),
-            "cost": round(charge["total_cost"], 5),
+            
+            # Mehrwertsteuer & Währungswerte
+            "country": c_info,
+            "vat_rate": vat_rate,
+            "vat_name": c_info["vat_name"],
+            "cost_netto": round(netto, 5),
+            "vat_amount": round(vat_amt, 5),
+            "cost_brutto": round(brutto, 5),
+            "cost": round(brutto, 5),  # Brutto als Standard
+            
             "ai_result": charge["ai_result"] or {},
             "active_device": active_dev,
             "devices": devices,
@@ -526,7 +575,9 @@ def start_charge():
             charge["last_wh_time"] = None
             charge["total_wh"] = 0.0
             charge["total_kwh"] = 0.0
-            charge["total_cost"] = 0.0
+            charge["total_cost_netto"] = 0.0
+            charge["total_vat_amount"] = 0.0
+            charge["total_cost_brutto"] = 0.0
             charge["power_history"] = []
             charge["ai_result"] = None
             charge["ai_tick"] = 0
@@ -563,6 +614,26 @@ def stop_charge():
     logger.info(f">>> PAUSE (t_acc={charge['accumulated_seconds']:.1f}s) <<<")
     return jsonify({"status": "ok"})
 
+@app.route('/set_country', methods=['POST'])
+def set_country():
+    data = request.get_json() or {}
+    code = data.get("country_code", "DE")
+    if code in COUNTRY_VAT_RATES:
+        with lock:
+            charge["selected_country"] = code
+            c_info = COUNTRY_VAT_RATES[code]
+            # Neuberechnung der Summen mit neuem Steuersatz
+            vat_rate = c_info["rate"]
+            charge["total_vat_amount"] = charge["total_cost_netto"] * (vat_rate / 100.0)
+            charge["total_cost_brutto"] = charge["total_cost_netto"] + charge["total_vat_amount"]
+            for d in charge["devices"]:
+                d["vat_amount"] = d.get("cost_netto", 0.0) * (vat_rate / 100.0)
+                d["cost_brutto"] = d.get("cost_netto", 0.0) + d["vat_amount"]
+                d["cost"] = d["cost_brutto"]
+            logger.info(f"Land/MwSt angepasst: {code} ({c_info['name']} {c_info['rate']}%)")
+            return jsonify({"status": "ok", "country": c_info})
+    return jsonify({"status": "error", "message": "Land nicht gefunden"}), 400
+
 @app.route('/set_device', methods=['POST'])
 def set_device():
     data = request.get_json() or {}
@@ -582,7 +653,7 @@ def set_device():
                 dev["is_battery"] = prof["is_battery"]
                 dev["nominal_wh"] = prof["nominal_wh"]
                 dev["user_confirmed"] = confirmed
-                logger.info(f"Gerät geändert auf: {dev['name']} ({dev['mode']}) | Bestätigt: {confirmed}")
+                logger.info(f"Gerät geändert: {dev['name']} ({dev['mode']}) | Bestätigt: {confirmed}")
                 return jsonify({"status": "ok", "device": dev})
     return jsonify({"status": "error", "message": "Gerät nicht gefunden"}), 400
 
@@ -613,6 +684,13 @@ def logout():
         elapsed = charge["accumulated_seconds"]
         invoice_id = f"RE-{time.strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}"
 
+        c_info = COUNTRY_VAT_RATES.get(charge["selected_country"], COUNTRY_VAT_RATES["DE"])
+        vat_rate = c_info["rate"]
+
+        netto = charge["total_cost_netto"]
+        vat_amt = charge["total_vat_amount"]
+        brutto = charge["total_cost_brutto"]
+
         report = {
             "invoice_id": invoice_id,
             "date": time.strftime('%d.%m.%Y %H:%M'),
@@ -620,19 +698,30 @@ def logout():
             "time_formatted": fmt_time(elapsed),
             "total_wh": charge["total_wh"],
             "total_kwh": charge["total_kwh"],
-            "total_cost": charge["total_cost"],
+            
+            # MwSt.-Daten
+            "country_code": c_info["code"],
+            "country_name": c_info["name"],
+            "country_flag": c_info["flag"],
+            "vat_name": c_info["vat_name"],
+            "vat_rate": vat_rate,
+            "total_cost_netto": netto,
+            "total_vat_amount": vat_amt,
+            "total_cost_brutto": brutto,
+            "total_cost": brutto,
+            
             "devices": [dict(d) for d in charge["devices"]]
         }
         charge["last_report"] = report
 
         history_stats["sessions"] += 1
         history_stats["kwh"] += report["total_kwh"]
-        history_stats["revenue"] += report["total_cost"]
+        history_stats["revenue_brutto"] += report["total_cost_brutto"]
         history_records.append(report)
 
     relay_control(False)
     save_history()
-    logger.info(f"LOGOUT {invoice_id} | {fmt_time(elapsed)} | {report['total_wh']:.3f}Wh | {report['total_cost']:.5f}EUR")
+    logger.info(f"LOGOUT {invoice_id} | Netto: {netto:.5f}€ + MwSt({vat_rate}%): {vat_amt:.5f}€ = Brutto: {brutto:.5f}€")
     return jsonify(report)
 
 @app.route('/download_invoice')
@@ -640,7 +729,11 @@ def download_invoice():
     report = charge.get("last_report") or {
         "invoice_id": "SAMPLE", "date": time.strftime('%d.%m.%Y %H:%M'),
         "total_seconds": 0, "time_formatted": "00:00:00",
-        "total_wh": 0, "total_kwh": 0, "total_cost": 0, "devices": []}
+        "total_wh": 0, "total_kwh": 0,
+        "country_name": "Deutschland", "country_flag": "🇩🇪", "vat_name": "MwSt.", "vat_rate": 19.0,
+        "total_cost_netto": 0.0, "total_vat_amount": 0.0, "total_cost_brutto": 0.0, "total_cost": 0.0,
+        "devices": []
+    }
     pdf = generate_pdf(report)
     return send_file(pdf, mimetype="application/pdf", as_attachment=True,
                      download_name=f"{report.get('invoice_id', 'Quittung')}.pdf")
@@ -651,32 +744,73 @@ def generate_pdf(report):
         doc = SimpleDocTemplate(buf, pagesize=A4, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
         styles = getSampleStyleSheet()
         story = []
+        
+        c_name = report.get("country_name", "Deutschland")
+        vat_name = report.get("vat_name", "MwSt.")
+        vat_rate = report.get("vat_rate", 19.0)
+        netto = report.get("total_cost_netto", 0.0)
+        vat_amt = report.get("total_vat_amount", 0.0)
+        brutto = report.get("total_cost_brutto", report.get("total_cost", 0.0))
+
         ts = ParagraphStyle('T', parent=styles['Heading1'], fontSize=18, textColor=colors.HexColor("#2563eb"))
-        ms = ParagraphStyle('M', parent=styles['Normal'], fontSize=9, textColor=colors.HexColor("#64748b"), spaceAfter=12)
-        story.append(Paragraph("Smart Power Hub - Stromquittung", ts))
-        story.append(Paragraph(f"Nr: {report.get('invoice_id')} | Datum: {report.get('date')} | Tarif: {STROMPREIS_PER_KWH:.2f} €/kWh", ms))
+        ms = ParagraphStyle('M', parent=styles['Normal'], fontSize=9, textColor=colors.HexColor("#64748b"), spaceAfter=10)
+        
+        story.append(Paragraph("⚡ Smart Power Hub • Offizielle Stromquittung", ts))
+        story.append(Paragraph(
+            f"Beleg-Nr.: <b>{report.get('invoice_id')}</b> | Datum: {report.get('date')}<br/>"
+            f"Steuerland: <b>{c_name}</b> | Arbeitspreis (Netto): {STROMPREIS_PER_KWH:.2f} €/kWh", ms))
         story.append(HRFlowable(width="100%", thickness=1.5, color=colors.HexColor("#2563eb"), spaceAfter=14))
-        tbl = [["Pos", "Gerät & Modus", "Dauer", "Wh", "Betrag (€)"]]
+
+        tbl = [["Pos", "Gerät & Modus", "Dauer", "Energie", "Netto (€)", f"{vat_name} ({vat_rate:.1f}%)", "Brutto (€)"]]
         for i, d in enumerate(report.get("devices", []), 1):
             m_label = "Akku" if d.get("is_battery") else "Dauerbetrieb"
-            tbl.append([str(i), f"{d.get('icon','🔌')} {d.get('name','Gerät')} ({m_label})",
-                        fmt_time(d.get("duration_sec", 0)),
-                        f"{d.get('wh', 0):.3f} Wh", f"{d.get('cost', 0):.5f} €"])
-        tbl.append(["", "GESAMTSUMME", fmt_time(report.get("total_seconds", 0)),
-                     f"{report.get('total_wh', 0):.4f} Wh", f"{report.get('total_cost', 0):.5f} €"])
-        t = Table(tbl, colWidths=[30, 220, 80, 90, 90])
+            d_netto = d.get("cost_netto", (d.get("wh", 0) / 1000.0) * STROMPREIS_PER_KWH)
+            d_vat = d.get("vat_amount", d_netto * (vat_rate / 100.0))
+            d_brutto = d.get("cost_brutto", d_netto + d_vat)
+            tbl.append([
+                str(i),
+                f"{d.get('name','Gerät')} ({m_label})",
+                fmt_time(d.get("duration_sec", 0)),
+                f"{d.get('wh', 0):.3f} Wh",
+                f"{d_netto:.5f} €",
+                f"{d_vat:.5f} €",
+                f"{d_brutto:.5f} €"
+            ])
+            
+        t = Table(tbl, colWidths=[24, 150, 60, 75, 65, 75, 75])
         t.setStyle(TableStyle([
             ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#f1f5f9")),
             ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0,0), (-1,-1), 9),
-            ('BOTTOMPADDING', (0,0), (-1,-1), 6),
+            ('FONTSIZE', (0,0), (-1,-1), 8.5),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 5),
+            ('TOPPADDING', (0,0), (-1,-1), 5),
             ('ALIGN', (2,0), (-1,-1), 'RIGHT'),
             ('LINEBELOW', (0,0), (-1,0), 1.5, colors.HexColor("#cbd5e1")),
-            ('LINEBELOW', (0,1), (-1,-2), 0.5, colors.HexColor("#e2e8f0")),
-            ('BACKGROUND', (0,-1), (-1,-1), colors.HexColor("#f0fdf4")),
-            ('FONTNAME', (0,-1), (-1,-1), 'Helvetica-Bold'),
+            ('LINEBELOW', (0,1), (-1,-1), 0.5, colors.HexColor("#e2e8f0")),
         ]))
         story.append(t)
+        story.append(Spacer(1, 14))
+
+        # Summenblock mit MwSt.-Ausweisung
+        sum_tbl = [
+            ["Nettobetrag (Zwischensumme):", f"{netto:.5f} €"],
+            [f"zzgl. {vat_name} ({vat_rate:.1f}% für {c_name}):", f"+ {vat_amt:.5f} €"],
+            ["GESAMTBETRAG (Brutto inkl. Steuern):", f"{brutto:.5f} €"]
+        ]
+        st = Table(sum_tbl, colWidths=[360, 164])
+        st.setStyle(TableStyle([
+            ('ALIGN', (0,0), (-1,-1), 'RIGHT'),
+            ('FONTSIZE', (0,0), (-1,-1), 9),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+            ('BACKGROUND', (0,-1), (-1,-1), colors.HexColor("#f0fdf4")),
+            ('FONTNAME', (0,-1), (-1,-1), 'Helvetica-Bold'),
+            ('TEXTCOLOR', (0,-1), (-1,-1), colors.HexColor("#15803d")),
+            ('FONTSIZE', (0,-1), (-1,-1), 11),
+            ('LINEABOVE', (0,-1), (-1,-1), 1.5, colors.HexColor("#15803d")),
+        ]))
+        story.append(st)
+        story.append(Spacer(1, 20))
+        story.append(Paragraph("Vielen Dank für die Nutzung der Smart Power Hub Ladestation!", ms))
         doc.build(story)
     else:
         buf.write(b"PDF nicht verfuegbar.")
@@ -696,8 +830,8 @@ def send_email():
         pdf = generate_pdf(report)
         msg = MIMEMultipart()
         msg["From"] = SMTP_USER; msg["To"] = email_to
-        msg["Subject"] = f"Quittung {report.get('invoice_id', '')}"
-        msg.attach(MIMEText(f"Gesamtbetrag: {report.get('total_cost',0):.5f} EUR", "plain", "utf-8"))
+        msg["Subject"] = f"Quittung {report.get('invoice_id', '')} ({report.get('total_cost_brutto', 0):.5f} €)"
+        msg.attach(MIMEText(f"Gesamtbetrag (Brutto): {report.get('total_cost_brutto',0):.5f} EUR (inkl. {report.get('vat_rate',19)}% {report.get('vat_name','MwSt')})", "plain", "utf-8"))
         att = MIMEApplication(pdf.read(), _subtype="pdf")
         att.add_header("Content-Disposition", "attachment", filename="Quittung.pdf")
         msg.attach(att)
@@ -710,14 +844,18 @@ def send_email():
 @app.route('/debug')
 def debug():
     elapsed = get_elapsed()
+    c_info = COUNTRY_VAT_RATES.get(charge["selected_country"], COUNTRY_VAT_RATES["DE"])
     return jsonify({
         "shelly": dict(shelly),
         "charge_active": charge["active"],
         "charge_paused": charge["paused"],
+        "country": c_info,
         "accumulated_seconds": charge["accumulated_seconds"],
         "elapsed_calculated": round(elapsed, 1),
         "total_wh": charge["total_wh"],
-        "total_cost": charge["total_cost"],
+        "cost_netto": charge["total_cost_netto"],
+        "vat_amount": charge["total_vat_amount"],
+        "cost_brutto": charge["total_cost_brutto"],
         "devices": charge["devices"],
         "ai_result": charge["ai_result"],
         "server_time": time.time()
@@ -729,8 +867,8 @@ def admin():
     today_recs = [r for r in history_records if r.get("date", "").startswith(today)]
     return render_template_string(ADMIN_HTML,
         physical_token=PHYSICAL_STATION_TOKEN, device_id=DEVICE_ID,
-        today_revenue=sum(r.get("total_cost", 0) for r in today_recs),
-        total_revenue=history_stats["revenue"],
+        today_revenue=sum(r.get("total_cost_brutto", r.get("total_cost", 0)) for r in today_recs),
+        total_revenue=history_stats["revenue_brutto"],
         today_wh=sum(r.get("total_wh", 0) for r in today_recs),
         total_kwh=history_stats["kwh"],
         today_sessions=len(today_recs),
@@ -759,7 +897,7 @@ def admin_override():
 
 
 # =====================================================================
-# HTML UI TEMPLATES (WYSIWYG ADAPTIV)
+# HTML UI TEMPLATES
 # =====================================================================
 
 LOCK_HTML = """<!DOCTYPE html>
@@ -803,7 +941,8 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 
 .hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
 .brand{font-size:18px;font-weight:800;letter-spacing:-.3px}
-.rate{background:#f1f5f9;color:var(--muted);font-size:11.5px;padding:4px 10px;border-radius:20px;font-weight:700}
+.country-badge{background:#eff6ff;border:1px solid #bfdbfe;color:#1e40af;font-size:11.5px;padding:4px 10px;border-radius:20px;font-weight:700;cursor:pointer;display:flex;align-items:center;gap:4px;transition:background .15s}
+.country-badge:hover{background:#dbeafe}
 
 .badges{display:flex;justify-content:center;gap:8px;flex-wrap:wrap;margin-bottom:14px}
 .pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:700;padding:5px 13px;border-radius:30px}
@@ -866,6 +1005,10 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 .bl .st-v{color:var(--blue)}
 .gr .st-v{color:var(--green)}
 
+/* MWST-INFOZEILE */
+.tax-banner{background:#f8fafc;border:1px dashed #cbd5e1;border-radius:12px;padding:8px 12px;margin-bottom:10px;font-size:11px;color:var(--muted);display:flex;justify-content:space-between;align-items:center}
+.tax-banner b{color:var(--text)}
+
 /* BUTTONS */
 .btns{display:flex;flex-direction:column;gap:8px;margin-top:14px}
 .btn{width:100%;padding:13px;font-size:14.5px;font-weight:700;border:none;border-radius:14px;cursor:pointer;transition:transform .1s}
@@ -874,7 +1017,7 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 .bs{background:#f1f5f9;color:var(--text);border:1px solid var(--border)}
 .bd{background:#fee2e2;color:var(--red)}
 
-/* MODAL: SCHNELLAUSWAHL GERAET */
+/* MODALE */
 .modal{display:none;position:fixed;inset:0;background:rgba(9,13,22,.75);backdrop-filter:blur(5px);z-index:999;padding:16px;align-items:center;justify-content:center}
 .mbox{background:#fff;border-radius:24px;padding:22px 18px;text-align:left;max-width:390px;width:100%;max-height:90vh;overflow-y:auto;animation:pop .2s ease-out}
 @keyframes pop{from{transform:scale(.9);opacity:0}to{transform:scale(1);opacity:1}}
@@ -888,12 +1031,66 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 .dev-opt-tag{font-size:10px;font-weight:700;padding:3px 7px;border-radius:6px}
 
 .receipt{display:none}
-.rtbl{width:100%;border-collapse:collapse;margin:14px 0;font-size:12.5px}
-.rtbl th{background:#f1f5f9;padding:8px;font-size:11px;text-transform:uppercase;color:var(--muted)}
-.rtbl td{padding:8px;border-bottom:1px solid var(--border)}
+.rtbl{width:100%;border-collapse:collapse;margin:14px 0;font-size:12px}
+.rtbl th{background:#f1f5f9;padding:8px 6px;font-size:10.5px;text-transform:uppercase;color:var(--muted)}
+.rtbl td{padding:8px 6px;border-bottom:1px solid var(--border)}
 .tbox{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:14px;padding:14px;text-align:right;margin-top:14px}
 .ein{width:100%;padding:11px;border:1px solid var(--border);border-radius:10px;font-size:13.5px;margin-bottom:8px}
 </style></head><body>
+
+<!-- MODAL: LAND & MWST WAHLEN -->
+<div id="countryModal" class="modal">
+<div class="mbox">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+  <div style="font-size:16px;font-weight:800">🌍 Land & MwSt. / VAT wählen</div>
+  <button style="background:none;border:none;font-size:20px;cursor:pointer;color:var(--muted)" onclick="hideM('countryModal')">✕</button>
+</div>
+<p style="font-size:12px;color:var(--muted);margin-bottom:12px">Wähle dein Land, um den gesetzlichen Steuersatz (MwSt. / VAT) auf Stromabrechnungen und Quittungen auszuweisen.</p>
+
+<div class="dev-option" onclick="chooseCountry('DE')">
+  <div class="dev-opt-left"><span class="dev-opt-ico">🇩🇪</span><div><div class="dev-opt-nm">Deutschland</div><div class="dev-opt-sub">19.0% MwSt.</div></div></div>
+  <span class="dev-opt-tag badge-cont">19%</span>
+</div>
+<div class="dev-option" onclick="chooseCountry('AT')">
+  <div class="dev-opt-left"><span class="dev-opt-ico">🇦🇹</span><div><div class="dev-opt-nm">Österreich</div><div class="dev-opt-sub">20.0% USt.</div></div></div>
+  <span class="dev-opt-tag badge-cont">20%</span>
+</div>
+<div class="dev-option" onclick="chooseCountry('CH')">
+  <div class="dev-opt-left"><span class="dev-opt-ico">🇨🇭</span><div><div class="dev-opt-nm">Schweiz</div><div class="dev-opt-sub">8.1% MWST</div></div></div>
+  <span class="dev-opt-tag badge-cont">8.1%</span>
+</div>
+<div class="dev-option" onclick="chooseCountry('FR')">
+  <div class="dev-opt-left"><span class="dev-opt-ico">🇫🇷</span><div><div class="dev-opt-nm">Frankreich</div><div class="dev-opt-sub">20.0% TVA</div></div></div>
+  <span class="dev-opt-tag badge-cont">20%</span>
+</div>
+<div class="dev-option" onclick="chooseCountry('IT')">
+  <div class="dev-opt-left"><span class="dev-opt-ico">🇮🇹</span><div><div class="dev-opt-nm">Italien</div><div class="dev-opt-sub">22.0% IVA</div></div></div>
+  <span class="dev-opt-tag badge-cont">22%</span>
+</div>
+<div class="dev-option" onclick="chooseCountry('ES')">
+  <div class="dev-opt-left"><span class="dev-opt-ico">🇪🇸</span><div><div class="dev-opt-nm">Spanien</div><div class="dev-opt-sub">21.0% IVA</div></div></div>
+  <span class="dev-opt-tag badge-cont">21%</span>
+</div>
+<div class="dev-option" onclick="chooseCountry('NL')">
+  <div class="dev-opt-left"><span class="dev-opt-ico">🇳🇱</span><div><div class="dev-opt-nm">Niederlande</div><div class="dev-opt-sub">21.0% BTW</div></div></div>
+  <span class="dev-opt-tag badge-cont">21%</span>
+</div>
+<div class="dev-option" onclick="chooseCountry('GB')">
+  <div class="dev-opt-left"><span class="dev-opt-ico">🇬🇧</span><div><div class="dev-opt-nm">Großbritannien</div><div class="dev-opt-sub">20.0% VAT</div></div></div>
+  <span class="dev-opt-tag badge-cont">20%</span>
+</div>
+<div class="dev-option" onclick="chooseCountry('PL')">
+  <div class="dev-opt-left"><span class="dev-opt-ico">🇵🇱</span><div><div class="dev-opt-nm">Polen</div><div class="dev-opt-sub">23.0% VAT</div></div></div>
+  <span class="dev-opt-tag badge-cont">23%</span>
+</div>
+<div class="dev-option" onclick="chooseCountry('CUSTOM_0')">
+  <div class="dev-opt-left"><span class="dev-opt-ico">🌐</span><div><div class="dev-opt-nm">Steuerfrei / B2B</div><div class="dev-opt-sub">0.0% Steuer</div></div></div>
+  <span class="dev-opt-tag badge-batt">0%</span>
+</div>
+
+<button class="btn bs" style="margin-top:12px;padding:10px" onclick="hideM('countryModal')">Schließen</button>
+</div>
+</div>
 
 <!-- MODAL: GERAET WAHLEN -->
 <div id="devModal" class="modal">
@@ -963,7 +1160,9 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 <div class="card" id="mainC">
 <div class="hdr">
   <span class="brand">⚡ Smart Power Hub</span>
-  <span class="rate">{{ strompreis }} €/kWh</span>
+  <span class="country-badge" onclick="showM('countryModal')">
+    <span id="hdrFlag">🇩🇪</span> <span id="hdrCountryText">DE · 19% MwSt.</span> ▾
+  </span>
 </div>
 
 <div class="badges">
@@ -1000,14 +1199,14 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
       <div class="prog-val-big"><span id="p24Wh">0.0</span> Wh <span style="font-size:14px;color:#64748b">/ 24h</span></div>
       <div style="font-size:18px;font-weight:800;color:#059669"><span id="p24Cost">0.00</span> € <span style="font-size:12px;color:#64748b">/ Tag</span></div>
     </div>
-    <div class="prog-sub">Hochrechnung bei gleichbleibender Dauerlast (<span id="p24Watt">0.0</span> W)</div>
+    <div class="prog-sub">Hochrechnung bei Dauerlast (<span id="p24Watt">0.0</span> W) inkl. <span class="vatRateDisplay">19.0</span>% <span class="vatNameDisplay">MwSt.</span></div>
     <div class="prog-grid2">
       <div class="prog-chip">
         <div class="lbl">Verbrauch / 24h</div>
         <div class="val" id="p24Kwh">0.000 kWh</div>
       </div>
       <div class="prog-chip">
-        <div class="lbl">Kosten / 30 Tage</div>
+        <div class="lbl">Kosten / 30 Tage (Brutto)</div>
         <div class="val" style="color:#2563eb" id="p30Cost">0.00 €</div>
       </div>
     </div>
@@ -1027,7 +1226,7 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
         <div class="val" style="color:#059669" id="battWhNeeded">-- Wh</div>
       </div>
       <div class="prog-chip">
-        <div class="lbl">Rest-Ladekosten</div>
+        <div class="lbl">Restkosten (Brutto)</div>
         <div class="val" id="battCostNeeded">-- €</div>
       </div>
     </div>
@@ -1045,7 +1244,13 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 </div>
 <div class="g2">
   <div class="st bl"><div class="st-l">Verbrauch (Wh)</div><div class="st-v"><span id="wh">0.0000</span> Wh</div><div class="st-s"><span id="mwh">0.0</span> mWh</div></div>
-  <div class="st gr"><div class="st-l">Bisherige Kosten</div><div class="st-v"><span id="cost">0.00000</span> €</div><div class="st-s"><span id="cent">0.000</span> Cent</div></div>
+  <div class="st gr"><div class="st-l">Gesamtbetrag (Brutto)</div><div class="st-v"><span id="costBrutto">0.00000</span> €</div><div class="st-s"><span id="costCent">0.000</span> Cent</div></div>
+</div>
+
+<!-- MWST-AUFSCHLUESSELUNG -->
+<div class="tax-banner">
+  <div>Netto: <b id="costNetto">0.00000 €</b></div>
+  <div>+ <span class="vatRateDisplay">19.0</span>% <span class="vatNameDisplay">MwSt.</span>: <b id="vatAmount">0.00000 €</b></div>
 </div>
 
 <div class="btns">
@@ -1058,24 +1263,33 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 
 <!-- QUITTUNGS-ANSICHT -->
 <div class="card receipt" id="recC" style="margin-top:0">
-<div style="text-align:center;margin-bottom:18px">
-  <div style="font-size:44px;margin-bottom:6px">🧾</div>
-  <div style="font-size:20px;font-weight:800">Stromquittung</div>
+<div style="text-align:center;margin-bottom:14px">
+  <div style="font-size:40px;margin-bottom:4px">🧾</div>
+  <div style="font-size:20px;font-weight:800">Offizielle Stromquittung</div>
+  <div style="font-size:12px;color:var(--muted);margin-top:4px">
+    Land: <b id="rCountryName">Deutschland</b> (<span id="rVatRate">19.0</span>% <span id="rVatName">MwSt.</span>)
+    <span style="color:var(--blue);cursor:pointer;font-weight:700;margin-left:6px" onclick="showM('countryModal')">✏️ Ändern</span>
+  </div>
 </div>
+
 <table class="rtbl">
-  <thead><tr><th>Gerät</th><th style="text-align:center">Dauer</th><th style="text-align:right">Wh</th><th style="text-align:right">EUR</th></tr></thead>
+  <thead><tr><th>Pos / Gerät</th><th style="text-align:center">Dauer</th><th style="text-align:right">Wh</th><th style="text-align:right">Netto</th><th style="text-align:right">Brutto</th></tr></thead>
   <tbody id="recB"></tbody>
 </table>
+
 <div class="tbox">
-  <div style="font-size:11px;color:#166534;font-weight:700">GESAMTBETRAG</div>
-  <div style="font-size:24px;font-weight:800;color:#15803d" id="rCost">0 EUR</div>
-  <div style="font-size:11px;color:#166534;margin-top:2px"><span id="rWh">0</span> Wh (<span id="rKwh">0</span> kWh)</div>
+  <div style="font-size:11.5px;color:#64748b;margin-bottom:3px">Zwischensumme (Netto): <b id="rNetto" style="color:#0f172a">0.00000 €</b></div>
+  <div style="font-size:11.5px;color:#64748b;margin-bottom:6px">zzgl. <span id="rVatPct">19.0% MwSt.</span>: <b id="rVatAmt" style="color:#0f172a">+ 0.00000 €</b></div>
+  <div style="font-size:11px;color:#166534;font-weight:800;text-transform:uppercase;border-top:1px dashed #86efac;padding-top:6px">GESAMTBETRAG (BRUTTO)</div>
+  <div style="font-size:24px;font-weight:800;color:#15803d" id="rCost">0.00000 €</div>
+  <div style="font-size:11px;color:#166534;margin-top:2px">Gesamtverbrauch: <span id="rWh">0</span> Wh (<span id="rKwh">0</span> kWh)</div>
 </div>
+
 <div style="margin-top:18px;background:#f8fafc;border:1px solid var(--border);border-radius:14px;padding:14px">
-  <div style="font-size:12px;font-weight:700;margin-bottom:6px">📧 Quittung per E-Mail:</div>
+  <div style="font-size:12px;font-weight:700;margin-bottom:6px">📧 Quittung per E-Mail senden:</div>
   <input type="email" id="emIn" class="ein" placeholder="deine@email.de">
   <button class="btn bp" style="background:var(--blue);font-size:13.5px;padding:11px" onclick="sendEm()">Senden</button>
-  <button class="btn bs" style="font-size:13px;padding:9px;margin-top:6px" onclick="window.open('/download_invoice','_blank')">📥 PDF</button>
+  <button class="btn bs" style="font-size:13px;padding:9px;margin-top:6px" onclick="window.open('/download_invoice','_blank')">📥 PDF-Quittung herunterladen</button>
   <div id="emFb" style="display:none;font-size:12px;font-weight:600;margin-top:8px"></div>
 </div>
 </div>
@@ -1086,7 +1300,9 @@ var done = false, lastR = null;
 var localElapsed = 0;
 var isChargingActive = false;
 var localTimerInterval = null;
-var STROMPREIS = 0.35;
+
+var STROMPREIS_NETTO = 0.35;
+var currentCountry = { code: 'DE', name: 'Deutschland', flag: '🇩🇪', vat_name: 'MwSt.', rate: 19.0 };
 var currentDevice = { mode: 'continuous', is_battery: false, nominal_wh: 0, user_confirmed: false };
 var latestAiSuggestion = null;
 
@@ -1165,6 +1381,22 @@ function devAct(a){
   }
 }
 
+function chooseCountry(code){
+  hideM('countryModal');
+  post('/set_country', { country_code: code }).then(function(res){
+    if(res.status === 'ok' && res.country){
+      currentCountry = res.country;
+      updateCountryDisplays();
+    }
+    if(done && lastR){
+      // Quittungsansicht neu rendern mit neuem Land
+      post('/logout').then(function(newR){ showReceipt(newR); });
+    } else {
+      poll();
+    }
+  });
+}
+
 function chooseDevice(key){
   hideM('devModal');
   post('/set_device', { key: key, confirmed: true }).then(function(res){
@@ -1187,12 +1419,24 @@ function confirmSuggestion(){
   });
 }
 
+function updateCountryDisplays(){
+  document.getElementById('hdrFlag').innerText = currentCountry.flag || '🇩🇪';
+  document.getElementById('hdrCountryText').innerText = (currentCountry.code || 'DE') + ' · ' + (currentCountry.rate || 19) + '% ' + (currentCountry.vat_name || 'MwSt.');
+  
+  var vRates = document.querySelectorAll('.vatRateDisplay');
+  vRates.forEach(function(el){ el.innerText = (currentCountry.rate || 19.0).toFixed(1); });
+
+  var vNames = document.querySelectorAll('.vatNameDisplay');
+  vNames.forEach(function(el){ el.innerText = currentCountry.vat_name || 'MwSt.'; });
+}
+
 function updateWysiwygLook(dev, curW, curWh){
   var isBatt = dev.is_battery || dev.mode === 'battery';
   var pCont = document.getElementById('panelContinuous');
   var pBatt = document.getElementById('panelBattery');
+  var vatFactor = 1.0 + ((currentCountry.rate || 19.0) / 100.0);
 
-  // AI Box Styling & Status
+  // AI Box
   var aiBox = document.getElementById('aiBox');
   var aiTag = document.getElementById('aiTag');
   var btnConf = document.getElementById('btnConfirm');
@@ -1233,27 +1477,29 @@ function updateWysiwygLook(dev, curW, curWh){
     if(loadedWh >= nomWh) socPct = 100;
 
     var etaMin = curW > 0.5 ? Math.round((whNeeded / curW) * 60) : 0;
-    var costNeeded = (whNeeded / 1000.0) * STROMPREIS;
+    var costNeededNetto = (whNeeded / 1000.0) * STROMPREIS_NETTO;
+    var costNeededBrutto = costNeededNetto * vatFactor;
 
     document.getElementById('socBar').style.width = socPct + '%';
     document.getElementById('socPctText').innerText = socPct + '%';
     document.getElementById('socEtaText').innerText = curW > 0.5 ? ('Restzeit: ~' + etaMin + ' Min') : 'Warte auf Strom...';
     document.getElementById('battWhNeeded').innerText = whNeeded.toFixed(2) + ' Wh';
-    document.getElementById('battCostNeeded').innerText = '+' + costNeeded.toFixed(4) + ' €';
+    document.getElementById('battCostNeeded').innerText = '+' + costNeededBrutto.toFixed(4) + ' €';
   } else {
     pBatt.style.display = 'none';
     pCont.style.display = 'block';
 
     var p24_wh = curW * 24.0;
     var p24_kwh = p24_wh / 1000.0;
-    var p24_cost = p24_kwh * STROMPREIS;
-    var p30_cost = p24_cost * 30.0;
+    var p24_cost_netto = p24_kwh * STROMPREIS_NETTO;
+    var p24_cost_brutto = p24_cost_netto * vatFactor;
+    var p30_cost_brutto = p24_cost_brutto * 30.0;
 
     document.getElementById('p24Wh').innerText = p24_wh.toFixed(1);
-    document.getElementById('p24Cost').innerText = p24_cost.toFixed(2);
+    document.getElementById('p24Cost').innerText = p24_cost_brutto.toFixed(2);
     document.getElementById('p24Watt').innerText = curW.toFixed(1);
     document.getElementById('p24Kwh').innerText = p24_kwh.toFixed(3) + ' kWh';
-    document.getElementById('p30Cost').innerText = p30_cost.toFixed(2) + ' €';
+    document.getElementById('p30Cost').innerText = p30_cost_brutto.toFixed(2) + ' €';
   }
 }
 
@@ -1264,15 +1510,33 @@ function showReceipt(rp){
   lastR = rp;
   document.getElementById('mainC').style.display = 'none';
   document.getElementById('recC').style.display = 'block';
+
+  var vatRate = rp.vat_rate || currentCountry.rate || 19.0;
+  var vatName = rp.vat_name || currentCountry.vat_name || 'MwSt.';
+  var cName = rp.country_name || currentCountry.name || 'Deutschland';
+  var netto = rp.total_cost_netto || 0.0;
+  var vatAmt = rp.total_vat_amount || 0.0;
+  var brutto = rp.total_cost_brutto || rp.total_cost || 0.0;
+
+  document.getElementById('rCountryName').innerText = cName;
+  document.getElementById('rVatRate').innerText = vatRate.toFixed(1);
+  document.getElementById('rVatName').innerText = vatName;
+
   var tb = document.getElementById('recB');
   tb.innerHTML = '';
-  (rp.devices || []).forEach(function(d){
+  (rp.devices || []).forEach(function(d, idx){
     var m = d.is_battery ? 'Akku' : 'Dauerbetrieb';
+    var dNetto = d.cost_netto || (d.wh / 1000.0) * STROMPREIS_NETTO;
+    var dBrutto = d.cost_brutto || d.cost || (dNetto * (1 + vatRate/100));
     var tr = document.createElement('tr');
-    tr.innerHTML = '<td><b>' + (d.icon || '🔌') + ' ' + (d.name || 'Gerät') + '</b><br><span style="font-size:10.5px;color:#64748b">' + m + '</span></td><td style="text-align:center">' + fs(d.duration_sec || 0) + '</td><td style="text-align:right">' + (d.wh || 0).toFixed(3) + '</td><td style="text-align:right"><b>' + (d.cost || 0).toFixed(5) + '</b></td>';
+    tr.innerHTML = '<td><b>' + (d.icon || '🔌') + ' ' + (d.name || 'Gerät') + '</b><br><span style="font-size:10px;color:#64748b">' + m + '</span></td><td style="text-align:center">' + fs(d.duration_sec || 0) + '</td><td style="text-align:right">' + (d.wh || 0).toFixed(3) + '</td><td style="text-align:right">' + dNetto.toFixed(4) + ' €</td><td style="text-align:right"><b>' + dBrutto.toFixed(4) + ' €</b></td>';
     tb.appendChild(tr);
   });
-  document.getElementById('rCost').innerText = (rp.total_cost || 0).toFixed(5) + ' EUR';
+
+  document.getElementById('rNetto').innerText = netto.toFixed(5) + ' €';
+  document.getElementById('rVatPct').innerText = vatRate.toFixed(1) + '% ' + vatName;
+  document.getElementById('rVatAmt').innerText = '+ ' + vatAmt.toFixed(5) + ' €';
+  document.getElementById('rCost').innerText = brutto.toFixed(5) + ' €';
   document.getElementById('rWh').innerText = (rp.total_wh || 0).toFixed(4);
   document.getElementById('rKwh').innerText = (rp.total_kwh || 0).toFixed(6);
 }
@@ -1288,6 +1552,12 @@ function poll(){
     var srvSec = d.elapsed_seconds || 0;
     var curW = d.watt || 0.0;
     var curWh = d.wh || 0.0;
+
+    // Land-Synchronisation
+    if(d.country){
+      currentCountry = d.country;
+      updateCountryDisplays();
+    }
 
     // Timer-Synchronisation ohne Ruckeln
     if(d.active){
@@ -1320,8 +1590,17 @@ function poll(){
     document.getElementById('watt').innerText = curW.toFixed(3);
     document.getElementById('wh').innerText = curWh.toFixed(4);
     document.getElementById('mwh').innerText = (curWh * 1000).toFixed(1);
-    document.getElementById('cost').innerText = (d.cost || 0).toFixed(5);
-    document.getElementById('cent').innerText = ((d.cost || 0) * 100).toFixed(3);
+
+    // Kosten (Netto, MwSt, Brutto)
+    var brutto = d.cost_brutto || d.cost || 0.0;
+    var netto = d.cost_netto || 0.0;
+    var vatAmt = d.vat_amount || 0.0;
+
+    document.getElementById('costBrutto').innerText = brutto.toFixed(5);
+    document.getElementById('costCent').innerText = (brutto * 100).toFixed(3);
+    document.getElementById('costNetto').innerText = netto.toFixed(5) + ' €';
+    document.getElementById('vatAmount').innerText = vatAmt.toFixed(5) + ' €';
+
     document.getElementById('wSub').innerText = (curW > 0.1) ? 'Strom fließt' : 'Kein Strom';
 
     // KI-Vorschlag & Aktives Gerät
@@ -1392,10 +1671,10 @@ td{padding:10px;border-bottom:1px solid #1e293b}
 <div class="wrap">
 <div class="hdr"><div><div class="brand">⚡ Admin Dashboard</div><div style="font-size:12px;color:#94a3b8;margin-top:4px">Station: <code>{{ physical_token }}</code></div></div><span class="badge">Admin</span></div>
 <div class="g4">
-<div class="kpi"><div class="kpi-l">Umsatz</div><div class="kpi-v" style="color:#10b981">{{ "%.5f"|format(today_revenue) }} €</div><div class="kpi-s">Gesamt: {{ "%.5f"|format(total_revenue) }} €</div></div>
-<div class="kpi"><div class="kpi-l">Energie</div><div class="kpi-v" style="color:#3b82f6">{{ "%.2f"|format(today_wh) }} Wh</div><div class="kpi-s">Gesamt: {{ "%.4f"|format(total_kwh) }} kWh</div></div>
+<div class="kpi"><div class="kpi-l">Umsatz Heute (Brutto)</div><div class="kpi-v" style="color:#10b981">{{ "%.5f"|format(today_revenue) }} €</div><div class="kpi-s">Gesamt: {{ "%.5f"|format(total_revenue) }} €</div></div>
+<div class="kpi"><div class="kpi-l">Energie Heute</div><div class="kpi-v" style="color:#3b82f6">{{ "%.2f"|format(today_wh) }} Wh</div><div class="kpi-s">Gesamt: {{ "%.4f"|format(total_kwh) }} kWh</div></div>
 <div class="kpi"><div class="kpi-l">Sitzungen</div><div class="kpi-v">{{ today_sessions }}</div><div class="kpi-s">Gesamt: {{ total_sessions }}</div></div>
-<div class="kpi"><div class="kpi-l">Live</div><div class="kpi-v" style="color:{% if live_active %}#10b981{% else %}#94a3b8{% endif %}">{% if live_active %}AKTIV{% else %}BEREIT{% endif %}</div><div class="kpi-s">Relais: {% if relay_on %}EIN{% else %}AUS{% endif %}</div></div>
+<div class="kpi"><div class="kpi-l">Live Status</div><div class="kpi-v" style="color:{% if live_active %}#10b981{% else %}#94a3b8{% endif %}">{% if live_active %}AKTIV{% else %}BEREIT{% endif %}</div><div class="kpi-s">Relais: {% if relay_on %}EIN{% else %}AUS{% endif %}</div></div>
 </div>
 <div class="sec">
 <div class="sec-t"><span>Telemetrie</span><div style="display:flex;gap:8px"><button class="btn bon" onclick="ovr('force_on')">EIN</button><button class="btn boff" onclick="ovr('force_off')">AUS</button></div></div>
@@ -1407,8 +1686,8 @@ td{padding:10px;border-bottom:1px solid #1e293b}
 </div></div>
 <div class="sec">
 <div class="sec-t">Sitzungen</div>
-<table><thead><tr><th>Beleg</th><th>Datum</th><th>Gerät</th><th>Dauer</th><th>Wh</th><th>EUR</th></tr></thead>
-<tbody>{% for r in history_records|reverse %}<tr><td><code>{{ r.invoice_id }}</code></td><td>{{ r.date }}</td><td>{% for d in r.devices %}{{ d.icon|default('🔌') }} {{ d.name|default('?') }} ({{ 'Akku' if d.is_battery else 'Dauerbetrieb' }})<br>{% endfor %}</td><td>{{ r.time_formatted }}</td><td>{{ "%.3f"|format(r.total_wh) }}</td><td><b style="color:#10b981">{{ "%.5f"|format(r.total_cost) }}</b></td></tr>{% else %}<tr><td colspan="6" style="text-align:center;color:#94a3b8">Keine.</td></tr>{% endfor %}</tbody></table>
+<table><thead><tr><th>Beleg</th><th>Datum</th><th>Gerät & Land</th><th>Dauer</th><th>Wh</th><th>Brutto (€)</th></tr></thead>
+<tbody>{% for r in history_records|reverse %}<tr><td><code>{{ r.invoice_id }}</code></td><td>{{ r.date }}</td><td>{% for d in r.devices %}{{ d.icon|default('🔌') }} {{ d.name|default('?') }} ({{ 'Akku' if d.is_battery else 'Dauerbetrieb' }})<br>{% endfor %}<span style="font-size:10.5px;color:#94a3b8">{{ r.country_flag|default('🇩🇪') }} {{ r.country_name|default('DE') }} ({{ r.vat_rate|default(19.0) }}% {{ r.vat_name|default('MwSt') }})</span></td><td>{{ r.time_formatted }}</td><td>{{ "%.3f"|format(r.total_wh) }}</td><td><b style="color:#10b981">{{ "%.5f"|format(r.total_cost_brutto|default(r.total_cost|default(0))) }} €</b></td></tr>{% else %}<tr><td colspan="6" style="text-align:center;color:#94a3b8">Keine.</td></tr>{% endfor %}</tbody></table>
 </div></div>
 <script>function ovr(a){fetch('/admin_api/override',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:a})}).then(function(r){return r.json()}).then(function(d){alert(d.message||'OK');location.reload()})}</script>
 </body></html>"""
