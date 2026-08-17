@@ -424,15 +424,15 @@ def background_metering_loop():
                         dev["soc_pct"] = 100.0
                         dev["wh_to_100"] = 0.0
 
-                # 5. Erkennung: Gerät ausgesteckt (Verbrauch unter 0.3W für mehrere Zyklen)
+                # 5. Erkennung: Gerät ausgesteckt (Verbrauch unter 0.3W erst nach 90s prüfen)
                 if watt < 0.3 and u.get("active") and not u.get("paused"):
                     global_state["consecutive_zero_w_count"] += 1
-                    if global_state["consecutive_zero_w_count"] >= 15 and u["accumulated_seconds"] > 25:
+                    if global_state["consecutive_zero_w_count"] >= 60 and u["accumulated_seconds"] > 90:
                         u["unplug_dialog_active"] = True
                         u["active"] = False
                         u["paused"] = True
                         u["stop_reason"] = "unplugged"
-                        logger.info("[METERING-WORKER] 🔌 Kein Stromfluss erkannt. Pausiere Station.")
+                        logger.info("[METERING-WORKER] 🔌 Kein Stromfluss über 60s erkannt. Pausiere Station.")
                         async_cloud_control(turn_on=False)
                 else:
                     global_state["consecutive_zero_w_count"] = 0
