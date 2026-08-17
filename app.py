@@ -907,9 +907,7 @@ def reset_session():
 
 @app.route('/status')
 def get_status():
-    poll_shelly()
     with lock:
-        accumulate_energy()
         elapsed = get_session_elapsed()
         curr_idx = charge["current_device_idx"]
         devices = [dict(d) for d in charge["devices"]]
