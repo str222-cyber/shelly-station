@@ -209,57 +209,59 @@ def async_cloud_control(turn_on=True):
             
     threading.Thread(target=_worker, daemon=True).start()
 
+def update_shelly_telemetry_once():
+    try:
+        payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID}
+        res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=5.0).json()
+        
+        if res.get("isok"):
+            status = res.get("data", {}).get("device_status", {})
+            watt = 0.0
+            amp = 0.0
+            volt = 230.0
+            relay_out = False
+
+            if "switch:0" in status:
+                sw = status["switch:0"]
+                watt = float(sw.get("apower", 0.0) or 0.0)
+                amp = float(sw.get("current", 0.0) or 0.0)
+                volt = float(sw.get("voltage", 230.0) or 230.0)
+                relay_out = bool(sw.get("output", False))
+            elif "meters" in status and len(status["meters"]) > 0:
+                m = status["meters"][0]
+                watt = float(m.get("power", 0.0) or 0.0)
+                amp = float(m.get("current", 0.0) or (watt / 230.0 if watt > 0 else 0.0))
+                volt = float(m.get("voltage", 230.0) or 230.0)
+            elif "relays" in status and len(status["relays"]) > 0:
+                r0 = status["relays"][0]
+                watt = float(r0.get("power", 0.0) or 0.0)
+                amp = watt / 230.0 if watt > 0 else 0.0
+                relay_out = bool(r0.get("ison", False))
+
+            with state_lock:
+                global_state["last_watt"] = max(0.0, watt)
+                global_state["last_amp"] = max(0.0, amp)
+                global_state["last_volt"] = volt if volt > 50 else 230.0
+                global_state["relay_on"] = relay_out
+                global_state["last_valid_fetch_time"] = time.time()
+                global_state["history_w"].append(watt)
+            return True
+    except Exception:
+        pass
+    return False
+
 # --- THREAD 1: ZENTRALER GETAKTETER SHELLY-POLLER (5.0s Intervall = 100% Rate-Limit konform) ---
 def shelly_cloud_poller_loop():
-    time.sleep(2.0)
+    time.sleep(0.5)
     while True:
         try:
-            payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID}
-            res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=5.0).json()
-            
-            if res.get("isok"):
-                status = res.get("data", {}).get("device_status", {})
-                watt = 0.0
-                amp = 0.0
-                volt = 230.0
-                relay_out = False
-
-                if "switch:0" in status:
-                    sw = status["switch:0"]
-                    watt = float(sw.get("apower", 0.0) or 0.0)
-                    amp = float(sw.get("current", 0.0) or 0.0)
-                    volt = float(sw.get("voltage", 230.0) or 230.0)
-                    relay_out = bool(sw.get("output", False))
-                elif "meters" in status and len(status["meters"]) > 0:
-                    m = status["meters"][0]
-                    watt = float(m.get("power", 0.0) or 0.0)
-                    amp = float(m.get("current", 0.0) or (watt / 230.0 if watt > 0 else 0.0))
-                    volt = float(m.get("voltage", 230.0) or 230.0)
-                elif "relays" in status and len(status["relays"]) > 0:
-                    r0 = status["relays"][0]
-                    watt = float(r0.get("power", 0.0) or 0.0)
-                    amp = watt / 230.0 if watt > 0 else 0.0
-                    relay_out = bool(r0.get("ison", False))
-
-                with state_lock:
-                    global_state["last_watt"] = max(0.0, watt)
-                    global_state["last_amp"] = max(0.0, amp)
-                    global_state["last_volt"] = volt if volt > 50 else 230.0
-                    global_state["relay_on"] = relay_out
-                    global_state["last_valid_fetch_time"] = time.time()
-                    global_state["history_w"].append(watt)
-
+            success = update_shelly_telemetry_once()
+            if success:
                 time.sleep(5.0)
-
-            elif res.get("error") == "TOO_MANY_REQUESTS":
-                time.sleep(6.0)
             else:
-                time.sleep(5.0)
-
+                time.sleep(5.5)
         except Exception:
             time.sleep(5.0)
-
-threading.Thread(target=shelly_cloud_poller_loop, daemon=True).start()
 
 # --- THREAD 2: AUTARKER ENERGIE- & AI-METERING ENGINE (1s Intervall) ---
 def background_metering_loop():
@@ -283,7 +285,7 @@ def background_metering_loop():
                 if not u.get("active") or u.get("terminated") or u.get("paused"):
                     continue
 
-                # 1. Energie-Integration
+                # 1. Energie-Integration (sekundengenau)
                 wh_increment = (watt * dt) / 3600.0
                 u["accumulated_seconds"] += dt
                 u["total_wh"] += wh_increment
@@ -357,7 +359,25 @@ def background_metering_loop():
         except Exception as e:
             print(f"Metering Engine Fehler: {e}")
 
-threading.Thread(target=background_metering_loop, daemon=True).start()
+# SICHERES STARTEN DER HINTERGRUND-THREADS IM WORKER-PROZESS
+threads_started = False
+threads_start_lock = threading.Lock()
+
+def ensure_background_workers():
+    global threads_started
+    with threads_start_lock:
+        if not threads_started:
+            threads_started = True
+            t1 = threading.Thread(target=shelly_cloud_poller_loop, daemon=True, name="ShellyPoller")
+            t2 = threading.Thread(target=background_metering_loop, daemon=True, name="MeteringEngine")
+            t1.start()
+            t2.start()
+
+ensure_background_workers()
+
+@app.before_request
+def startup_hook():
+    ensure_background_workers()
 
 # --- PDF-GENERATOR ---
 def generate_pdf_invoice(report_data):
