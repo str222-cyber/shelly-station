@@ -140,6 +140,8 @@ global_state = {
     "last_watt": 0.0,
     "last_amp": 0.0,
     "last_volt": 230.0,
+    "smoothed_watt": 0.0,
+    "smoothed_amp": 0.0,
     "last_valid_fetch_time": 0.0,
     "last_shelly_error": None,
     "transfer_requested": False,
@@ -308,9 +310,9 @@ def update_shelly_telemetry_once():
         logger.error(f"[SHELLY-CLOUD-API] 💥 Unerwarteter Fehler: {e}", exc_info=True)
         return False, str(e)
 
-# --- THREAD 1: GETAKTETER SHELLY-POLLER (8.0s Intervall, 15s Backoff bei Rate Limit) ---
+# --- DAEMON THREAD 1: GETAKTETER SHELLY-POLLER (10.0s Intervall, 20s Backoff bei Rate Limit) ---
 def shelly_cloud_poller_loop():
-    logger.info("🚀 Shelly Cloud Poller Loop gestartet.")
+    logger.info("🚀 Shelly Cloud Poller Daemon gestartet (10.0s Takt).")
     time.sleep(1.0)
     while True:
         try:
@@ -324,28 +326,45 @@ def shelly_cloud_poller_loop():
                 time.sleep(10.0)
         except Exception as e:
             logger.error(f"[SHELLY-POLLER] Fehler in Poller-Schleife: {e}")
-            time.sleep(8.0)
+            time.sleep(10.0)
 
-# --- THREAD 2: AUTARKER ENERGIE- & AI-METERING ENGINE (1s Intervall, Standby-Immun) ---
-def background_metering_loop():
-    logger.info("🚀 Autarke Hintergrund-Metering-Engine gestartet.")
-    last_loop_time = time.time()
+# --- DAEMON THREAD 2: AUTONOMER MESS-WORKER (Delta-Zeit, Smoothing & Wh-Akkumulation im 1.0s Takt) ---
+def background_metering_worker():
+    logger.info("🚀 Autonomer Hintergrund-Mess-Worker läuft im 1-Sekunden-Takt...")
+    last_loop = time.time()
     tick_counter = 0
 
     while True:
         try:
+            # 4. Fester Takt: Sauberes 1-Sekunden-Schlafen
             time.sleep(1.0)
             now = time.time()
-            dt = max(0.1, min(3.0, now - last_loop_time))
-            last_loop_time = now
+
+            # 2. Delta-Zeit-Integration: Exakte Zeitmessung seit letztem Durchlauf (begrenzt auf 1.0 bis 5.0s)
+            dt = max(1.0, min(5.0, now - last_loop))
+            last_loop = now
             tick_counter += 1
 
             with state_lock:
-                active_uid = global_state["active_user_id"]
-                watt = global_state["last_watt"]
-                amp = global_state["last_amp"]
+                raw_w = global_state["last_watt"]
+                raw_a = global_state["last_amp"]
 
-                # Automatische Session-Bindung: Falls active_uid nicht gesetzt, suche aktive Session
+                # 3. Glättung der Leistung (Smoothing via gleitendem Durchschnitt)
+                if global_state["smoothed_watt"] <= 0.0:
+                    global_state["smoothed_watt"] = raw_w
+                else:
+                    global_state["smoothed_watt"] = (global_state["smoothed_watt"] * 0.8) + (raw_w * 0.2)
+
+                if global_state["smoothed_amp"] <= 0.0:
+                    global_state["smoothed_amp"] = raw_a
+                else:
+                    global_state["smoothed_amp"] = (global_state["smoothed_amp"] * 0.8) + (raw_a * 0.2)
+
+                watt = global_state["smoothed_watt"]
+                amp = global_state["smoothed_amp"]
+
+                # Aktive Session finden
+                active_uid = global_state["active_user_id"]
                 if not active_uid or active_uid not in user_sessions:
                     for uid_cand, sess_cand in user_sessions.items():
                         if sess_cand.get("active") and not sess_cand.get("terminated"):
@@ -360,11 +379,13 @@ def background_metering_loop():
                 if not u.get("active") or u.get("terminated") or u.get("paused"):
                     continue
 
-                # 1. Kontinuierliche Energie-Integration (sekundengenau)
-                wh_increment = (watt * dt) / 3600.0
+                # 2. Energie-Akkumulation über Delta-Zeit: total_kwh += (watt * dt) / 3600000.0
+                kwh_increment = (raw_w * dt) / 3600000.0
+                wh_increment = (raw_w * dt) / 3600.0
+
                 u["accumulated_seconds"] += dt
                 u["total_wh"] += wh_increment
-                u["total_kwh"] = u["total_wh"] / 1000.0
+                u["total_kwh"] += kwh_increment
                 u["total_cost"] = u["total_kwh"] * STROMPREIS_PER_KWH
 
                 # Aktuelles Einzelgerät aktualisieren
@@ -374,11 +395,11 @@ def background_metering_loop():
                     dev["duration_sec"] += dt
                     dev["wh"] += wh_increment
                     dev["cost"] = (dev["wh"] / 1000.0) * STROMPREIS_PER_KWH
-                    dev["peak_w"] = max(dev.get("peak_w", 0.0), watt)
+                    dev["peak_w"] = max(dev.get("peak_w", 0.0), raw_w)
 
                     prof = DEVICE_PROFILES.get(dev["key"], DEVICE_PROFILES["custom"])
 
-                    # 2. AI-Ladestufen & SoC Berechnung
+                    # AI-Ladestufen & SoC Berechnung
                     if prof["is_battery"]:
                         peak_w = max(dev["peak_w"], prof["typical_w"] * 0.7)
                         nom_wh = prof["nominal_wh"] or 20.0
@@ -402,7 +423,7 @@ def background_metering_loop():
                         dev["soc_pct"] = round(min(100.0, soc), 1)
                         dev["wh_to_100"] = max(0.0, round(nom_wh * (1.0 - (dev["soc_pct"] / 100.0)), 2))
 
-                        # 3. Automatischer 80% Lade-Stopp (nur nach echtem Ladevorgang)
+                        # Automatischer 80% Lade-Stopp (nur nach echtem Ladevorgang)
                         if u.get("battery_80_protection_enabled") and not u.get("battery_80_triggered") and dev["duration_sec"] > 30 and dev["wh"] >= (nom_wh * 0.65) and dev["soc_pct"] >= 80.0:
                             u["battery_80_triggered"] = True
                             u["active"] = False
@@ -411,7 +432,7 @@ def background_metering_loop():
                             logger.info("[METERING-WORKER] 🛡️ 80% Batterieschutz ausgelöst! Schalte Relais ab.")
                             async_cloud_control(turn_on=False)
 
-                        # 4. Automatischer 100% Lade-Stopp (nur nach echtem Ladevorgang)
+                        # Automatischer 100% Lade-Stopp (nur nach echtem Ladevorgang)
                         if not u.get("battery_100_triggered") and dev["duration_sec"] > 45 and dev["wh"] > 0.5 and (dev["soc_pct"] >= 99.5 or watt <= prof["trickle_w"]):
                             u["battery_100_triggered"] = True
                             u["active"] = False
@@ -424,8 +445,8 @@ def background_metering_loop():
                         dev["soc_pct"] = 100.0
                         dev["wh_to_100"] = 0.0
 
-                # 5. Erkennung: Gerät ausgesteckt (Verbrauch unter 0.3W erst nach 90s prüfen)
-                if watt < 0.3 and u.get("active") and not u.get("paused"):
+                # Unplug-Erkennung nach 90s ohne Last
+                if raw_w < 0.3 and u.get("active") and not u.get("paused"):
                     global_state["consecutive_zero_w_count"] += 1
                     if global_state["consecutive_zero_w_count"] >= 60 and u["accumulated_seconds"] > 90:
                         u["unplug_dialog_active"] = True
@@ -437,34 +458,33 @@ def background_metering_loop():
                 else:
                     global_state["consecutive_zero_w_count"] = 0
 
-                # Periodischer Debug-Log alle 5 Sekunden
+                # Periodischer Log alle 5 Sekunden
                 if tick_counter % 5 == 0:
-                    curr_dev_name = u["devices"][curr_idx]["name"] if u.get("devices") else "Unbekannt"
-                    logger.info(f"[METERING-WORKER] ⏱️ Session={active_uid[:8]} | Zeit={u['accumulated_seconds']:.1f}s | P={watt:.2f}W | Wh={u['total_wh']:.4f}Wh | Betrag={u['total_cost']:.5f}€ | Gerät={curr_dev_name}")
+                    logger.info(f"[METER-WORKER] ⏱️ {active_uid[:8]} | Zeit={u['accumulated_seconds']:.1f}s | P={watt:.2f}W (Roh:{raw_w:.2f}W) | Wh={u['total_wh']:.4f}Wh | Betrag={u['total_cost']:.5f}€")
 
         except Exception as e:
             logger.error(f"[METERING-WORKER] 💥 Fehler in Metering-Engine: {e}", exc_info=True)
 
-# SICHERES STARTEN DER HINTERGRUND-THREADS IM WORKER-PROZESS
-threads_started = False
-threads_start_lock = threading.Lock()
+# 1. ENSURE_WORKER: AUTONOMER DAEMON-THREAD INITIALISIERUNG
+worker_started = False
+worker_start_lock = threading.Lock()
 
-def ensure_background_workers():
-    global threads_started
-    with threads_start_lock:
-        if not threads_started:
-            threads_started = True
+def ensure_worker():
+    global worker_started
+    with worker_start_lock:
+        if not worker_started:
+            worker_started = True
             t1 = threading.Thread(target=shelly_cloud_poller_loop, daemon=True, name="ShellyPoller")
-            t2 = threading.Thread(target=background_metering_loop, daemon=True, name="MeteringEngine")
+            t2 = threading.Thread(target=background_metering_worker, daemon=True, name="BackgroundMeterWorker")
             t1.start()
             t2.start()
-            logger.info("🚀 Hintergrund-Worker erfolgreich initialisiert und gestartet!")
+            logger.info("🚀 Autonome Daemon-Worker (ShellyPoller + BackgroundMeterWorker) dauerhaft gestartet!")
 
-ensure_background_workers()
+ensure_worker()
 
 @app.before_request
 def startup_hook():
-    ensure_background_workers()
+    ensure_worker()
 
 # --- PDF-GENERATOR ---
 def generate_pdf_invoice(report_data):
@@ -1682,6 +1702,8 @@ def scan_token(token):
     u, uid = get_or_create_user_session()
     if token == PHYSICAL_STATION_TOKEN:
         session["station_verified"] = True
+        session.permanent = True
+        session.modified = True
         u["station_verified"] = True
         logger.info(f"✅ User {uid[:8]} erfolgreich über physischen Token {token} verifiziert.")
         return redirect(url_for('index'))
@@ -1702,39 +1724,32 @@ def get_status():
         })
 
     with state_lock:
-        w = global_state["last_watt"]
-        a = global_state["last_amp"]
+        w = global_state["smoothed_watt"] if global_state["smoothed_watt"] > 0 else global_state["last_watt"]
+        a = global_state["smoothed_amp"] if global_state["smoothed_amp"] > 0 else global_state["last_amp"]
         v = global_state["last_volt"]
         relay = global_state["relay_on"]
-
-    now = time.time()
-    live_elapsed = u.get("accumulated_seconds", 0.0)
-    if u.get("active") and u.get("start_timestamp"):
-        live_elapsed = u.get("accumulated_seconds", 0.0) + (now - u["start_timestamp"])
 
     curr_idx = u.get("current_device_idx", 0)
     devices_copy = []
     for idx, d in enumerate(u.get("devices", [])):
-        dev_dur = d.get("duration_sec", 0.0)
-        d_dict = dict(d)
-        d_dict["duration_sec"] = dev_dur
-        devices_copy.append(d_dict)
+        devices_copy.append(dict(d))
 
     current_device = devices_copy[curr_idx] if 0 <= curr_idx < len(devices_copy) else None
 
+    # Schneller, nicht-blockierender O(1) Memory-Zugriff
     return jsonify({
         "user_id": uid,
         "active_user_id": global_state["active_user_id"],
         "active": u.get("active", False),
         "paused": u.get("paused", False),
-        "watt": w,
-        "current_ampere": a,
-        "voltage": v,
+        "watt": round(w, 3),
+        "current_ampere": round(a, 3),
+        "voltage": round(v, 1),
         "relay_on": relay,
-        "elapsed_seconds": live_elapsed,
-        "wh": u.get("total_wh", 0.0),
-        "kwh": u.get("total_kwh", 0.0),
-        "cost": u.get("total_cost", 0.0),
+        "elapsed_seconds": round(u.get("accumulated_seconds", 0.0), 1),
+        "wh": round(u.get("total_wh", 0.0), 4),
+        "kwh": round(u.get("total_kwh", 0.0), 6),
+        "cost": round(u.get("total_cost", 0.0), 5),
         "battery_80_protection_enabled": u.get("battery_80_protection_enabled", True),
         "battery_80_triggered": u.get("battery_80_triggered", False),
         "battery_100_triggered": u.get("battery_100_triggered", False),
@@ -1989,8 +2004,8 @@ def admin_dashboard():
         today_wh = sum(r.get("total_wh", 0.0) for r in today_records)
         today_sessions_count = len(today_records)
 
-        live_w = global_state["last_watt"]
-        live_a = global_state["last_amp"]
+        live_w = global_state["smoothed_watt"] if global_state["smoothed_watt"] > 0 else global_state["last_watt"]
+        live_a = global_state["smoothed_amp"] if global_state["smoothed_amp"] > 0 else global_state["last_amp"]
         live_v = global_state["last_volt"]
         relay = global_state["relay_on"]
         active_u = global_state["active_user_id"]
