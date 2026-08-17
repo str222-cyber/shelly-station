@@ -215,6 +215,8 @@ charge = {
     "devices": [],
     "current_device_idx": 0,
     "last_report": None,
+    "owner_client_id": None,
+    "owner_since": None,
 }
 
 history_records = []
@@ -938,6 +940,24 @@ def fmt_time(s):
 # =====================================================================
 # ROUTES
 # =====================================================================
+
+def get_client_id():
+    cid = session.get("client_id")
+    if not cid:
+        cid = uuid.uuid4().hex[:12]
+        session["client_id"] = cid
+        session.permanent = True
+    return cid
+
+def check_client_control():
+    cid = get_client_id()
+    owner = charge.get("owner_client_id")
+    if owner is None:
+        charge["owner_client_id"] = cid
+        charge["owner_since"] = time.time()
+        return True
+    return owner == cid
+
 @app.before_request
 def check_worker_daemon():
     ensure_daemon_started()
@@ -960,15 +980,21 @@ def scan(token):
         session["station_verified"] = True
         session.permanent = True
         session.modified = True
+        cid = get_client_id()
         with lock:
             has_existing = (
+                charge.get("owner_client_id") is not None or
                 charge["active"] or
-                charge.get("total_wh", 0.0) > 0.02 or
+                charge["paused"] or
+                charge.get("total_wh", 0.0) > 0.005 or
                 len(charge.get("devices", [])) > 1 or
                 charge.get("session_start_time") is not None
             )
+            is_same_owner = (charge.get("owner_client_id") == cid)
+
             if not has_existing:
-                # Frische Station: Initialisieren
+                charge["owner_client_id"] = cid
+                charge["owner_since"] = time.time()
                 charge["terminated"] = False
                 charge["last_report"] = None
                 charge["active"] = True
@@ -1000,11 +1026,13 @@ def scan(token):
                 charge["ai_tick"] = 0
                 charge["devices"] = [new_device_entry(1, "lamp")]
                 charge["current_device_idx"] = 0
-                logger.info(">>> QR-CODE GESCANNT -> NEUE STATION INITIALISIERT & RELAIS EIN <<<")
+                logger.info(f">>> QR-CODE GESCANNT -> NEUE STATION INITIALISIERT FÜR CLIENT {cid} <<<")
+                relay_control(True)
+                return redirect(url_for('index'))
             else:
-                logger.info(">>> QR-CODE GESCANNT -> LAUFENDE SITZUNG ERKANNT (KEIN RESET) <<<")
-        relay_control(True)
-        return redirect(url_for('index', join='1' if has_existing else None))
+                logger.info(f">>> QR-CODE GESCANNT -> LAUFENDE SITZUNG ERKANNT (Owner={charge.get('owner_client_id')}, Caller={cid}) <<<")
+                relay_control(True)
+                return redirect(url_for('index', join='1' if not is_same_owner else None))
     return "Ungültiger Token.", 403
 
 @app.route('/reset_session', methods=['POST', 'GET'])
@@ -1044,6 +1072,15 @@ def reset_session():
     relay_control(True)
     logger.info(">>> SITZUNG ZURÜCKGESETZT -> RELAIS SOFORT EIN & BEREIT FÜR STROMFLUSS <<<")
     return jsonify({"status": "ok"})
+
+@app.route('/claim_control', methods=['POST'])
+def claim_control():
+    cid = get_client_id()
+    with lock:
+        charge["owner_client_id"] = cid
+        charge["owner_since"] = time.time()
+        logger.info(f"📲 Steuerung der Station exklusiv auf Client {cid} übertragen!")
+        return jsonify({"status": "ok", "is_owner": True, "client_id": cid})
 
 @app.route('/status')
 def get_status():
@@ -1088,7 +1125,15 @@ def get_status():
                 charge.get("power_history", [])
             )
 
+        cid = get_client_id()
+        is_owner = (charge.get("owner_client_id") is None) or (charge.get("owner_client_id") == cid)
+        if charge.get("owner_client_id") is None and charge.get("active"):
+            charge["owner_client_id"] = cid
+            is_owner = True
+
         return jsonify({
+            "is_owner": is_owner,
+            "has_owner": bool(charge.get("owner_client_id")),
             "battery_state": batt_state,
             "active": charge["active"],
             "paused": charge["paused"],
@@ -1138,6 +1183,8 @@ def get_status():
 @app.route('/start', methods=['POST', 'GET'])
 def start_charge():
     with lock:
+        if not check_client_control():
+            return jsonify({"status": "locked", "message": "Nur das aktive Steuerungsgerät darf schalten."}), 403
         now = time.time()
         if charge["terminated"]:
             charge["terminated"] = False
@@ -1186,6 +1233,8 @@ def start_charge():
 @app.route('/stop', methods=['POST', 'GET'])
 def stop_charge():
     with lock:
+        if not check_client_control():
+            return jsonify({"status": "locked", "message": "Nur das aktive Steuerungsgerät darf schalten."}), 403
         accumulate_energy()
         charge["active"] = False
         charge["paused"] = True
@@ -1389,6 +1438,9 @@ def merge_device():
 @app.route('/battery_action', methods=['POST'])
 def battery_action():
     data = request.get_json() or {}
+    with lock:
+        if not check_client_control():
+            return jsonify({"status": "locked", "message": "Nur das aktive Steuerungsgerät darf schalten."}), 403
     action = data.get("action")  # "continue_100" | "finish"
     now = time.time()
 
@@ -1451,6 +1503,9 @@ def switch_active_device():
 @app.route('/set_device', methods=['POST'])
 def set_device():
     data = request.get_json() or {}
+    with lock:
+        if not check_client_control():
+            return jsonify({"status": "locked", "message": "Nur das aktive Steuerungsgerät darf schalten."}), 403
     key = data.get("key")
     dev_idx = data.get("device_idx", None)
 
@@ -1479,6 +1534,7 @@ def logout():
         charge["active"] = False
         charge["paused"] = False
         charge["terminated"] = True
+        charge["owner_client_id"] = None
         charge["unplug_modal"] = None
         charge["battery_modal"] = None
         charge["power_shift_modal"] = None
@@ -2004,6 +2060,27 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 .ein{width:100%;padding:11px;border:1px solid var(--border);border-radius:10px;font-size:13.5px;margin-bottom:8px}
 </style></head><body>
 
+<!-- MODAL: STEUERUNG UEBERNEHMEN BESTAETIGEN -->
+<div id="modalConfirmTakeover" class="modal" style="display:none">
+<div class="mbox" style="text-align:center;border:2px solid #dc2626">
+  <div style="font-size:42px;margin-bottom:6px">🔐📲</div>
+  <div style="font-size:18px;font-weight:800;margin-bottom:6px;color:#991b1b">Alleinige Steuerung übernehmen?</div>
+  <p style="font-size:13px;color:var(--muted);margin-bottom:16px;line-height:1.4">
+    Diese Ladestation wird aktuell von einem anderen Smartphone / Browser gesteuert.<br/>
+    <b>Möchtest du die alleinige Bedienung jetzt auf dieses Gerät übertragen?</b>
+  </p>
+  
+  <div style="display:flex;flex-direction:column;gap:8px">
+    <button class="btn bp" style="background:#dc2626;padding:13px;font-size:14px" onclick="executeTakeover()">
+      ✅ Ja, Steuerung auf dieses Gerät übertragen
+    </button>
+    <button class="btn bs" style="padding:11px;font-size:13px" onclick="hideM('modalConfirmTakeover')">
+      👁️ Nein, nur als Zuschauer ansehen
+    </button>
+  </div>
+</div>
+</div>
+
 <!-- MODAL: BEREITS LAUFENDE SITZUNG UEBERNEHMEN ODER NEUES GERAET -->
 <div id="modalJoinSession" class="modal" style="display:none">
 <div class="mbox" style="text-align:center;border:2px solid var(--blue)">
@@ -2317,6 +2394,17 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
   </span>
 </div>
 
+<!-- SPECTATOR / GESPERRT BANNER -->
+<div id="spectatorBanner" style="display:none;background:#fef2f2;border:1.5px solid #fecaca;border-radius:14px;padding:10px 14px;margin-bottom:12px;justify-content:space-between;align-items:center;gap:8px">
+  <div style="text-align:left">
+    <div style="font-size:12px;font-weight:800;color:#991b1b">🔒 Nur Lese-Modus (Zuschauer)</div>
+    <div style="font-size:11px;color:#b91c1c">Wird aktuell von anderem Gerät gesteuert.</div>
+  </div>
+  <button class="btn bp" style="width:auto;padding:7px 12px;font-size:11.5px;background:#dc2626;white-space:nowrap;margin:0" onclick="showTakeoverPrompt()">
+    📲 Steuerung anfordern
+  </button>
+</div>
+
 <div class="badges">
   <span class="pill pill-g">🔒 Verifiziert</span>
   <span class="pill pill-off" id="sPill"><span class="dot"></span><span id="sTxt">Bereit</span></span>
@@ -2551,14 +2639,34 @@ function chooseJoinOption(opt){
   hideM('modalJoinSession');
   sessionStorage.setItem('join_handled', '1');
   if(opt === 'takeover'){
-    poll();
+    executeTakeover();
   } else if(opt === 'new_device'){
+    executeTakeover();
     showM('devModal');
   } else if(opt === 'fresh_start'){
+    executeTakeover();
     startFreshSession();
   }
 }
 window.chooseJoinOption = chooseJoinOption;
+
+function showTakeoverPrompt(){
+  showM('modalConfirmTakeover');
+}
+
+function executeTakeover(){
+  hideM('modalConfirmTakeover');
+  post('/claim_control').then(function(res){
+    if(res && res.status === 'ok'){
+      sessionStorage.setItem('join_handled', '1');
+      poll();
+    }
+  });
+}
+
+window.showTakeoverPrompt = showTakeoverPrompt;
+window.executeTakeover = executeTakeover;
+
 
 function startFreshSession(){
   lastActionLocalTime = Date.now();
@@ -2591,6 +2699,10 @@ function startFreshSession(){
 
 function doStart(){
   if(done) return;
+  if(window.lastStatusPayload && window.lastStatusPayload.is_owner === false){
+    showTakeoverPrompt();
+    return;
+  }
   lastActionLocalTime = Date.now();
   requestWakeLock();
   sessionStarted = true;
@@ -2606,6 +2718,10 @@ function doStart(){
 
 function doStop(){
   if(done) return;
+  if(window.lastStatusPayload && window.lastStatusPayload.is_owner === false){
+    showTakeoverPrompt();
+    return;
+  }
   lastActionLocalTime = Date.now();
   document.getElementById('sPill').className = 'pill pill-p';
   document.getElementById('sTxt').innerText = 'Pause';
@@ -3034,6 +3150,8 @@ function poll(){
     var idleSec = d.total_idle_seconds || 0.0;
 
     allRecordedDevices = d.devices || [];
+    var specB = document.getElementById('spectatorBanner');
+    if(specB){ specB.style.display = (d.is_owner === false) ? 'flex' : 'none'; }
     // QR-Join Erkennung bei neu gescanntem Geraet
     var urlP = new URLSearchParams(window.location.search);
     if(urlP.get('join') === '1' && !sessionStorage.getItem('join_handled') && (d.wh > 0.01 || (d.devices && d.devices.length > 1) || d.active)){
