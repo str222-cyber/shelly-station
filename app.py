@@ -134,7 +134,7 @@ global_state = {
     "last_watt": 0.0,
     "last_amp": 0.0,
     "last_volt": 230.0,
-    "last_fetch_time": 0.0,
+    "last_valid_fetch_time": 0.0,
     "transfer_requested": False,
     "transfer_requester_id": None,
     "history_w": deque(maxlen=60),
@@ -211,63 +211,70 @@ def async_cloud_control(turn_on=True):
             
     threading.Thread(target=_worker, daemon=True).start()
 
-def fetch_live_cloud_metrics():
-    now = time.time()
-    with state_lock:
-        if now - global_state["last_fetch_time"] < 0.8:
-            return global_state["last_watt"], global_state["last_amp"], global_state["last_volt"]
+# --- THREAD 1: ZENTRALER GETAKTETER SHELLY-POLLER (VERHINDERT RATE-LIMITS) ---
+def shelly_cloud_poller_loop():
+    while True:
+        try:
+            time.sleep(2.5)
+            payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID}
+            res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=3.5).json()
+            
+            if res.get("isok"):
+                status = res.get("data", {}).get("device_status", {})
+                watt = 0.0
+                amp = 0.0
+                volt = 230.0
+                relay_out = False
 
-    payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID}
-    try:
-        res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=2.0).json()
-        if res.get("isok"):
-            status = res.get("data", {}).get("device_status", {})
-            watt = 0.0
-            amp = 0.0
-            volt = 230.0
+                if "switch:0" in status:
+                    sw = status["switch:0"]
+                    watt = float(sw.get("apower", 0.0) or 0.0)
+                    amp = float(sw.get("current", 0.0) or 0.0)
+                    volt = float(sw.get("voltage", 230.0) or 230.0)
+                    relay_out = bool(sw.get("output", False))
+                elif "meters" in status and len(status["meters"]) > 0:
+                    m = status["meters"][0]
+                    watt = float(m.get("power", 0.0) or 0.0)
+                    amp = float(m.get("current", 0.0) or (watt / 230.0 if watt > 0 else 0.0))
+                    volt = float(m.get("voltage", 230.0) or 230.0)
+                elif "relays" in status and len(status["relays"]) > 0:
+                    r0 = status["relays"][0]
+                    watt = float(r0.get("power", 0.0) or 0.0)
+                    amp = watt / 230.0 if watt > 0 else 0.0
+                    relay_out = bool(r0.get("ison", False))
 
-            if "switch:0" in status:
-                sw = status["switch:0"]
-                watt = float(sw.get("apower", 0.0))
-                amp = float(sw.get("current", 0.0))
-                volt = float(sw.get("voltage", 230.0))
-            elif "meters" in status and len(status["meters"]) > 0:
-                m = status["meters"][0]
-                watt = float(m.get("power", 0.0))
-                amp = float(m.get("current", 0.0)) if "current" in m else (watt / 230.0 if watt > 0 else 0.0)
-                volt = float(m.get("voltage", 230.0)) if "voltage" in m else 230.0
-            elif "relays" in status and len(status["relays"]) > 0:
-                watt = float(status["relays"][0].get("power", 0.0))
-                amp = watt / 230.0 if watt > 0 else 0.0
+                with state_lock:
+                    global_state["last_watt"] = max(0.0, watt)
+                    global_state["last_amp"] = max(0.0, amp)
+                    global_state["last_volt"] = volt if volt > 50 else 230.0
+                    global_state["relay_on"] = relay_out
+                    global_state["last_valid_fetch_time"] = time.time()
+                    global_state["history_w"].append(watt)
 
-            with state_lock:
-                global_state["last_watt"] = max(0.0, watt)
-                global_state["last_amp"] = max(0.0, amp)
-                global_state["last_volt"] = volt if volt > 50 else 230.0
-                global_state["last_fetch_time"] = now
-                global_state["history_w"].append(watt)
-            return global_state["last_watt"], global_state["last_amp"], global_state["last_volt"]
-    except Exception:
-        pass
+            elif res.get("error") == "TOO_MANY_REQUESTS":
+                # Bei Rate Limit: Werte behalten und extra Pause
+                time.sleep(1.5)
 
-    with state_lock:
-        return global_state["last_watt"], global_state["last_amp"], global_state["last_volt"]
+        except Exception as e:
+            time.sleep(1.0)
 
-# --- SERVER-HINTERGRUND-THREAD (TRACKING & AI ENGINE) ---
-# Immun gegen Handy-Standby / Verbindungsabbruch
+threading.Thread(target=shelly_cloud_poller_loop, daemon=True).start()
+
+# --- THREAD 2: AUTARKER ENERGIE- & AI-METERING ENGINE (STANDBY-IMMUN) ---
 def background_metering_loop():
     last_loop_time = time.time()
     while True:
         try:
             time.sleep(1.0)
             now = time.time()
-            dt = max(0.1, min(5.0, now - last_loop_time))
+            dt = max(0.1, min(3.0, now - last_loop_time))
             last_loop_time = now
-
-            watt, amp, volt = fetch_live_cloud_metrics()
 
             with state_lock:
                 active_uid = global_state["active_user_id"]
+                watt = global_state["last_watt"]
+                amp = global_state["last_amp"]
+
                 if not active_uid or active_uid not in user_sessions:
                     continue
 
@@ -275,14 +282,14 @@ def background_metering_loop():
                 if not u.get("active") or u.get("terminated") or u.get("paused"):
                     continue
 
-                # 1. Kontinuierliche Integration
+                # 1. Energie-Integration
                 wh_increment = (watt * dt) / 3600.0
                 u["accumulated_seconds"] += dt
                 u["total_wh"] += wh_increment
                 u["total_kwh"] = u["total_wh"] / 1000.0
                 u["total_cost"] = u["total_kwh"] * STROMPREIS_PER_KWH
 
-                # Aktuelles aktives Einzelgerät aktualisieren
+                # Aktuelles Einzelgerät aktualisieren
                 curr_idx = u.get("current_device_idx", 0)
                 if 0 <= curr_idx < len(u.get("devices", [])):
                     dev = u["devices"][curr_idx]
@@ -297,7 +304,6 @@ def background_metering_loop():
                     if prof["is_battery"]:
                         peak_w = max(dev["peak_w"], prof["typical_w"] * 0.7)
                         nom_wh = prof["nominal_wh"] or 20.0
-                        
                         energy_soc = (dev["wh"] / nom_wh) * 100.0
                         
                         if watt > peak_w * prof["cv_ratio"]:
@@ -335,10 +341,10 @@ def background_metering_loop():
                         dev["soc_pct"] = 100.0
                         dev["wh_to_100"] = 0.0
 
-                # 5. Erkennung: Gerät ausgesteckt / Null-Last
+                # 5. Erkennung: Gerät ausgesteckt
                 if watt < 0.3 and u.get("active") and not u.get("paused"):
                     global_state["consecutive_zero_w_count"] += 1
-                    if global_state["consecutive_zero_w_count"] >= 4 and u["accumulated_seconds"] > 10:
+                    if global_state["consecutive_zero_w_count"] >= 6 and u["accumulated_seconds"] > 15:
                         u["unplug_dialog_active"] = True
                         u["active"] = False
                         u["paused"] = True
@@ -348,9 +354,8 @@ def background_metering_loop():
                     global_state["consecutive_zero_w_count"] = 0
 
         except Exception as e:
-            print(f"Hintergrund-Thread Fehler: {e}")
+            print(f"Metering Engine Fehler: {e}")
 
-# Hintergrund-Thread starten
 threading.Thread(target=background_metering_loop, daemon=True).start()
 
 # --- PDF-GENERATOR ---
@@ -1239,7 +1244,7 @@ MAIN_PAGE_HTML = """
             window.open('/download_invoice', '_blank');
         }
 
-        // TELEMETRIE-POLLING VOM SERVER
+        // TELEMETRIE-POLLING VOM SERVER (Greift ohne Verzögerung auf Server-Cache zu)
         async function fetchTelemetry() {
             if (isTerminated) return;
             try {
@@ -1301,10 +1306,14 @@ MAIN_PAGE_HTML = """
                 }
 
                 // Netz & Energie
-                document.getElementById('volt').innerText = data.voltage.toFixed(1);
-                document.getElementById('amp').innerText = data.current_ampere.toFixed(3);
-                document.getElementById('milliAmp').innerText = (data.current_ampere * 1000.0).toFixed(0);
-                document.getElementById('watt').innerText = data.watt.toFixed(3);
+                let currentW = data.watt || 0.0;
+                let currentA = data.current_ampere || 0.0;
+                let currentV = data.voltage || 230.0;
+
+                document.getElementById('volt').innerText = currentV.toFixed(1);
+                document.getElementById('amp').innerText = currentA.toFixed(3);
+                document.getElementById('milliAmp').innerText = (currentA * 1000.0).toFixed(0);
+                document.getElementById('watt').innerText = currentW.toFixed(3);
                 document.getElementById('wh').innerText = data.wh.toFixed(4);
                 document.getElementById('mwh').innerText = (data.wh * 1000.0).toFixed(1);
                 document.getElementById('cost').innerText = data.cost.toFixed(5);
@@ -1580,7 +1589,7 @@ def get_status():
 
     now = time.time()
     
-    # Präzise Zeitberechnung (kumulierte Sekunden + aktuelle Live-Spanne)
+    # Präzise Zeitberechnung
     live_elapsed = u.get("accumulated_seconds", 0.0)
     if u.get("active") and u.get("start_timestamp"):
         live_elapsed = u.get("accumulated_seconds", 0.0) + (now - u["start_timestamp"])
@@ -1689,7 +1698,6 @@ def set_device():
 
     curr_idx = u.get("current_device_idx", 0)
     if 0 <= curr_idx < len(u["devices"]) and u["devices"][curr_idx].get("duration_sec", 0) > 3:
-        # Vorheriges Gerät abschließen
         if u.get("active") and u["devices"][curr_idx].get("start_timestamp"):
             u["devices"][curr_idx]["duration_sec"] += (now - u["devices"][curr_idx]["start_timestamp"])
             u["devices"][curr_idx]["start_timestamp"] = None
