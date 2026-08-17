@@ -501,12 +501,13 @@ DeviceAI.load_learned()
 # =====================================================================
 def poll_shelly():
     now = time.time()
-    if now < shelly["poll_time"] + 2.2:
+    if now < shelly["poll_time"]:
         return
 
     if not poll_lock.acquire(blocking=False):
         return
 
+    next_poll = now + 2.8
     try:
         r = http_requests.post(
             f"{SHELLY_CLOUD_URL}/device/status",
@@ -535,14 +536,13 @@ def poll_shelly():
                 shelly["error"] = j.get("error", "isok=false")
         elif r.status_code == 429:
             shelly["error"] = "Rate Limit (429)"
-            shelly["poll_time"] = now + 4.0
-            return
+            next_poll = now + 5.0
         else:
             shelly["error"] = f"HTTP {r.status_code}"
     except Exception as e:
         shelly["error"] = str(e)[:80]
     finally:
-        shelly["poll_time"] = time.time()
+        shelly["poll_time"] = next_poll
         poll_lock.release()
 
 
