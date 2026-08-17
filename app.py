@@ -209,13 +209,13 @@ def async_cloud_control(turn_on=True):
             
     threading.Thread(target=_worker, daemon=True).start()
 
-# --- THREAD 1: ZENTRALER GETAKTETER SHELLY-POLLER ---
+# --- THREAD 1: ZENTRALER GETAKTETER SHELLY-POLLER (5.0s Intervall = 100% Rate-Limit konform) ---
 def shelly_cloud_poller_loop():
-    time.sleep(1.0)
+    time.sleep(2.0)
     while True:
         try:
             payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID}
-            res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=4.0).json()
+            res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=5.0).json()
             
             if res.get("isok"):
                 status = res.get("data", {}).get("device_status", {})
@@ -249,19 +249,19 @@ def shelly_cloud_poller_loop():
                     global_state["last_valid_fetch_time"] = time.time()
                     global_state["history_w"].append(watt)
 
-                time.sleep(3.5)
+                time.sleep(5.0)
 
             elif res.get("error") == "TOO_MANY_REQUESTS":
-                time.sleep(4.0)
+                time.sleep(6.0)
             else:
-                time.sleep(3.5)
+                time.sleep(5.0)
 
         except Exception:
-            time.sleep(3.0)
+            time.sleep(5.0)
 
 threading.Thread(target=shelly_cloud_poller_loop, daemon=True).start()
 
-# --- THREAD 2: AUTARKER ENERGIE- & AI-METERING ENGINE ---
+# --- THREAD 2: AUTARKER ENERGIE- & AI-METERING ENGINE (1s Intervall) ---
 def background_metering_loop():
     last_loop_time = time.time()
     while True:
@@ -345,7 +345,7 @@ def background_metering_loop():
                 # 5. Erkennung: Gerät ausgesteckt
                 if watt < 0.3 and u.get("active") and not u.get("paused"):
                     global_state["consecutive_zero_w_count"] += 1
-                    if global_state["consecutive_zero_w_count"] >= 6 and u["accumulated_seconds"] > 15:
+                    if global_state["consecutive_zero_w_count"] >= 8 and u["accumulated_seconds"] > 20:
                         u["unplug_dialog_active"] = True
                         u["active"] = False
                         u["paused"] = True
@@ -382,7 +382,7 @@ def generate_pdf_invoice(report_data):
             <meta charset="utf-8">
             <style>
             @page {{ size: A4; margin: 18mm 15mm; background-color: #ffffff; }}
-            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color: #090d16; margin: 0; padding: 0; }}
+            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: #090d16; margin: 0; padding: 0; }}
             .header {{ display: flex; justify-content: space-between; border-bottom: 2px solid #2563eb; padding-bottom: 15px; margin-bottom: 20px; }}
             .brand {{ font-size: 20pt; font-weight: 800; color: #2563eb; letter-spacing: -0.5px; }}
             .meta {{ font-size: 9pt; color: #64748b; margin-top: 4px; }}
@@ -1937,28 +1937,6 @@ def admin_override():
                 user_sessions[global_state["active_user_id"]]["active"] = False
         return jsonify({"status": "ok", "message": "Notabschaltung ausgeführt (Relais AUS)"})
     return jsonify({"status": "error", "message": "Unbekannte Aktion"}), 400
-
-@app.route('/debug_shelly')
-def debug_shelly():
-    try:
-        payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID}
-        t0 = time.time()
-        res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=5.0).json()
-        dur = time.time() - t0
-        return jsonify({
-            "status_code": 200,
-            "duration": dur,
-            "isok": res.get("isok"),
-            "error": res.get("error"),
-            "data_keys": list(res.get("data", {}).keys()),
-            "switch0": res.get("data", {}).get("device_status", {}).get("switch:0"),
-            "global_watt": global_state.get("last_watt"),
-            "global_amp": global_state.get("last_amp"),
-            "global_volt": global_state.get("last_volt"),
-            "last_valid_fetch_time": global_state.get("last_valid_fetch_time")
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)})
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
