@@ -1,5 +1,5 @@
 from flask import Flask, render_template_string, jsonify, session, request, send_file, redirect, url_for
-import requests
+import requests as http_requests  # Umbenennung um Konflikte zu vermeiden
 import time
 import threading
 import uuid
@@ -8,7 +8,6 @@ import json
 import smtplib
 import io
 import logging
-from collections import deque
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
@@ -43,47 +42,55 @@ SMTP_USER = ""
 SMTP_PASSWORD = ""
 
 # =====================================================================
-# ARCHITEKTUR: EIN GLOBALER LADE-ZUSTAND
+# ARCHITEKTUR v4 - KEIN HINTERGRUND-THREAD FUER KERNFUNKTIONEN
 #
-# WARUM: Flask-Sessions (Cookie-basiert) funktionieren nicht zuverlaessig
-# mit fetch()-Aufrufen auf Render/Gunicorn. Jeder fetch kann eine neue
-# Session erzeugen -> total_seconds wird immer wieder auf 0 zurueckgesetzt.
+# PROBLEM: Gunicorn forkt Worker-Prozesse. Daemon-Threads, die beim
+# Modul-Import gestartet werden, sterben beim Fork. Das Flag bleibt
+# aber True -> Thread wird nie neu gestartet -> total_seconds bleibt 0.
 #
-# LOESUNG: Eine physische Station = ein globaler Lade-Zustand.
-# Kein Cookie noetig. Worker schreibt rein, /status liest raus.
-# Garantiert thread-sicher mit einem Lock.
+# LOESUNG: ALLE Kernfunktionen laufen direkt in den HTTP-Handlern:
+# 1. Timer: On-the-fly berechnet (time.time() - start_time)
+# 2. Shelly: Direkt in /status gepollt (mit 1.5s Cache)
+# 3. Wh: In /status akkumuliert (dt seit letztem Aufruf)
+# 4. KI: In /status berechnet (alle 5 Aufrufe)
+#
+# KEIN Hintergrund-Thread noetig. Funktioniert garantiert mit
+# Gunicorn, Render, Heroku, Docker, egal was.
 # =====================================================================
 
 lock = threading.Lock()
 
-# Shelly-Rohwerte (vom Worker geschrieben)
+# Shelly-Rohwerte (gecacht, max 1.5s alt)
 shelly = {
-    "watt": 0.0,
-    "amp": 0.0,
-    "volt": 230.0,
-    "ok": False,
-    "poll_time": 0.0
+    "watt": 0.0, "amp": 0.0, "volt": 230.0,
+    "ok": False, "poll_time": 0.0, "error": ""
 }
 
-# Lade-Zustand (der Worker akkumuliert hier, /status liest)
+# Globaler Lade-Zustand
 charge = {
     "active": False,
     "paused": False,
     "terminated": False,
     "relay_on": False,
-    "start_time": None,
-    "total_seconds": 0.0,
+    # Timer: On-the-fly berechnet aus diesen 2 Werten
+    "accumulated_seconds": 0.0,  # Gespeicherte Zeit aus frueheren Aktiv-Phasen
+    "last_start_time": None,     # Beginn der aktuellen Aktiv-Phase (oder None)
+    # Energie: Akkumuliert bei jedem /status-Aufruf
+    "last_wh_time": None,        # Letzter Zeitpunkt der Wh-Berechnung
     "total_wh": 0.0,
     "total_kwh": 0.0,
     "total_cost": 0.0,
-    "power_history": [],   # [(timestamp, watt), ...] fuer KI
+    # KI
+    "power_history": [],
     "ai_result": None,
-    "devices": [],          # Liste aller geladenen Geraete
+    "ai_tick": 0,
+    # Geraete
+    "devices": [],
     "current_device_idx": 0,
-    "last_report": None
+    "last_report": None,
 }
 
-# Historische Daten
+# Historie
 history_records = []
 history_stats = {"sessions": 0, "kwh": 0.0, "revenue": 0.0}
 HISTORY_FILE = "station_history.json"
@@ -96,84 +103,48 @@ class DeviceAI:
     @staticmethod
     def classify(power_history):
         if len(power_history) < 3:
-            return {"type": "unknown", "icon": "🔌", "name": "Erkennung laeuft...",
+            return {"type": "unknown", "icon": "\U0001f50c", "name": "Erkennung...",
                     "confidence": 0, "stage": "Daten werden gesammelt...", "soc_pct": 0,
                     "is_battery": None, "peak_w": 0, "avg_w": 0, "trend_ratio": 1.0, "cv": 0}
-
         watts = [w for _, w in power_history if w > 0.05]
         if not watts:
-            return {"type": "unknown", "icon": "🔌", "name": "Kein Verbrauch",
-                    "confidence": 0, "stage": "Warte auf Stromfluss...", "soc_pct": 0,
+            return {"type": "unknown", "icon": "\U0001f50c", "name": "Kein Verbrauch",
+                    "confidence": 0, "stage": "Warte auf Strom...", "soc_pct": 0,
                     "is_battery": None, "peak_w": 0, "avg_w": 0, "trend_ratio": 1.0, "cv": 0}
-
-        current_w = watts[-1]
-        peak_w = max(watts)
-        avg_w = sum(watts) / len(watts)
-        n = len(watts)
-
-        # Trend & Varianz
+        cw, pw, aw, n = watts[-1], max(watts), sum(watts)/len(watts), len(watts)
         if n >= 5:
-            first_half = sum(watts[:n//2]) / max(1, n//2)
-            second_half = sum(watts[n//2:]) / max(1, n - n//2)
-            trend_ratio = second_half / first_half if first_half > 0 else 1.0
-            variance = sum((w - avg_w)**2 for w in watts) / n
-            cv = (variance**0.5) / avg_w if avg_w > 0 else 0
+            fh = sum(watts[:n//2]) / max(1, n//2)
+            sh = sum(watts[n//2:]) / max(1, n - n//2)
+            tr = sh / fh if fh > 0 else 1.0
+            var = sum((w - aw)**2 for w in watts) / n
+            cv = (var**0.5) / aw if aw > 0 else 0
         else:
-            trend_ratio = 1.0
-            cv = 0.0
-
-        is_battery = None
-        confidence = 0
-
-        # Stabile Leistung = Dauerbetrieb
-        if cv < 0.15 and trend_ratio > 0.90:
-            is_battery = False
-            confidence = min(95, 50 + n * 5)
-            if peak_w < 15:
-                t, icon, name = "lamp", "💡", "Lampe / LED"
-            elif peak_w < 60:
-                t, icon, name = "tv", "📺", "TV / Monitor"
-            elif peak_w < 250:
-                t, icon, name = "appliance_s", "☕", "Kleines Geraet"
-            else:
-                t, icon, name = "appliance", "🍳", "Grossgeraet"
-        # Sinkende Leistung = Akku
-        elif trend_ratio < 0.88 or (peak_w < 120 and current_w < peak_w * 0.75 and n > 8):
-            is_battery = True
-            confidence = min(92, 40 + n * 6)
-            if peak_w < 25:
-                t, icon, name = "phone", "📱", "Smartphone / Tablet"
-            elif peak_w < 100:
-                t, icon, name = "laptop", "💻", "Laptop"
-            elif peak_w < 300:
-                t, icon, name = "ebike", "🚲", "E-Bike Akku"
-            else:
-                t, icon, name = "ebike_fast", "⚡", "E-Bike Schnelllader"
+            tr, cv = 1.0, 0.0
+        ib, conf = None, 0
+        if cv < 0.15 and tr > 0.90:
+            ib, conf = False, min(95, 50 + n * 5)
+            if pw < 15: t, ic, nm = "lamp", "\U0001f4a1", "Lampe / LED"
+            elif pw < 60: t, ic, nm = "tv", "\U0001f4fa", "TV / Monitor"
+            elif pw < 250: t, ic, nm = "appliance_s", "\u2615", "Kleines Geraet"
+            else: t, ic, nm = "appliance", "\U0001f373", "Grossgeraet"
+        elif tr < 0.88 or (pw < 120 and cw < pw * 0.75 and n > 8):
+            ib, conf = True, min(92, 40 + n * 6)
+            if pw < 25: t, ic, nm = "phone", "\U0001f4f1", "Smartphone / Tablet"
+            elif pw < 100: t, ic, nm = "laptop", "\U0001f4bb", "Laptop"
+            elif pw < 300: t, ic, nm = "ebike", "\U0001f6b2", "E-Bike Akku"
+            else: t, ic, nm = "ebike_fast", "\u26a1", "E-Bike Schnelllader"
         else:
-            is_battery = None
-            confidence = 25
-            t, icon, name = "unknown", "🔌", "Analyse laeuft..."
-
-        soc_pct = 0
-        stage = "Dauerbetrieb"
-        if is_battery and n >= 2:
-            if current_w >= peak_w * 0.85:
-                stage = "Schnellladung (CC)"
-                soc_pct = min(75, max(5, int((1 - trend_ratio) * 200)))
-            elif current_w >= peak_w * 0.35:
-                stage = "Saettigung (CV)"
-                soc_pct = min(95, max(75, 75 + int((1 - (current_w / peak_w)) * 60)))
-            else:
-                stage = "Erhaltungsladung (Voll)"
-                soc_pct = 98
-        elif is_battery is False:
-            stage = "Dauerbetrieb aktiv"
-            soc_pct = 100
-
-        return {"type": t, "icon": icon, "name": name, "confidence": confidence,
-                "stage": stage, "soc_pct": soc_pct, "is_battery": is_battery,
-                "peak_w": round(peak_w, 2), "avg_w": round(avg_w, 3),
-                "current_w": round(current_w, 3), "trend_ratio": round(trend_ratio, 3), "cv": round(cv, 3)}
+            ib, conf = None, 25
+            t, ic, nm = "unknown", "\U0001f50c", "Analyse..."
+        soc, stage = 0, "Dauerbetrieb"
+        if ib and n >= 2:
+            if cw >= pw * 0.85: stage, soc = "Schnellladung (CC)", min(75, max(5, int((1-tr)*200)))
+            elif cw >= pw * 0.35: stage, soc = "Saettigung (CV)", min(95, max(75, 75+int((1-(cw/pw))*60)))
+            else: stage, soc = "Erhaltungsladung", 98
+        elif ib is False: stage, soc = "Dauerbetrieb aktiv", 100
+        return {"type": t, "icon": ic, "name": nm, "confidence": conf, "stage": stage,
+                "soc_pct": soc, "is_battery": ib, "peak_w": round(pw,2), "avg_w": round(aw,3),
+                "current_w": round(cw,3), "trend_ratio": round(tr,3), "cv": round(cv,3)}
 
 
 # =====================================================================
@@ -188,109 +159,121 @@ def load_history():
                 history_records = data.get("records", [])
                 history_stats = data.get("stats", history_stats)
         except Exception as e:
-            logger.error(f"History-Laden: {e}")
+            logger.error(f"History: {e}")
 
 def save_history():
     try:
         with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump({"stats": history_stats, "records": history_records[-200:]}, f, indent=2, ensure_ascii=False)
+            json.dump({"stats": history_stats, "records": history_records[-200:]},
+                      f, indent=2, ensure_ascii=False)
     except Exception as e:
-        logger.error(f"History-Speichern: {e}")
+        logger.error(f"Save: {e}")
 
 load_history()
 
 
 # =====================================================================
-# RELAIS-STEUERUNG
+# SHELLY CLOUD - POLL & RELAIS
 # =====================================================================
+def poll_shelly():
+    """Pollt Shelly Cloud API. Ergebnis wird in shelly-Dict gecacht.
+    Aufgerufen aus /status (jede Sekunde vom Browser).
+    Cache: Kein neuer Poll wenn letzter < 1.5s her ist."""
+    now = time.time()
+    if now - shelly["poll_time"] < 1.5:
+        return  # Cache noch frisch
+
+    try:
+        r = http_requests.post(
+            f"{SHELLY_CLOUD_URL}/device/status",
+            data={"auth_key": AUTH_KEY, "id": DEVICE_ID},
+            timeout=3.0
+        )
+        if r.status_code == 200:
+            j = r.json()
+            if j.get("isok"):
+                ds = j.get("data", {}).get("device_status", {})
+                if "switch:0" in ds:
+                    sw = ds["switch:0"]
+                    shelly["watt"] = float(sw.get("apower", 0) or 0)
+                    shelly["amp"]  = float(sw.get("current", 0) or 0)
+                    shelly["volt"] = float(sw.get("voltage", 230) or 230)
+                    shelly["ok"] = True
+                    shelly["error"] = ""
+                elif "meters" in ds and ds["meters"]:
+                    m = ds["meters"][0]
+                    shelly["watt"] = float(m.get("power", 0) or 0)
+                    shelly["amp"]  = float(m.get("current", shelly["watt"]/230 if shelly["watt"] > 0 else 0))
+                    shelly["volt"] = float(m.get("voltage", 230) or 230)
+                    shelly["ok"] = True
+                    shelly["error"] = ""
+                else:
+                    shelly["error"] = f"Unbekannte Keys: {list(ds.keys())[:3]}"
+            else:
+                shelly["error"] = j.get("error", "isok=false")
+        else:
+            shelly["error"] = f"HTTP {r.status_code}"
+    except http_requests.exceptions.Timeout:
+        shelly["error"] = "Timeout"
+    except Exception as e:
+        shelly["error"] = str(e)[:80]
+
+    shelly["poll_time"] = now
+
+
 def relay_control(turn_on):
+    """Relais schalten (asynchron, blockiert nicht)."""
     def _do():
         s = "on" if turn_on else "off"
         try:
-            requests.post(f"{SHELLY_CLOUD_URL}/device/relay/control",
-                          data={"auth_key": AUTH_KEY, "id": DEVICE_ID, "turn": s, "channel": 0}, timeout=4)
-        except Exception as e:
-            logger.warning(f"Relay REST: {e}")
+            http_requests.post(f"{SHELLY_CLOUD_URL}/device/relay/control",
+                               data={"auth_key": AUTH_KEY, "id": DEVICE_ID, "turn": s, "channel": 0}, timeout=4)
+        except: pass
         try:
-            requests.post(f"{SHELLY_CLOUD_URL}/device/rpc",
-                          json={"auth_key": AUTH_KEY, "id": DEVICE_ID,
-                                "method": "Switch.Set", "params": {"id": 0, "on": turn_on}}, timeout=4)
-        except Exception as e:
-            logger.warning(f"Relay RPC: {e}")
-        with lock:
-            charge["relay_on"] = turn_on
+            http_requests.post(f"{SHELLY_CLOUD_URL}/device/rpc",
+                               json={"auth_key": AUTH_KEY, "id": DEVICE_ID,
+                                     "method": "Switch.Set", "params": {"id": 0, "on": turn_on}}, timeout=4)
+        except: pass
+        charge["relay_on"] = turn_on
         logger.info(f"Relay -> {'EIN' if turn_on else 'AUS'}")
     threading.Thread(target=_do, daemon=True).start()
 
 
 # =====================================================================
-# HINTERGRUND-WORKER
-#
-# Laeuft IMMER. Pollt Shelly. Akkumuliert Energie wenn charge["active"].
-# Komplett unabhaengig von HTTP-Sessions/Cookies.
+# KERNFUNKTIONEN (aufgerufen aus HTTP-Handlern, KEIN Thread)
 # =====================================================================
-def worker():
-    logger.info("=== WORKER GESTARTET ===")
-    last_t = time.time()
-    tick = 0
 
-    while True:
-        now = time.time()
-        dt = max(0.5, min(5.0, now - last_t))
-        last_t = now
+def get_elapsed():
+    """Berechnet verstrichene Sekunden on-the-fly. Immer exakt."""
+    if charge["active"] and charge["last_start_time"]:
+        return charge["accumulated_seconds"] + (time.time() - charge["last_start_time"])
+    return charge["accumulated_seconds"]
 
-        # ---- 1. SHELLY ABFRAGEN ----
-        w, a, v, ok = 0.0, 0.0, 230.0, False
-        try:
-            r = requests.post(f"{SHELLY_CLOUD_URL}/device/status",
-                              data={"auth_key": AUTH_KEY, "id": DEVICE_ID}, timeout=4)
-            if r.status_code == 200:
-                j = r.json()
-                if j.get("isok"):
-                    ds = j.get("data", {}).get("device_status", {})
-                    if "switch:0" in ds:
-                        sw = ds["switch:0"]
-                        w = float(sw.get("apower", 0) or 0)
-                        a = float(sw.get("current", 0) or 0)
-                        v = float(sw.get("voltage", 230) or 230)
-                        ok = True
-                    elif "meters" in ds and ds["meters"]:
-                        m = ds["meters"][0]
-                        w = float(m.get("power", 0) or 0)
-                        a = float(m.get("current", w/230 if w > 0 else 0))
-                        v = float(m.get("voltage", 230) or 230)
-                        ok = True
-        except Exception as e:
-            logger.warning(f"Shelly: {e}")
 
-        # ---- 2. GLOBALEN STATE AKTUALISIEREN ----
-        with lock:
-            if ok:
-                shelly["watt"] = w
-                shelly["amp"] = a
-                shelly["volt"] = v
-                shelly["ok"] = True
-                shelly["poll_time"] = now
-            else:
-                w = shelly["watt"]
-                a = shelly["amp"]
-                v = shelly["volt"]
-                shelly["ok"] = False
+def accumulate_energy():
+    """Akkumuliert Wh basierend auf aktuellem Watt und dt seit letztem Aufruf.
+    Wird bei jedem /status Aufruf aufgerufen (ca. 1x pro Sekunde)."""
+    if not charge["active"]:
+        return
 
-            # ---- 3. WENN AKTIV: AKKUMULIEREN ----
-            if charge["active"]:
-                charge["total_seconds"] += dt
+    now = time.time()
+    last = charge.get("last_wh_time")
 
-                if w > 0.05:
-                    charge["total_wh"] += (w * dt) / 3600.0
+    if last and last > 0:
+        dt = now - last
+        # Nur realistische dt-Werte akzeptieren (0.3s - 10s)
+        if 0.3 < dt < 10.0:
+            w = shelly["watt"]
+            if w > 0.05:
+                delta_wh = (w * dt) / 3600.0
+                charge["total_wh"] += delta_wh
                 charge["total_kwh"] = charge["total_wh"] / 1000.0
                 charge["total_cost"] = charge["total_kwh"] * STROMPREIS_PER_KWH
 
-                # Power-History fuer KI (max 120 = 2 Min)
-                ph = charge["power_history"]
-                ph.append((now, w))
-                if len(ph) > 120:
-                    charge["power_history"] = ph[-120:]
+                # Power-History fuer KI (max 120 Punkte)
+                charge["power_history"].append((now, w))
+                if len(charge["power_history"]) > 120:
+                    charge["power_history"] = charge["power_history"][-120:]
 
                 # Aktuelles Geraet aktualisieren
                 idx = charge["current_device_idx"]
@@ -298,48 +281,27 @@ def worker():
                 if 0 <= idx < len(devs):
                     d = devs[idx]
                     d["duration_sec"] = d.get("duration_sec", 0) + dt
-                    if w > 0.05:
-                        d["wh"] = d.get("wh", 0) + (w * dt) / 3600.0
-                    d["cost"] = (d.get("wh", 0) / 1000.0) * STROMPREIS_PER_KWH
+                    d["wh"] = d.get("wh", 0) + delta_wh
+                    d["cost"] = (d["wh"] / 1000.0) * STROMPREIS_PER_KWH
                     d["peak_w"] = max(d.get("peak_w", 0), w)
 
-                # KI alle 5 Ticks
-                tick += 1
-                if tick % 5 == 0 or charge["ai_result"] is None:
-                    charge["ai_result"] = DeviceAI.classify(charge["power_history"])
-                    ai = charge["ai_result"]
-                    # AI-Info ins Geraet schreiben
-                    if 0 <= idx < len(devs):
-                        devs[idx]["ai_name"] = ai.get("name", "?")
-                        devs[idx]["ai_icon"] = ai.get("icon", "🔌")
-                        devs[idx]["ai_type"] = ai.get("type", "unknown")
-                        devs[idx]["ai_confidence"] = ai.get("confidence", 0)
-                        devs[idx]["is_battery"] = ai.get("is_battery")
-                        devs[idx]["stage"] = ai.get("stage", "?")
-                        devs[idx]["soc_pct"] = ai.get("soc_pct", 0)
+    charge["last_wh_time"] = now
 
-                if tick % 3 == 0:
-                    logger.info(f"CHARGE t={charge['total_seconds']:.0f}s W={w:.2f} Wh={charge['total_wh']:.4f} EUR={charge['total_cost']:.5f}")
-
-        elapsed = time.time() - now
-        time.sleep(max(0.1, 1.0 - elapsed))
-
-
-# Worker starten
-_wk = False
-_wl = threading.Lock()
-def ensure_worker():
-    global _wk
-    with _wl:
-        if not _wk:
-            _wk = True
-            threading.Thread(target=worker, daemon=True, name="Worker").start()
-
-ensure_worker()
-
-@app.before_request
-def _bfr():
-    ensure_worker()
+    # KI alle 5 Aufrufe
+    charge["ai_tick"] = charge.get("ai_tick", 0) + 1
+    if charge["ai_tick"] % 5 == 0 or charge["ai_result"] is None:
+        ai = DeviceAI.classify(charge["power_history"])
+        charge["ai_result"] = ai
+        idx = charge["current_device_idx"]
+        devs = charge["devices"]
+        if 0 <= idx < len(devs):
+            devs[idx]["ai_name"] = ai.get("name", "?")
+            devs[idx]["ai_icon"] = ai.get("icon", "\U0001f50c")
+            devs[idx]["ai_type"] = ai.get("type", "unknown")
+            devs[idx]["ai_confidence"] = ai.get("confidence", 0)
+            devs[idx]["is_battery"] = ai.get("is_battery")
+            devs[idx]["stage"] = ai.get("stage", "?")
+            devs[idx]["soc_pct"] = ai.get("soc_pct", 0)
 
 
 # =====================================================================
@@ -351,14 +313,10 @@ def fmt_time(s):
 
 def new_device_entry(idx):
     return {"id": idx, "key": "auto",
-            "ai_name": "Erkennung...", "ai_icon": "🔌",
+            "ai_name": "Erkennung...", "ai_icon": "\U0001f50c",
             "ai_type": "unknown", "ai_confidence": 0, "is_battery": None,
             "duration_sec": 0, "wh": 0, "cost": 0, "peak_w": 0,
-            "stage": "Bereit", "soc_pct": 0, "start_time": None}
-
-def is_verified():
-    """Prueft ob der Besucher verifiziert ist (Cookie-basiert, nur fuer Zugang)."""
-    return session.get("station_verified", False)
+            "stage": "Bereit", "soc_pct": 0}
 
 
 # =====================================================================
@@ -370,17 +328,13 @@ def headers(r):
     r.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     return r
 
-
-# --- STARTSEITE ---
 @app.route('/')
 def index():
-    if not is_verified():
+    if not session.get("station_verified"):
         return render_template_string(LOCK_HTML,
             required_token=PHYSICAL_STATION_TOKEN, admin_token=ADMIN_SECRET_TOKEN)
     return render_template_string(MAIN_HTML, strompreis=f"{STROMPREIS_PER_KWH:.2f}")
 
-
-# --- QR-SCAN / VERIFIZIERUNG ---
 @app.route('/scan/<token>')
 def scan(token):
     if token == PHYSICAL_STATION_TOKEN:
@@ -391,10 +345,19 @@ def scan(token):
     return "Ungueltiger Token.", 403
 
 
-# --- STATUS (KEIN SESSION-LOOKUP - LIEST DIREKT AUS GLOBALEM STATE) ---
+# --- STATUS: HERZSTÜCK - berechnet alles on-the-fly ---
 @app.route('/status')
 def get_status():
+    # 1. Shelly pollen (gecacht, max alle 1.5s)
+    poll_shelly()
+
+    # 2. Energie akkumulieren (wenn aktiv)
     with lock:
+        accumulate_energy()
+
+        # 3. Timer on-the-fly berechnen
+        elapsed = get_elapsed()
+
         return jsonify({
             "active": charge["active"],
             "paused": charge["paused"],
@@ -404,13 +367,13 @@ def get_status():
             "current_ampere": round(shelly["amp"], 3),
             "voltage": round(shelly["volt"], 1),
             "shelly_ok": shelly["ok"],
-            "elapsed_seconds": round(charge["total_seconds"], 1),
+            "shelly_error": shelly["error"],
+            "elapsed_seconds": round(elapsed, 1),
             "wh": round(charge["total_wh"], 4),
             "kwh": round(charge["total_kwh"], 6),
             "cost": round(charge["total_cost"], 5),
             "ai_result": charge["ai_result"] or {},
             "devices": [dict(d) for d in charge["devices"]],
-            "current_device_idx": charge["current_device_idx"],
             "session_terminated": charge["terminated"],
             "report": charge["last_report"] if charge["terminated"] else None
         })
@@ -421,27 +384,33 @@ def get_status():
 def start_charge():
     with lock:
         if charge["terminated"]:
-            # Neue Sitzung nach Beendigung
+            # Neue Sitzung
             charge["terminated"] = False
             charge["last_report"] = None
-            charge["total_seconds"] = 0
-            charge["total_wh"] = 0
-            charge["total_kwh"] = 0
-            charge["total_cost"] = 0
+            charge["accumulated_seconds"] = 0.0
+            charge["last_start_time"] = None
+            charge["last_wh_time"] = None
+            charge["total_wh"] = 0.0
+            charge["total_kwh"] = 0.0
+            charge["total_cost"] = 0.0
             charge["power_history"] = []
             charge["ai_result"] = None
+            charge["ai_tick"] = 0
             charge["devices"] = [new_device_entry(1)]
             charge["current_device_idx"] = 0
 
         if not charge["active"]:
+            charge["active"] = True
+            charge["paused"] = False
+            charge["last_start_time"] = time.time()
+            charge["last_wh_time"] = time.time()
             if not charge["devices"]:
                 charge["devices"] = [new_device_entry(1)]
                 charge["current_device_idx"] = 0
-            charge["active"] = True
-            charge["paused"] = False
             charge["power_history"] = []
             charge["ai_result"] = None
-            logger.info(">>> START <<<")
+            charge["ai_tick"] = 0
+            logger.info(f">>> START (t_acc={charge['accumulated_seconds']:.1f}s) <<<")
 
     relay_control(True)
     return jsonify({"status": "ok"})
@@ -451,10 +420,16 @@ def start_charge():
 @app.route('/stop', methods=['POST', 'GET'])
 def stop_charge():
     with lock:
+        if charge["active"] and charge["last_start_time"]:
+            # Akkumulierte Zeit sichern
+            charge["accumulated_seconds"] += time.time() - charge["last_start_time"]
+            accumulate_energy()  # Letzte Wh berechnen
         charge["active"] = False
         charge["paused"] = True
+        charge["last_start_time"] = None
+        charge["last_wh_time"] = None
     relay_control(False)
-    logger.info(">>> PAUSE <<<")
+    logger.info(f">>> PAUSE (t_acc={charge['accumulated_seconds']:.1f}s) <<<")
     return jsonify({"status": "ok"})
 
 
@@ -467,6 +442,7 @@ def new_device():
         charge["current_device_idx"] = len(charge["devices"]) - 1
         charge["power_history"] = []
         charge["ai_result"] = None
+        charge["ai_tick"] = 0
     return jsonify({"status": "ok"})
 
 
@@ -474,20 +450,28 @@ def new_device():
 @app.route('/logout', methods=['POST', 'GET'])
 def logout():
     with lock:
+        if charge["active"] and charge["last_start_time"]:
+            charge["accumulated_seconds"] += time.time() - charge["last_start_time"]
+            accumulate_energy()
+
         charge["active"] = False
         charge["paused"] = False
         charge["terminated"] = True
+        charge["last_start_time"] = None
+        charge["last_wh_time"] = None
 
+        elapsed = charge["accumulated_seconds"]
         invoice_id = f"RE-{time.strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}"
+
         for d in charge["devices"]:
-            d.setdefault("ai_icon", "🔌")
+            d.setdefault("ai_icon", "\U0001f50c")
             d.setdefault("ai_name", d.get("name", "Geraet"))
 
         report = {
             "invoice_id": invoice_id,
             "date": time.strftime('%d.%m.%Y %H:%M'),
-            "total_seconds": charge["total_seconds"],
-            "time_formatted": fmt_time(charge["total_seconds"]),
+            "total_seconds": elapsed,
+            "time_formatted": fmt_time(elapsed),
             "total_wh": charge["total_wh"],
             "total_kwh": charge["total_kwh"],
             "total_cost": charge["total_cost"],
@@ -502,8 +486,28 @@ def logout():
 
     relay_control(False)
     save_history()
-    logger.info(f"LOGOUT {invoice_id} | {fmt_time(report['total_seconds'])} | {report['total_wh']:.3f}Wh | {report['total_cost']:.5f}EUR")
+    logger.info(f"LOGOUT {invoice_id} | {fmt_time(elapsed)} | {report['total_wh']:.3f}Wh | {report['total_cost']:.5f}EUR")
     return jsonify(report)
+
+
+# --- DEBUG ---
+@app.route('/debug')
+def debug():
+    elapsed = get_elapsed()
+    return jsonify({
+        "shelly": dict(shelly),
+        "charge_active": charge["active"],
+        "charge_paused": charge["paused"],
+        "accumulated_seconds": charge["accumulated_seconds"],
+        "last_start_time": charge["last_start_time"],
+        "elapsed_calculated": round(elapsed, 1),
+        "total_wh": charge["total_wh"],
+        "total_cost": charge["total_cost"],
+        "devices_count": len(charge["devices"]),
+        "power_history_len": len(charge["power_history"]),
+        "ai_result": charge["ai_result"],
+        "server_time": time.time()
+    })
 
 
 # --- PDF ---
@@ -515,7 +519,7 @@ def download_invoice():
         "total_wh": 0, "total_kwh": 0, "total_cost": 0, "devices": []}
     pdf = generate_pdf(report)
     return send_file(pdf, mimetype="application/pdf", as_attachment=True,
-                     download_name=f"{report.get('invoice_id', 'Quittung')}.pdf")
+                     download_name=f"{report.get('invoice_id', 'Q')}.pdf")
 
 def generate_pdf(report):
     buf = io.BytesIO()
@@ -554,7 +558,7 @@ def generate_pdf(report):
     return buf
 
 
-# --- E-MAIL ---
+# --- EMAIL ---
 @app.route('/send_email_invoice', methods=['POST'])
 def send_email():
     data = request.get_json() or {}
@@ -563,7 +567,7 @@ def send_email():
     if not email_to or "@" not in email_to:
         return jsonify({"status": "error", "message": "Ungueltige E-Mail"})
     if not SMTP_USER:
-        return jsonify({"status": "error", "message": "SMTP nicht konfiguriert. Bitte PDF laden."})
+        return jsonify({"status": "error", "message": "SMTP nicht konfiguriert."})
     try:
         pdf = generate_pdf(report)
         msg = MIMEMultipart()
@@ -580,36 +584,11 @@ def send_email():
         return jsonify({"status": "error", "message": str(e)})
 
 
-# --- DEBUG (Diagnose-Endpunkt) ---
-@app.route('/debug')
-def debug():
-    with lock:
-        return jsonify({
-            "shelly": dict(shelly),
-            "charge_active": charge["active"],
-            "charge_paused": charge["paused"],
-            "charge_terminated": charge["terminated"],
-            "total_seconds": charge["total_seconds"],
-            "total_wh": charge["total_wh"],
-            "total_cost": charge["total_cost"],
-            "devices_count": len(charge["devices"]),
-            "power_history_len": len(charge["power_history"]),
-            "ai_result": charge["ai_result"],
-            "worker_running": _wk,
-            "server_time": time.time()
-        })
-
-
 # --- ADMIN ---
 @app.route(f'/admin/{ADMIN_SECRET_TOKEN}')
 def admin():
     today = time.strftime('%d.%m.%Y')
     today_recs = [r for r in history_records if r.get("date", "").startswith(today)]
-    with lock:
-        lw, la, lv = shelly["watt"], shelly["amp"], shelly["volt"]
-        poll_ok = shelly["ok"]
-        is_active = charge["active"]
-        relay = charge["relay_on"]
     return render_template_string(ADMIN_HTML,
         physical_token=PHYSICAL_STATION_TOKEN, device_id=DEVICE_ID,
         today_revenue=sum(r.get("total_cost", 0) for r in today_recs),
@@ -618,8 +597,9 @@ def admin():
         total_kwh=history_stats["kwh"],
         today_sessions=len(today_recs),
         total_sessions=history_stats["sessions"],
-        live_active=is_active, relay_on=relay,
-        live_watt=lw, live_amp=la, live_volt=lv, last_poll_ok=poll_ok,
+        live_active=charge["active"], relay_on=charge["relay_on"],
+        live_watt=shelly["watt"], live_amp=shelly["amp"], live_volt=shelly["volt"],
+        last_poll_ok=shelly["ok"],
         history_records=history_records[-30:])
 
 @app.route('/admin_api/override', methods=['POST'])
@@ -632,7 +612,10 @@ def admin_override():
     elif action == "force_off":
         relay_control(False)
         with lock:
+            if charge["active"] and charge["last_start_time"]:
+                charge["accumulated_seconds"] += time.time() - charge["last_start_time"]
             charge["active"] = False
+            charge["last_start_time"] = None
         return jsonify({"status": "ok", "message": "Relais AUS"})
     return jsonify({"status": "error"}), 400
 
@@ -642,9 +625,7 @@ def admin_override():
 # =====================================================================
 
 LOCK_HTML = """<!DOCTYPE html>
-<html lang="de">
-<head>
-<meta charset="utf-8"><title>Smart Power Hub</title>
+<html lang="de"><head><meta charset="utf-8"><title>Smart Power Hub</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <style>
 *{box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:0;padding:0}
@@ -661,17 +642,15 @@ p{font-size:13.5px;color:#94a3b8;line-height:1.5;margin-bottom:20px}
 <div class="card">
 <div style="font-size:54px">🔒</div>
 <h1>Vor-Ort-Sicherheitspruefung</h1>
-<p>Scanne den QR-Code an der Ladestation, um sie freizuschalten.</p>
-<div class="tbox"><div class="tlbl">Erforderlicher Token:</div><div class="tcode">{{ required_token }}</div></div>
+<p>Scanne den QR-Code an der Ladestation.</p>
+<div class="tbox"><div class="tlbl">Token:</div><div class="tcode">{{ required_token }}</div></div>
 <a href="/scan/{{ required_token }}" class="btn">📲 Station freischalten</a>
-<a href="/admin/{{ admin_token }}" class="btn btn2" style="margin-top:12px;text-decoration:none">⚙️ Admin-Dashboard</a>
+<a href="/admin/{{ admin_token }}" class="btn btn2" style="margin-top:12px;text-decoration:none">⚙️ Admin</a>
 </div></body></html>"""
 
 
 MAIN_HTML = """<!DOCTYPE html>
-<html lang="de">
-<head>
-<meta charset="utf-8"><title>Smart Power Hub</title>
+<html lang="de"><head><meta charset="utf-8"><title>Smart Power Hub</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <style>
 :root{--bg:#f8fafc;--card:#fff;--text:#090d16;--muted:#64748b;--blue:#2563eb;--green:#059669;--red:#dc2626;--border:#e2e8f0}
@@ -732,37 +711,37 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 
 <div id="swapM" class="modal"><div class="mbox" style="border:2px solid var(--blue)">
 <div style="font-size:38px;margin-bottom:6px">🔄🔌</div>
-<h3>Pause / Geraet wechseln</h3><p>Wie moechtest du fortfahren?</p>
-<button class="btn bp" style="background:var(--green);margin-bottom:8px" onclick="devAct('continue')">▶️ Gleiches Geraet fortsetzen</button>
+<h3>Pause / Geraet wechseln</h3><p>Wie fortfahren?</p>
+<button class="btn bp" style="background:var(--green);margin-bottom:8px" onclick="devAct('continue')">▶️ Gleiches Geraet</button>
 <button class="btn bp" style="background:var(--blue);margin-bottom:8px" onclick="startNew()">➕ Neues Geraet</button>
-<button class="btn bd" onclick="devAct('finish')">🧾 Sitzung beenden</button>
+<button class="btn bd" onclick="devAct('finish')">🧾 Beenden</button>
 </div></div>
 
 <div class="wrap">
 <div class="card" id="mainC">
-<div class="hdr"><span class="brand">⚡ Smart Power Hub</span><span class="rate">{{ strompreis }} €/kWh</span></div>
+<div class="hdr"><span class="brand">⚡ Smart Power Hub</span><span class="rate">{{ strompreis }} EUR/kWh</span></div>
 <div class="badges">
 <span class="pill pill-g">🔒 Verifiziert</span>
 <span class="pill pill-off" id="sPill"><span class="dot"></span><span id="sTxt">Bereit</span></span>
 </div>
 
 <div class="ai-b">
-<div class="ai-h"><span class="ai-l">⚡ KI-Geraeteerkennung</span><span class="ai-c" id="aiC">Warte...</span></div>
-<div class="ai-row"><div class="ai-i" id="aiI">🔌</div><div><div class="ai-n" id="aiN">Automatische Erkennung</div><div class="ai-s" id="aiS">Geraet einstecken & Start</div><div class="ai-sub" id="aiSub">KI analysiert den Stromfluss</div></div></div>
+<div class="ai-h"><span class="ai-l">⚡ KI-Erkennung</span><span class="ai-c" id="aiC">Warte...</span></div>
+<div class="ai-row"><div class="ai-i" id="aiI">🔌</div><div><div class="ai-n" id="aiN">Automatische Erkennung</div><div class="ai-s" id="aiS">Start druecken</div><div class="ai-sub" id="aiSub">KI analysiert den Stromfluss</div></div></div>
 <div id="socSec" style="display:none"><div class="soc-w"><div class="soc-f" id="socF" style="width:5%"></div></div><div class="soc-r"><span>Ladestand: <b id="socP">5%</b></span><span id="socE"></span></div></div>
 </div>
 
 <div class="g2">
-<div class="st"><div class="st-l">Spannung (U)</div><div class="st-v"><span id="volt">230.0</span> V</div><div class="st-s">Wechselspannung</div></div>
+<div class="st"><div class="st-l">Spannung (U)</div><div class="st-v"><span id="volt">230.0</span> V</div></div>
 <div class="st"><div class="st-l">Strom (I)</div><div class="st-v"><span id="amp">0.000</span> A</div><div class="st-s"><span id="ma">0</span> mA</div></div>
 </div>
 <div class="g2">
 <div class="st bl"><div class="st-l">Leistung (P)</div><div class="st-v"><span id="watt">0.000</span> W</div><div class="st-s" id="wSub">Kein Strom</div></div>
-<div class="st"><div class="st-l">Laufzeit</div><div class="st-v" id="timer">00:00:00</div><div class="st-s">Sekundengenau</div></div>
+<div class="st"><div class="st-l">Laufzeit</div><div class="st-v" id="timer">00:00:00</div></div>
 </div>
 <div class="g2">
 <div class="st bl"><div class="st-l">Verbrauch</div><div class="st-v"><span id="wh">0.0000</span> Wh</div><div class="st-s"><span id="mwh">0.0</span> mWh</div></div>
-<div class="st gr"><div class="st-l">Kosten</div><div class="st-v"><span id="cost">0.00000</span> €</div><div class="st-s"><span id="cent">0.000</span> Cent</div></div>
+<div class="st gr"><div class="st-l">Kosten</div><div class="st-v"><span id="cost">0.00000</span> EUR</div><div class="st-s"><span id="cent">0.000</span> Cent</div></div>
 </div>
 
 <div class="btns">
@@ -777,13 +756,12 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 <div style="text-align:center;margin-bottom:18px">
 <div style="font-size:44px;margin-bottom:6px">🧾</div>
 <div style="font-size:20px;font-weight:800">Stromquittung</div>
-<div style="font-size:12px;color:var(--muted);margin-top:3px">Sitzung beendet</div>
 </div>
-<table class="rtbl"><thead><tr><th>Geraet (KI)</th><th style="text-align:center">Dauer</th><th style="text-align:right">Wh</th><th style="text-align:right">€</th></tr></thead><tbody id="recB"></tbody></table>
+<table class="rtbl"><thead><tr><th>Geraet</th><th style="text-align:center">Dauer</th><th style="text-align:right">Wh</th><th style="text-align:right">EUR</th></tr></thead><tbody id="recB"></tbody></table>
 <div class="tbox">
-<div style="font-size:11px;color:#166534;font-weight:700;text-transform:uppercase">Gesamtbetrag</div>
-<div style="font-size:24px;font-weight:800;color:#15803d" id="rCost">0 €</div>
-<div style="font-size:11px;color:#166534;margin-top:2px">Gesamt: <span id="rWh">0</span> Wh (<span id="rKwh">0</span> kWh)</div>
+<div style="font-size:11px;color:#166534;font-weight:700">GESAMTBETRAG</div>
+<div style="font-size:24px;font-weight:800;color:#15803d" id="rCost">0 EUR</div>
+<div style="font-size:11px;color:#166534;margin-top:2px"><span id="rWh">0</span> Wh (<span id="rKwh">0</span> kWh)</div>
 </div>
 <div style="margin-top:18px;background:#f8fafc;border:1px solid var(--border);border-radius:14px;padding:14px">
 <div style="font-size:12px;font-weight:700;margin-bottom:6px">📧 Quittung per E-Mail:</div>
@@ -792,77 +770,59 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 <button class="btn bs" style="font-size:13px;padding:9px;margin-top:6px" onclick="window.open('/download_invoice','_blank')">📥 PDF</button>
 <div id="emFb" style="display:none;font-size:12px;font-weight:600;margin-top:8px"></div>
 </div>
-<div style="margin-top:16px;font-size:11.5px;color:var(--muted);text-align:center">Erneut nutzen? QR-Code scannen.</div>
 </div>
 </div>
 
 <script>
-let done=false, lastR=null, localS=0, running=false, tI=null;
+var done=false, lastR=null;
 
 function fs(s){s=Math.floor(Math.max(0,s));return String(Math.floor(s/3600)).padStart(2,'0')+':'+String(Math.floor((s%3600)/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0')}
 function showM(id){document.getElementById(id).style.display='flex'}
 function hideM(id){document.getElementById(id).style.display='none'}
 
-function startTick(){if(tI)clearInterval(tI);tI=setInterval(()=>{if(running&&!done){localS++;document.getElementById('timer').innerText=fs(localS)}},1000)}
-function stopTick(){if(tI){clearInterval(tI);tI=null}}
+function post(u,d){return fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d||{})}).then(function(r){return r.json()}).catch(function(){return {}})}
 
-async function post(u,d){try{let r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d||{})});return await r.json()}catch(e){return{}}}
-
-async function doStart(){
+function doStart(){
   if(done)return;
-  await post('/start');
-  running=true;startTick();
-  document.getElementById('sPill').className='pill pill-on';
-  document.getElementById('sTxt').innerText='Aktiv';
+  post('/start').then(function(){poll()});
 }
-async function doStop(){
+function doStop(){
   if(done)return;
-  await post('/stop');
-  running=false;stopTick();
-  document.getElementById('sPill').className='pill pill-p';
-  document.getElementById('sTxt').innerText='Pausiert';
+  post('/stop').then(function(){poll()});
 }
-async function startNew(){hideM('swapM');await post('/new_device');await doStart()}
-async function devAct(a){
+function startNew(){hideM('swapM');post('/new_device').then(function(){doStart()})}
+function devAct(a){
   hideM('swapM');
-  if(a==='continue'){await doStart()}
-  else if(a==='finish'){stopTick();running=false;let r=await post('/logout');showReceipt(r)}
+  if(a==='continue'){doStart()}
+  else if(a==='finish'){post('/logout').then(function(r){showReceipt(r)})}
 }
 
 function showReceipt(rp){
-  done=true;running=false;stopTick();lastR=rp;
+  done=true;lastR=rp;
   document.getElementById('mainC').style.display='none';
   document.getElementById('recC').style.display='block';
-  let tb=document.getElementById('recB');tb.innerHTML='';
-  (rp.devices||[]).forEach(d=>{let tr=document.createElement('tr');tr.innerHTML=`<td><b>${d.ai_icon||'🔌'} ${d.ai_name||'Geraet'}</b></td><td style="text-align:center">${fs(d.duration_sec||0)}</td><td style="text-align:right">${(d.wh||0).toFixed(3)}</td><td style="text-align:right"><b>${(d.cost||0).toFixed(5)}</b></td>`;tb.appendChild(tr)});
-  document.getElementById('rCost').innerText=(rp.total_cost||0).toFixed(5)+' €';
+  var tb=document.getElementById('recB');tb.innerHTML='';
+  (rp.devices||[]).forEach(function(d){var tr=document.createElement('tr');tr.innerHTML='<td><b>'+(d.ai_icon||'🔌')+' '+(d.ai_name||'Geraet')+'</b></td><td style="text-align:center">'+fs(d.duration_sec||0)+'</td><td style="text-align:right">'+(d.wh||0).toFixed(3)+'</td><td style="text-align:right"><b>'+(d.cost||0).toFixed(5)+'</b></td>';tb.appendChild(tr)});
+  document.getElementById('rCost').innerText=(rp.total_cost||0).toFixed(5)+' EUR';
   document.getElementById('rWh').innerText=(rp.total_wh||0).toFixed(4);
   document.getElementById('rKwh').innerText=(rp.total_kwh||0).toFixed(6);
 }
 
-async function poll(){
+function poll(){
   if(done)return;
-  try{
-    let d=await(await fetch('/status',{cache:'no-store'})).json();
+  fetch('/status',{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){
     if(d.session_terminated&&d.report){showReceipt(d.report);return}
 
-    // Server-Zeit ist die Wahrheit
-    let srv=d.elapsed_seconds||0;
-    if(d.active){
-      if(!running){running=true;startTick()}
-      // Synchronisiere lokalen Timer mit Server (Server ist Wahrheit)
-      if(Math.abs(localS-srv)>2){localS=Math.floor(srv)}
-      document.getElementById('timer').innerText=fs(srv);
-      document.getElementById('sPill').className='pill pill-on';
-      document.getElementById('sTxt').innerText='Aktiv';
-    }else{
-      if(running){running=false;stopTick()}
-      localS=Math.floor(srv);
-      document.getElementById('timer').innerText=fs(srv);
-      if(d.paused){document.getElementById('sPill').className='pill pill-p';document.getElementById('sTxt').innerText='Pausiert'}
-      else{document.getElementById('sPill').className='pill pill-off';document.getElementById('sTxt').innerText='Bereit'}
-    }
+    // Timer: Server-Wert ist die EINZIGE Wahrheit (on-the-fly berechnet)
+    document.getElementById('timer').innerText=fs(d.elapsed_seconds||0);
 
+    // Status-Badge
+    var pill=document.getElementById('sPill'), txt=document.getElementById('sTxt');
+    if(d.active){pill.className='pill pill-on';txt.innerText='Aktiv'}
+    else if(d.paused){pill.className='pill pill-p';txt.innerText='Pause'}
+    else{pill.className='pill pill-off';txt.innerText='Bereit'}
+
+    // Messwerte direkt vom Server
     document.getElementById('volt').innerText=(d.voltage||230).toFixed(1);
     document.getElementById('amp').innerText=(d.current_ampere||0).toFixed(3);
     document.getElementById('ma').innerText=((d.current_ampere||0)*1000).toFixed(0);
@@ -873,35 +833,34 @@ async function poll(){
     document.getElementById('cent').innerText=((d.cost||0)*100).toFixed(3);
     document.getElementById('wSub').innerText=(d.watt>0.1)?'Strom fliesst':'Kein Strom';
 
-    let ai=d.ai_result||{};
+    // KI
+    var ai=d.ai_result||{};
     document.getElementById('aiI').innerText=ai.icon||'🔌';
     document.getElementById('aiN').innerText=ai.name||'Erkenne...';
     document.getElementById('aiS').innerText=ai.stage||'Analyse';
-    let c=ai.confidence||0;
-    document.getElementById('aiC').innerText=c>0?`Sicherheit: ${c}%`:'Warte...';
-    document.getElementById('aiSub').innerText=ai.is_battery===true?`Akku | Spitze: ${ai.peak_w||0}W`:ai.is_battery===false?`Dauerbetrieb | Ø ${ai.avg_w||0}W`:'KI sammelt Daten...';
+    var c=ai.confidence||0;
+    document.getElementById('aiC').innerText=c>0?'Sicherheit: '+c+'%':'Warte...';
+    document.getElementById('aiSub').innerText=ai.is_battery===true?'Akku | Spitze: '+(ai.peak_w||0)+'W':ai.is_battery===false?'Dauerbetrieb | Avg '+(ai.avg_w||0)+'W':'KI sammelt Daten...';
     if(ai.is_battery===true&&ai.soc_pct>0){document.getElementById('socSec').style.display='block';document.getElementById('socF').style.width=Math.min(100,ai.soc_pct)+'%';document.getElementById('socP').innerText=ai.soc_pct+'%';document.getElementById('socE').innerText=ai.stage||''}
     else{document.getElementById('socSec').style.display='none'}
-  }catch(e){}
+  }).catch(function(){});
 }
 
-async function sendEm(){
-  let em=document.getElementById('emIn').value.trim(),fb=document.getElementById('emFb');
-  if(!em.includes('@')){fb.style.display='block';fb.style.color='#dc2626';fb.innerText='Bitte gueltige E-Mail.';return}
+function sendEm(){
+  var em=document.getElementById('emIn').value.trim(),fb=document.getElementById('emFb');
+  if(em.indexOf('@')<0){fb.style.display='block';fb.style.color='#dc2626';fb.innerText='Gueltige E-Mail!';return}
   fb.style.display='block';fb.style.color='var(--blue)';fb.innerText='Sende...';
-  let r=await post('/send_email_invoice',{email:em,report:lastR});
-  fb.style.color=r.status==='ok'?'#059669':'#d97706';fb.innerText=r.status==='ok'?'Gesendet!':r.message||'Fehler.';
+  post('/send_email_invoice',{email:em,report:lastR}).then(function(r){fb.style.color=r.status==='ok'?'#059669':'#d97706';fb.innerText=r.status==='ok'?'Gesendet!':r.message||'Fehler.'});
 }
 
+// Polling: alle 1 Sekunde
 setInterval(poll,1000);
 poll();
 </script></body></html>"""
 
 
 ADMIN_HTML = """<!DOCTYPE html>
-<html lang="de">
-<head>
-<meta charset="utf-8"><title>Admin</title>
+<html lang="de"><head><meta charset="utf-8"><title>Admin</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <style>
 *{box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:0;padding:0}
@@ -928,27 +887,27 @@ td{padding:10px;border-bottom:1px solid #1e293b}
 .boff{background:#ef4444;color:#fff}
 </style></head><body>
 <div class="wrap">
-<div class="hdr"><div><div class="brand">⚡ Smart Power Hub · Admin</div><div style="font-size:12px;color:#94a3b8;margin-top:4px">Station: <code>{{ physical_token }}</code> · Device: <code>{{ device_id }}</code></div></div><span class="badge">Admin</span></div>
+<div class="hdr"><div><div class="brand">⚡ Admin Dashboard</div><div style="font-size:12px;color:#94a3b8;margin-top:4px">Station: <code>{{ physical_token }}</code></div></div><span class="badge">Admin</span></div>
 <div class="g4">
-<div class="kpi"><div class="kpi-l">Umsatz Heute</div><div class="kpi-v" style="color:#10b981">{{ "%.5f"|format(today_revenue) }} €</div><div class="kpi-s">Gesamt: {{ "%.5f"|format(total_revenue) }} €</div></div>
-<div class="kpi"><div class="kpi-l">Energie Heute</div><div class="kpi-v" style="color:#3b82f6">{{ "%.2f"|format(today_wh) }} Wh</div><div class="kpi-s">Gesamt: {{ "%.4f"|format(total_kwh) }} kWh</div></div>
-<div class="kpi"><div class="kpi-l">Sitzungen Heute</div><div class="kpi-v">{{ today_sessions }}</div><div class="kpi-s">Gesamt: {{ total_sessions }}</div></div>
-<div class="kpi"><div class="kpi-l">Live Status</div><div class="kpi-v" style="color:{% if live_active %}#10b981{% else %}#94a3b8{% endif %}">{% if live_active %}AKTIV{% else %}BEREIT{% endif %}</div><div class="kpi-s">Relais: {% if relay_on %}EIN{% else %}AUS{% endif %} · {{ live_watt|round(2) }} W</div></div>
+<div class="kpi"><div class="kpi-l">Umsatz</div><div class="kpi-v" style="color:#10b981">{{ "%.5f"|format(today_revenue) }} EUR</div><div class="kpi-s">Gesamt: {{ "%.5f"|format(total_revenue) }} EUR</div></div>
+<div class="kpi"><div class="kpi-l">Energie</div><div class="kpi-v" style="color:#3b82f6">{{ "%.2f"|format(today_wh) }} Wh</div><div class="kpi-s">Gesamt: {{ "%.4f"|format(total_kwh) }} kWh</div></div>
+<div class="kpi"><div class="kpi-l">Sitzungen</div><div class="kpi-v">{{ today_sessions }}</div><div class="kpi-s">Gesamt: {{ total_sessions }}</div></div>
+<div class="kpi"><div class="kpi-l">Live</div><div class="kpi-v" style="color:{% if live_active %}#10b981{% else %}#94a3b8{% endif %}">{% if live_active %}AKTIV{% else %}BEREIT{% endif %}</div><div class="kpi-s">Relais: {% if relay_on %}EIN{% else %}AUS{% endif %}</div></div>
 </div>
 <div class="sec">
-<div class="sec-t"><span>Live Telemetrie</span><div style="display:flex;gap:8px"><button class="btn bon" onclick="ovr('force_on')">Relais EIN</button><button class="btn boff" onclick="ovr('force_off')">Relais AUS</button></div></div>
+<div class="sec-t"><span>Telemetrie</span><div style="display:flex;gap:8px"><button class="btn bon" onclick="ovr('force_on')">EIN</button><button class="btn boff" onclick="ovr('force_off')">AUS</button></div></div>
 <div class="lb">
 <div class="li"><div class="ll">Watt</div><div class="lv" style="color:#3b82f6">{{ "%.3f"|format(live_watt) }} W</div></div>
 <div class="li"><div class="ll">Ampere</div><div class="lv">{{ "%.3f"|format(live_amp) }} A</div></div>
 <div class="li"><div class="ll">Volt</div><div class="lv">{{ "%.1f"|format(live_volt) }} V</div></div>
-<div class="li"><div class="ll">Poll</div><div class="lv" style="color:{% if last_poll_ok %}#10b981{% else %}#ef4444{% endif %};font-size:13px">{% if last_poll_ok %}OK{% else %}Fehler{% endif %}</div></div>
+<div class="li"><div class="ll">API</div><div class="lv" style="color:{% if last_poll_ok %}#10b981{% else %}#ef4444{% endif %}">{% if last_poll_ok %}OK{% else %}?{% endif %}</div></div>
 </div></div>
 <div class="sec">
-<div class="sec-t">Letzte Sitzungen</div>
+<div class="sec-t">Sitzungen</div>
 <table><thead><tr><th>Beleg</th><th>Datum</th><th>Geraet</th><th>Dauer</th><th>Wh</th><th>EUR</th></tr></thead>
-<tbody>{% for r in history_records|reverse %}<tr><td><code>{{ r.invoice_id }}</code></td><td>{{ r.date }}</td><td>{% for d in r.devices %}{{ d.ai_icon|default('🔌') }} {{ d.ai_name|default('?') }}<br>{% endfor %}</td><td>{{ r.time_formatted }}</td><td>{{ "%.3f"|format(r.total_wh) }}</td><td><b style="color:#10b981">{{ "%.5f"|format(r.total_cost) }}</b></td></tr>{% else %}<tr><td colspan="6" style="text-align:center;color:#94a3b8;padding:18px">Noch keine Sitzungen.</td></tr>{% endfor %}</tbody></table>
+<tbody>{% for r in history_records|reverse %}<tr><td><code>{{ r.invoice_id }}</code></td><td>{{ r.date }}</td><td>{% for d in r.devices %}{{ d.ai_icon|default('🔌') }} {{ d.ai_name|default('?') }}<br>{% endfor %}</td><td>{{ r.time_formatted }}</td><td>{{ "%.3f"|format(r.total_wh) }}</td><td><b style="color:#10b981">{{ "%.5f"|format(r.total_cost) }}</b></td></tr>{% else %}<tr><td colspan="6" style="text-align:center;color:#94a3b8">Keine.</td></tr>{% endfor %}</tbody></table>
 </div></div>
-<script>async function ovr(a){let r=await fetch('/admin_api/override',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:a})});let d=await r.json();alert(d.message||'OK');location.reload()}</script>
+<script>function ovr(a){fetch('/admin_api/override',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:a})}).then(function(r){return r.json()}).then(function(d){alert(d.message||'OK');location.reload()})}</script>
 </body></html>"""
 
 
