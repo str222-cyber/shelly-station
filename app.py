@@ -887,8 +887,9 @@ def scan(token):
         with lock:
             charge["terminated"] = False
             charge["last_report"] = None
-            charge["active"] = False
+            charge["active"] = True
             charge["paused"] = False
+            charge["relay_on"] = True
             charge["unplug_modal"] = None
             charge["battery_modal"] = None
             charge["power_shift_modal"] = None
@@ -915,7 +916,8 @@ def scan(token):
             charge["ai_tick"] = 0
             charge["devices"] = [new_device_entry(1, "lamp")]
             charge["current_device_idx"] = 0
-        relay_control(False)
+        relay_control(True)
+        logger.info(">>> QR-CODE GESCANNT -> RELAIS SOFORT EIN & BEREIT FÜR STROMFLUSS <<<")
         return redirect(url_for('index'))
     return "Ungültiger Token.", 403
 
@@ -924,8 +926,9 @@ def reset_session():
     with lock:
         charge["terminated"] = False
         charge["last_report"] = None
-        charge["active"] = False
+        charge["active"] = True
         charge["paused"] = False
+        charge["relay_on"] = True
         charge["unplug_modal"] = None
         charge["battery_modal"] = None
         charge["power_shift_modal"] = None
@@ -952,8 +955,8 @@ def reset_session():
         charge["ai_tick"] = 0
         charge["devices"] = [new_device_entry(1, "lamp")]
         charge["current_device_idx"] = 0
-    relay_control(False)
-    logger.info(">>> SITZUNG ZURÜCKGESETZT / BEREIT FÜR NEUEN LADEVORGANG <<<")
+    relay_control(True)
+    logger.info(">>> SITZUNG ZURÜCKGESETZT -> RELAIS SOFORT EIN & BEREIT FÜR STROMFLUSS <<<")
     return jsonify({"status": "ok"})
 
 @app.route('/status')
