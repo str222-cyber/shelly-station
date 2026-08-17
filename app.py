@@ -41,6 +41,9 @@ SMTP_PORT = 587
 SMTP_USER = ""
 SMTP_PASSWORD = ""
 
+# Farben für Visualisierungsbalken
+DEVICE_COLORS = ["#2563eb", "#059669", "#7c3aed", "#d97706", "#db2777", "#0891b2", "#ea580c"]
+
 # =====================================================================
 # LAENDER- & MEHRWERTSTEUER-TABELLE (VAT / MwSt. fuer Strom)
 # =====================================================================
@@ -179,18 +182,18 @@ charge = {
     "selected_country": "DE",
     
     # --- PRÄZISER ABSTECK- & WECHSEL-WORKFLOW ---
-    # unplug_modal: None | "ASK_UNPLUG" | "ASK_NEXT_DEVICE"
-    "unplug_modal": None,
-    "waiting_for_new_plug": False,   # True, wenn Relais wieder EIN ist und auf Ampere-Anstieg gewartet wird
+    "unplug_modal": None,            # None | "ASK_UNPLUG" | "ASK_NEXT_DEVICE"
+    "waiting_for_new_plug": False,   # True, wenn Relais wieder EIN ist und auf Strom gewartet wird
+    "target_is_new": True,           # True -> erstellt neues Gerät; False -> verwendet selected_device_idx
     "had_flowing": False,            # True, sobald nach Start mindestens 1x Strom floss
     "is_flowing": False,
     
-    # --- ZEIT-METRIKEN (Stromfluss vs. Pausen/Leerlauf) ---
-    "accumulated_seconds": 0.0,
-    "total_flow_seconds": 0.0,       # Zeit mit echtem Stromfluss (>0.3 W)
-    "total_idle_seconds": 0.0,       # Pausen / Zeiten ohne Stromfluss
+    # --- DURCHGEHENDER SITZUNGS-TIMER (STOPPT NIE) ---
+    "session_start_time": None,      # Timestamp des ersten Starts in dieser Sitzung
+    "total_session_seconds": 0.0,
+    "total_flow_seconds": 0.0,       # Reine Stromflusszeit
+    "total_idle_seconds": 0.0,       # Reine Pausenzeit
     
-    "last_start_time": None,
     "last_wh_time": None,
     "total_wh": 0.0,
     "total_kwh": 0.0,
@@ -409,20 +412,25 @@ def relay_control(turn_on):
 # =====================================================================
 # KERNFUNKTIONEN
 # =====================================================================
-def get_elapsed():
-    if charge["active"] and charge["last_start_time"]:
-        return charge["accumulated_seconds"] + (time.time() - charge["last_start_time"])
-    return charge["accumulated_seconds"]
+def get_session_elapsed():
+    """Kontinuierliche Gesamtlaufzeit, die seit dem ersten Start durchgehend zählt"""
+    if charge["terminated"]:
+        return charge["total_session_seconds"]
+    if charge["session_start_time"]:
+        return time.time() - charge["session_start_time"]
+    return 0.0
 
 
 def new_device_entry(num, key="lamp"):
     prof = DEVICE_PROFILES.get(key, DEVICE_PROFILES["lamp"])
+    color_idx = (num - 1) % len(DEVICE_COLORS)
     return {
         "num": num,
         "key": prof["key"],
         "name": f"Gerät {num}: {prof['name']}",
         "raw_name": prof["name"],
         "icon": prof["icon"],
+        "color": DEVICE_COLORS[color_idx],
         "mode": prof["mode"],
         "is_battery": prof["is_battery"],
         "nominal_wh": prof["nominal_wh"],
@@ -458,84 +466,85 @@ def accumulate_energy():
         charge["had_flowing"] = True
 
     # =====================================================================
-    # 1. PRÄZISE ERKENNUNG: ABSTECKEN EINES KABELS (AMPERE -> 0.000 A)
+    # 1. ERKENNUNG: ABSTECKEN DES KABELS (AMPERE -> 0.000 A)
     # =====================================================================
     if charge["active"] and not charge["paused"] and charge["had_flowing"]:
         if not is_flowing and (a < 0.015 and w < 0.25):
-            # Stromfluss schlagartig weg -> Sofort Zählen stoppen, Relais AUS, Frage poppt auf!
-            if charge["last_start_time"]:
-                charge["accumulated_seconds"] += time.time() - charge["last_start_time"]
-            
             charge["active"] = False
             charge["paused"] = True
-            charge["last_start_time"] = None
             charge["unplug_modal"] = "ASK_UNPLUG"
             relay_control(False)
             logger.info("🔌 Ampere auf 0.0 A abgefallen -> Ladevorgang pausiert, Relais AUS, Modal ASK_UNPLUG geöffnet!")
 
     # =====================================================================
-    # 2. PRÄZISE ERKENNUNG: NEUES GERÄT EINGESTECKT (AMPERE-ANSTIEG)
+    # 2. ERKENNUNG: GERAET EINGESTECKT (AMPERE-ANSTIEG)
     # =====================================================================
     if charge["waiting_for_new_plug"] and is_flowing:
-        # Benutzer hat bestätigt "Neues Gerät einstecken", Relais war EIN, jetzt fließt neuer Strom!
         charge["waiting_for_new_plug"] = False
         charge["active"] = True
         charge["paused"] = False
-        charge["last_start_time"] = now
         charge["last_wh_time"] = now
         charge["had_flowing"] = True
         
-        next_num = len(charge["devices"]) + 1
-        new_dev = new_device_entry(next_num, "lamp")
-        charge["devices"].append(new_dev)
-        charge["current_device_idx"] = len(charge["devices"]) - 1
+        if charge.get("target_is_new", True):
+            next_num = len(charge["devices"]) + 1
+            new_dev = new_device_entry(next_num, "lamp")
+            charge["devices"].append(new_dev)
+            charge["current_device_idx"] = len(charge["devices"]) - 1
+            logger.info(f"⚡ Neues Gerät #{next_num} erkannt & gestartet ({w:.1f} W).")
+        else:
+            reused_idx = charge.get("current_device_idx", 0)
+            cur_d = charge["devices"][reused_idx]
+            logger.info(f"⚡ Bisheriges Gerät ({cur_d['name']}) fortgesetzt ({w:.1f} W).")
+
         charge["power_history"] = []
         charge["ai_result"] = None
         charge["ai_tick"] = 0
-        logger.info(f"⚡ Neues Gerät erkannt & eingesteckt ({w:.1f} W)! Gerät #{next_num} automatisch gestartet.")
 
     # =====================================================================
-    # 3. ENERGIE- & ZEIT-AKKUMULATION (nur bei aktivem Ladevorgang)
+    # 3. ENERGIE- & ZEIT-AKKUMULATION
     # =====================================================================
-    if charge["active"] and last and last > 0:
+    if last and last > 0 and charge["session_start_time"] is not None:
         dt = now - last
         if 0.2 < dt < 15.0:
-            delta_wh = (w * dt) / 3600.0 if is_flowing else 0.0
-
-            charge["total_wh"] += delta_wh
-            charge["total_kwh"] = charge["total_wh"] / 1000.0
-            
-            charge["total_cost_netto"] = charge["total_kwh"] * STROMPREIS_PER_KWH
-            charge["total_vat_amount"] = charge["total_cost_netto"] * (vat_rate / 100.0)
-            charge["total_cost_brutto"] = charge["total_cost_netto"] + charge["total_vat_amount"]
-
-            if is_flowing:
+            if is_flowing and charge["active"]:
+                delta_wh = (w * dt) / 3600.0
                 charge["total_flow_seconds"] += dt
-            else:
-                charge["total_idle_seconds"] += dt
+                charge["total_wh"] += delta_wh
+                charge["total_kwh"] = charge["total_wh"] / 1000.0
+                
+                charge["total_cost_netto"] = charge["total_kwh"] * STROMPREIS_PER_KWH
+                charge["total_vat_amount"] = charge["total_cost_netto"] * (vat_rate / 100.0)
+                charge["total_cost_brutto"] = charge["total_cost_netto"] + charge["total_vat_amount"]
 
-            charge["power_history"].append((now, w))
-            if len(charge["power_history"]) > 120:
-                charge["power_history"] = charge["power_history"][-120:]
+                charge["power_history"].append((now, w))
+                if len(charge["power_history"]) > 120:
+                    charge["power_history"] = charge["power_history"][-120:]
 
-            idx = charge["current_device_idx"]
-            devs = charge["devices"]
-            if 0 <= idx < len(devs):
-                d = devs[idx]
-                d["duration_sec"] = d.get("duration_sec", 0) + dt
-                if is_flowing:
+                # Auf aktives Gerät buchen
+                idx = charge["current_device_idx"]
+                devs = charge["devices"]
+                if 0 <= idx < len(devs):
+                    d = devs[idx]
+                    d["duration_sec"] = d.get("duration_sec", 0) + dt
                     d["flow_duration_sec"] = d.get("flow_duration_sec", 0.0) + dt
                     d["wh"] = d.get("wh", 0) + delta_wh
                     if d["flow_duration_sec"] > 0:
                         d["avg_flow_w"] = (d["wh"] * 3600.0) / d["flow_duration_sec"]
-                else:
+                    
+                    d["cost_netto"] = (d["wh"] / 1000.0) * STROMPREIS_PER_KWH
+                    d["vat_amount"] = d["cost_netto"] * (vat_rate / 100.0)
+                    d["cost_brutto"] = d["cost_netto"] + d["vat_amount"]
+                    d["cost"] = d["cost_brutto"]
+                    d["peak_w"] = max(d.get("peak_w", 0), w)
+            else:
+                # Pausenzeit erfassen (wenn kein Strom fließt oder pausiert ist)
+                charge["total_idle_seconds"] += dt
+                idx = charge["current_device_idx"]
+                devs = charge["devices"]
+                if 0 <= idx < len(devs):
+                    d = devs[idx]
                     d["idle_duration_sec"] = d.get("idle_duration_sec", 0.0) + dt
-                
-                d["cost_netto"] = (d["wh"] / 1000.0) * STROMPREIS_PER_KWH
-                d["vat_amount"] = d["cost_netto"] * (vat_rate / 100.0)
-                d["cost_brutto"] = d["cost_netto"] + d["vat_amount"]
-                d["cost"] = d["cost_brutto"]
-                d["peak_w"] = max(d.get("peak_w", 0), w)
 
     charge["last_wh_time"] = now
 
@@ -594,11 +603,12 @@ def scan(token):
             charge["paused"] = False
             charge["unplug_modal"] = None
             charge["waiting_for_new_plug"] = False
+            charge["target_is_new"] = True
             charge["had_flowing"] = False
-            charge["accumulated_seconds"] = 0.0
+            charge["session_start_time"] = None
+            charge["total_session_seconds"] = 0.0
             charge["total_flow_seconds"] = 0.0
             charge["total_idle_seconds"] = 0.0
-            charge["last_start_time"] = None
             charge["last_wh_time"] = None
             charge["total_wh"] = 0.0
             charge["total_kwh"] = 0.0
@@ -623,11 +633,12 @@ def reset_session():
         charge["paused"] = False
         charge["unplug_modal"] = None
         charge["waiting_for_new_plug"] = False
+        charge["target_is_new"] = True
         charge["had_flowing"] = False
-        charge["accumulated_seconds"] = 0.0
+        charge["session_start_time"] = None
+        charge["total_session_seconds"] = 0.0
         charge["total_flow_seconds"] = 0.0
         charge["total_idle_seconds"] = 0.0
-        charge["last_start_time"] = None
         charge["last_wh_time"] = None
         charge["total_wh"] = 0.0
         charge["total_kwh"] = 0.0
@@ -649,7 +660,7 @@ def get_status():
 
     with lock:
         accumulate_energy()
-        elapsed = get_elapsed()
+        elapsed = get_session_elapsed()
         curr_idx = charge["current_device_idx"]
         devices = [dict(d) for d in charge["devices"]]
         active_dev = devices[curr_idx] if 0 <= curr_idx < len(devices) else new_device_entry(1)
@@ -671,9 +682,13 @@ def get_status():
             "voltage": round(shelly["volt"], 1),
             "shelly_ok": shelly["ok"],
             "shelly_error": shelly["error"],
+            
+            # Laufzeiten (kontinuierlich)
             "elapsed_seconds": round(elapsed, 1),
             "total_flow_seconds": round(charge["total_flow_seconds"], 1),
             "total_idle_seconds": round(charge["total_idle_seconds"], 1),
+            "session_started": charge["session_start_time"] is not None,
+            
             "wh": round(charge["total_wh"], 4),
             "kwh": round(charge["total_kwh"], 6),
             
@@ -706,10 +721,10 @@ def start_charge():
         if charge["terminated"]:
             charge["terminated"] = False
             charge["last_report"] = None
-            charge["accumulated_seconds"] = 0.0
+            charge["session_start_time"] = None
+            charge["total_session_seconds"] = 0.0
             charge["total_flow_seconds"] = 0.0
             charge["total_idle_seconds"] = 0.0
-            charge["last_start_time"] = None
             charge["last_wh_time"] = None
             charge["total_wh"] = 0.0
             charge["total_kwh"] = 0.0
@@ -722,16 +737,19 @@ def start_charge():
             charge["devices"] = [new_device_entry(1, "lamp")]
             charge["current_device_idx"] = 0
 
+        # Erster Start setzt die kontinuierliche Sitzungsuhr
+        if charge["session_start_time"] is None:
+            charge["session_start_time"] = time.time()
+
         charge["active"] = True
         charge["paused"] = False
         charge["unplug_modal"] = None
         charge["waiting_for_new_plug"] = False
-        charge["last_start_time"] = time.time()
         charge["last_wh_time"] = time.time()
         if not charge["devices"]:
             charge["devices"] = [new_device_entry(1, "lamp")]
             charge["current_device_idx"] = 0
-        logger.info(f">>> START (t_acc={charge['accumulated_seconds']:.1f}s) <<<")
+        logger.info(f">>> START (Gesamtlaufzeit läuft durchgehend) <<<")
 
     relay_control(True)
     return jsonify({"status": "ok"})
@@ -739,58 +757,70 @@ def start_charge():
 @app.route('/stop', methods=['POST', 'GET'])
 def stop_charge():
     with lock:
-        if charge["active"] and charge["last_start_time"]:
-            charge["accumulated_seconds"] += time.time() - charge["last_start_time"]
-            accumulate_energy()
+        accumulate_energy()
         charge["active"] = False
         charge["paused"] = True
-        charge["last_start_time"] = None
         charge["last_wh_time"] = None
     relay_control(False)
-    logger.info(f">>> PAUSE (t_acc={charge['accumulated_seconds']:.1f}s) <<<")
+    logger.info(">>> PAUSE (Gesamtlaufzeit läuft weiter) <<<")
     return jsonify({"status": "ok"})
 
 # =====================================================================
-# ABSTECK- & WECHSEL-WORKFLOW ENDPOINT
+# ABSTECK- & WIEDERVERWENDUNGS-WORKFLOW ENDPOINT
 # =====================================================================
 @app.route('/unplug_action', methods=['POST'])
 def unplug_action():
     data = request.get_json() or {}
     action = data.get("action")
-    # action: "no_resume" | "yes_unplugged" | "prep_new_device" | "finish"
+    # action: "no_resume" | "yes_unplugged" | "select_existing" | "prep_new_device" | "finish"
 
     with lock:
         if action == "no_resume":
-            # 1. Nutzer klickt: "Nein, war nur Standby/Pause -> Selbes Gerät fortsetzen"
+            # 1. Selbes aktuelles Gerät fortsetzen
             charge["unplug_modal"] = None
             charge["waiting_for_new_plug"] = False
             charge["active"] = True
             charge["paused"] = False
-            charge["last_start_time"] = time.time()
             charge["last_wh_time"] = time.time()
             relay_control(True)
-            logger.info("Unplug: Abstecken verneint -> Relais EIN, Ladevorgang auf selbem Gerät fortgesetzt.")
+            logger.info("Unplug: Selbes Gerät direkt fortgesetzt -> Relais EIN.")
             return jsonify({"status": "ok", "state": "resumed"})
 
         elif action == "yes_unplugged":
-            # 2. Nutzer klickt: "Ja, Gerät wurde ausgesteckt" -> Wechsle zu Frage: Neues Gerät oder Beenden?
+            # 2. Stecker abgezogen -> Zeige Auswahl: Früheres Gerät vs. Neues Gerät vs. Beenden
             charge["unplug_modal"] = "ASK_NEXT_DEVICE"
             charge["waiting_for_new_plug"] = False
-            logger.info("Unplug: Abstecken bestätigt -> Zeige Frage 'Neues Gerät einstecken?'")
-            return jsonify({"status": "ok", "state": "ask_next_device"})
+            logger.info("Unplug: Bestätigt -> Zeige Geräteauswahl (früheres Gerät oder neues Gerät).")
+            return jsonify({"status": "ok", "state": "ask_next_device", "devices": charge["devices"]})
+
+        elif action == "select_existing":
+            # 3. Ein FRÜHER GENUTZTES Gerät aus dieser Sitzung wiederverwenden!
+            dev_idx = int(data.get("device_idx", 0))
+            if 0 <= dev_idx < len(charge["devices"]):
+                charge["current_device_idx"] = dev_idx
+                charge["target_is_new"] = False
+                charge["unplug_modal"] = None
+                charge["waiting_for_new_plug"] = True
+                charge["active"] = False
+                charge["paused"] = True
+                relay_control(True)
+                cur_d = charge["devices"][dev_idx]
+                logger.info(f"Unplug: Früheres Gerät gewählt ({cur_d['name']}) -> Relais EIN, warte auf Stromfluss!")
+                return jsonify({"status": "ok", "state": "waiting_for_plug", "reused_device": cur_d})
 
         elif action == "prep_new_device":
-            # 3. Nutzer klickt: "Neues Gerät einstecken" -> Schalte Steckdose EIN, warte auf Ampere-Anstieg!
+            # 4. Komplett NEUES Gerät erfassen
+            charge["target_is_new"] = True
             charge["unplug_modal"] = None
             charge["waiting_for_new_plug"] = True
             charge["active"] = False
             charge["paused"] = True
             relay_control(True)
-            logger.info("Unplug: Warte auf Einstecken des neuen Geräts -> Relais EIN geschaltet!")
+            logger.info("Unplug: Neues Gerät vorbereitet -> Relais EIN geschaltet!")
             return jsonify({"status": "ok", "state": "waiting_for_plug"})
 
         elif action == "finish":
-            # 4. Nutzer klickt: "Beenden"
+            # 5. Sitzung beenden
             charge["unplug_modal"] = None
             charge["waiting_for_new_plug"] = False
             return logout()
@@ -843,19 +873,17 @@ def set_device():
 @app.route('/logout', methods=['POST', 'GET'])
 def logout():
     with lock:
-        if charge["active"] and charge["last_start_time"]:
-            charge["accumulated_seconds"] += time.time() - charge["last_start_time"]
-            accumulate_energy()
-
+        accumulate_energy()
         charge["active"] = False
         charge["paused"] = False
         charge["terminated"] = True
         charge["unplug_modal"] = None
         charge["waiting_for_new_plug"] = False
-        charge["last_start_time"] = None
+        
+        elapsed = get_session_elapsed()
+        charge["total_session_seconds"] = elapsed
         charge["last_wh_time"] = None
 
-        elapsed = charge["accumulated_seconds"]
         invoice_id = f"RE-{time.strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}"
 
         c_info = COUNTRY_VAT_RATES.get(charge["selected_country"], COUNTRY_VAT_RATES["DE"])
@@ -937,7 +965,7 @@ def generate_pdf(report):
         story.append(Paragraph(
             f"Beleg-Nr.: <b>{report.get('invoice_id')}</b> | Datum: {report.get('date')}<br/>"
             f"Steuerland: <b>{c_name}</b> | Tarif: {STROMPREIS_PER_KWH:.2f} €/kWh (Netto)<br/>"
-            f"Gesamtdauer: <b>{report.get('time_formatted', '00:00:00')}</b> (davon aktiv Strom bezogen: <b>{report.get('flow_time_formatted', '00:00:00')}</b> | Pausen/Leerlauf: <b>{report.get('idle_time_formatted', '00:00:00')}</b>)", ms))
+            f"Gesamtlaufzeit: <b>{report.get('time_formatted', '00:00:00')}</b> (davon aktiv Strom gezogen: <b>{report.get('flow_time_formatted', '00:00:00')}</b> | Pausen/Leerlauf: <b>{report.get('idle_time_formatted', '00:00:00')}</b>)", ms))
         story.append(HRFlowable(width="100%", thickness=1.5, color=colors.HexColor("#2563eb"), spaceAfter=12))
 
         tbl = [["Pos", "Gerät & Modus", "Ladezeit", "Ø Leistung", "Energie", "Netto (€)", f"{vat_name} ({vat_rate:.1f}%)", "Brutto (€)"]]
@@ -1023,7 +1051,7 @@ def send_email():
 
 @app.route('/debug')
 def debug():
-    elapsed = get_elapsed()
+    elapsed = get_session_elapsed()
     c_info = COUNTRY_VAT_RATES.get(charge["selected_country"], COUNTRY_VAT_RATES["DE"])
     return jsonify({
         "shelly": dict(shelly),
@@ -1031,11 +1059,11 @@ def debug():
         "charge_paused": charge["paused"],
         "unplug_modal": charge["unplug_modal"],
         "waiting_for_new_plug": charge["waiting_for_new_plug"],
+        "target_is_new": charge.get("target_is_new", True),
+        "session_elapsed": round(elapsed, 1),
         "total_flow_seconds": charge["total_flow_seconds"],
         "total_idle_seconds": charge["total_idle_seconds"],
         "country": c_info,
-        "accumulated_seconds": charge["accumulated_seconds"],
-        "elapsed_calculated": round(elapsed, 1),
         "total_wh": charge["total_wh"],
         "cost_netto": charge["total_cost_netto"],
         "vat_amount": charge["total_vat_amount"],
@@ -1072,10 +1100,7 @@ def admin_override():
     elif action == "force_off":
         relay_control(False)
         with lock:
-            if charge["active"] and charge["last_start_time"]:
-                charge["accumulated_seconds"] += time.time() - charge["last_start_time"]
             charge["active"] = False
-            charge["last_start_time"] = None
         return jsonify({"status": "ok", "message": "Relais AUS"})
     return jsonify({"status": "error"}), 400
 
@@ -1151,6 +1176,22 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 .wb-title{font-size:14.5px;font-weight:800;color:#1e40af;margin-bottom:4px}
 .wb-sub{font-size:12px;color:#3b82f6;line-height:1.4}
 
+/* DYNAMISCHES MULTI-SEGMENT SCHAUBILD (GERÄTE 1, 2, 3... & PAUSEN) */
+.timeline-card{background:#f8fafc;border:1px solid var(--border);border-radius:18px;padding:14px;margin-bottom:12px;text-align:left}
+.timeline-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.timeline-title{font-size:11px;font-weight:800;text-transform:uppercase;color:var(--muted);letter-spacing:.5px}
+.timeline-stat{font-size:11px;font-weight:700;color:var(--text)}
+
+.time-bar{height:14px;background:#e2e8f0;border-radius:12px;display:flex;overflow:hidden;margin-bottom:10px;box-shadow:inset 0 1px 2px rgba(0,0,0,.08)}
+.tb-seg{height:100%;transition:width .4s ease}
+.tb-pause{background:#cbd5e1;background-image:repeating-linear-gradient(45deg,#cbd5e1,#cbd5e1 4px,#94a3b8 4px,#94a3b8 8px)}
+
+.time-chips-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:11px}
+.time-chip{background:#ffffff;border:1px solid var(--border);border-radius:10px;padding:6px 8px;display:flex;align-items:center;justify-content:space-between}
+.time-chip-left{display:flex;align-items:center;gap:6px}
+.time-chip-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.time-chip-val{font-weight:800;font-family:ui-monospace,monospace;color:var(--text)}
+
 /* KI-VORSCHLAG & GERAETE-AUSWAHL */
 .ai-box{background:#f8fafc;border:1.5px solid var(--border);border-radius:18px;padding:14px;margin-bottom:12px;text-align:left;transition:border-color .2s}
 .ai-box.confirmed{border-color:#bbf7d0;background:#f0fdf4}
@@ -1170,21 +1211,6 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 .ai-actions{display:flex;gap:8px}
 .btn-confirm{flex:1;background:#059669;color:#fff;border:none;border-radius:10px;padding:8px 12px;font-size:12.5px;font-weight:700;cursor:pointer}
 .btn-change{background:#f1f5f9;color:var(--text);border:1px solid var(--border);border-radius:10px;padding:8px 12px;font-size:12.5px;font-weight:700;cursor:pointer}
-
-/* DYNAMISCHES SCHAUBILD (PAUSEN & STROMFLUSS-TIMELINE) */
-.timeline-card{background:#f8fafc;border:1px solid var(--border);border-radius:18px;padding:14px;margin-bottom:12px;text-align:left}
-.timeline-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
-.timeline-title{font-size:11px;font-weight:800;text-transform:uppercase;color:var(--muted);letter-spacing:.5px}
-.timeline-stat{font-size:11px;font-weight:700;color:var(--text)}
-
-.time-bar{height:12px;background:#e2e8f0;border-radius:12px;display:flex;overflow:hidden;margin-bottom:8px}
-.tb-flow1{background:#2563eb}
-.tb-flow2{background:#10b981}
-.tb-flow3{background:#8b5cf6}
-.tb-pause{background:#cbd5e1;background-image:repeating-linear-gradient(45deg,#cbd5e1,#cbd5e1 4px,#94a3b8 4px,#94a3b8 8px)}
-
-.time-legend{display:flex;justify-content:space-between;font-size:11px;color:var(--muted);font-weight:600}
-.time-legend b{color:var(--text);font-family:ui-monospace,monospace}
 
 /* WYSIWYG ADAPTIVES PROGNOSE-PANEL */
 .prognosis-panel{border-radius:18px;padding:14px;margin-bottom:12px;text-align:left;animation:fadein .25s ease-out}
@@ -1227,10 +1253,11 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 .bd{background:#fee2e2;color:var(--red)}
 
 /* MODALE */
-.modal{display:none;position:fixed;inset:0;background:rgba(9,13,22,.8);backdrop-filter:blur(6px);z-index:999;padding:16px;align-items:center;justify-content:center}
+.modal{display:none;position:fixed;inset:0;background:rgba(9,13,22,.82);backdrop-filter:blur(6px);z-index:999;padding:16px;align-items:center;justify-content:center}
 .mbox{background:#fff;border-radius:24px;padding:24px 20px;text-align:left;max-width:390px;width:100%;max-height:90vh;overflow-y:auto;animation:pop .2s ease-out}
 @keyframes pop{from{transform:scale(.92);opacity:0}to{transform:scale(1);opacity:1}}
 .m-sec-title{font-size:11px;font-weight:800;text-transform:uppercase;color:var(--muted);letter-spacing:.5px;margin:12px 0 6px}
+
 .dev-option{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border:1px solid var(--border);border-radius:12px;margin-bottom:6px;cursor:pointer;background:#ffffff;transition:background .15s, border-color .15s}
 .dev-option:hover{background:#f8fafc;border-color:var(--blue)}
 .dev-opt-left{display:flex;align-items:center;gap:10px}
@@ -1238,6 +1265,12 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 .dev-opt-nm{font-size:13.5px;font-weight:700;color:var(--text)}
 .dev-opt-sub{font-size:11px;color:var(--muted)}
 .dev-opt-tag{font-size:10px;font-weight:700;padding:3px 7px;border-radius:6px}
+
+.reuse-card{border:1.5px solid #bfdbfe;background:#eff6ff;border-radius:14px;padding:12px;margin-bottom:8px;cursor:pointer;transition:transform .1s, background .15s}
+.reuse-card:hover{background:#dbeafe}
+.reuse-card:active{transform:scale(.98)}
+.reuse-title{font-size:13.5px;font-weight:800;color:#1e40af;display:flex;align-items:center;justify-content:space-between}
+.reuse-meta{font-size:11.5px;color:#3b82f6;margin-top:3px}
 
 .receipt{display:none}
 .rtbl{width:100%;border-collapse:collapse;margin:14px 0;font-size:11.5px}
@@ -1247,7 +1280,7 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 .ein{width:100%;padding:11px;border:1px solid var(--border);border-radius:10px;font-size:13.5px;margin-bottom:8px}
 </style></head><body>
 
-<!-- DIALOG 1: WURDE GERÄT ABGESTECKT? (ABFALL AUF 0.0 A) -->
+<!-- DIALOG 1: WURDE GERÄT ABGESTECKT? -->
 <div id="modalAskUnplug" class="modal">
 <div class="mbox" style="text-align:center;border:2px solid var(--red)">
   <div style="font-size:42px;margin-bottom:6px">🔌⚠️</div>
@@ -1268,23 +1301,28 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 </div>
 </div>
 
-<!-- DIALOG 2: NEUES GERÄT EINSTECKEN ODER BEENDEN? -->
+<!-- DIALOG 2: FRÜHERES GERÄT WIEDERVERWENDEN ODER NEUES GERÄT? -->
 <div id="modalAskNextDevice" class="modal">
-<div class="mbox" style="text-align:center;border:2px solid var(--blue)">
-  <div style="font-size:42px;margin-bottom:6px">🔄⚡</div>
-  <div style="font-size:18px;font-weight:800;margin-bottom:6px;color:#1e40af">Gerätewechsel & Fortfahren</div>
-  <p style="font-size:13px;color:var(--muted);margin-bottom:18px;line-height:1.4">
-    Möchtest du ein <b>neues Gerät einstecken</b> oder die Ladesitzung <b>beenden</b>?
-  </p>
-  
-  <div style="display:flex;flex-direction:column;gap:10px">
-    <button class="btn bp" style="background:var(--blue);padding:14px;font-size:14.5px" onclick="handleUnplugResponse('prep_new_device')">
-      ➕ Neues Gerät einstecken & fortfahren
-    </button>
-    <button class="btn bs" style="background:#f1f5f9;color:var(--text);padding:13px;font-size:14px" onclick="handleUnplugResponse('finish')">
-      🧾 Nein, Ladevorgang beenden
-    </button>
+<div class="mbox" style="text-align:left;border:2px solid var(--blue)">
+  <div style="text-align:center;margin-bottom:12px">
+    <div style="font-size:38px;margin-bottom:4px">🔄⚡</div>
+    <div style="font-size:17.5px;font-weight:800;color:#1e40af">Gerätewechsel & Fortfahren</div>
+    <p style="font-size:12px;color:var(--muted);margin-top:2px">
+      Wurde ein bereits genutztes Gerät oder ein neues Gerät angeschlossen?
+    </p>
   </div>
+
+  <div class="m-sec-title">🔁 Bisheriges Gerät fortsetzen:</div>
+  <div id="reusableDevicesContainer"></div>
+
+  <div class="m-sec-title" style="margin-top:14px">➕ Neues Gerät erfassen:</div>
+  <button class="btn bp" style="background:var(--blue);padding:12px;font-size:13.5px;margin-bottom:8px" onclick="handleUnplugResponse('prep_new_device')">
+    ➕ Neues separates Gerät einstecken
+  </button>
+  
+  <button class="btn bs" style="background:#f1f5f9;color:var(--text);padding:11px;font-size:13px" onclick="handleUnplugResponse('finish')">
+    🧾 Sitzung beenden & Quittung
+  </button>
 </div>
 </div>
 
@@ -1412,27 +1450,21 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 
 <!-- BANNER WENN AUF NEUES GERAET GEWARTET WIRD -->
 <div class="waiting-banner" id="waitingPlugBanner" style="display:none">
-  <div class="wb-title">🔌 Steckdose aktiv – Neues Gerät einstecken</div>
-  <div class="wb-sub">Stecke das nächste Gerät ein. Sobald Strom fließt, wird Gerät #2 automatisch gestartet!</div>
+  <div class="wb-title">🔌 Steckdose aktiv – Gerät einstecken</div>
+  <div class="wb-sub" id="waitingPlugSub">Stecke das Gerät ein. Sobald Strom fließt, läuft die Erfassung automatisch weiter!</div>
 </div>
 
 <!-- GERÄTE-TABS DER AKTUELLEN SITZUNG -->
 <div class="dev-pills" id="devPillsContainer"></div>
 
-<!-- DYNAMISCHES SCHAUBILD: PAUSEN & STROMFLUSS-ZEITSTRAHL -->
+<!-- DYNAMISCHES MULTI-SEGMENT SCHAUBILD -->
 <div class="timeline-card" id="timelineCard">
   <div class="timeline-hdr">
-    <span class="timeline-title">📊 Stromfluss & Pausen-Zeitstrahl</span>
+    <span class="timeline-title">📊 Dynamischer Lade- & Pausen-Zeitstrahl</span>
     <span class="timeline-stat" id="timelineFlowPct">0% Strom aktiv</span>
   </div>
-  <div class="time-bar" id="timeBarVisual">
-    <div id="tbFlowSeg" class="tb-flow1" style="width:0%"></div>
-    <div id="tbPauseSeg" class="tb-pause" style="width:100%"></div>
-  </div>
-  <div class="time-legend">
-    <span>⚡ Aktiv Strom: <b id="timeFlowText">00:00:00</b></span>
-    <span>⏸️ Pausen (0 W): <b id="timeIdleText">00:00:00</b></span>
-  </div>
+  <div class="time-bar" id="timeBarVisual"></div>
+  <div class="time-chips-grid" id="timeChipsGrid"></div>
 </div>
 
 <!-- KI-VORSCHLAG & GERAETE-LEISTE -->
@@ -1505,7 +1537,7 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 </div>
 <div class="g2">
   <div class="st bl"><div class="st-l">Wirkleistung (P)</div><div class="st-v"><span id="watt">0.000</span> W</div><div class="st-s" id="wSub">Kein Strom</div></div>
-  <div class="st"><div class="st-l">Laufzeit</div><div class="st-v" id="timer">00:00:00</div></div>
+  <div class="st"><div class="st-l">Gesamtlaufzeit (Daueruhr)</div><div class="st-v" id="timer">00:00:00</div></div>
 </div>
 <div class="g2">
   <div class="st bl"><div class="st-l">Verbrauch (Wh)</div><div class="st-v"><span id="wh">0.0000</span> Wh</div><div class="st-s"><span id="mwh">0.0</span> mWh</div></div>
@@ -1538,13 +1570,10 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 
 <div class="timeline-card" style="margin-bottom:12px;background:#f8fafc">
   <div class="timeline-hdr">
-    <span class="timeline-title">⏱️ Nutzungs- & Pausenaufteilung</span>
+    <span class="timeline-title">⏱️ Gesamtlaufzeit- & Pausenaufteilung</span>
     <span class="timeline-stat" id="rTimelinePct">--</span>
   </div>
-  <div class="time-legend" style="margin-top:4px">
-    <span>⚡ Reine Ladezeit: <b id="rFlowTime">00:00:00</b></span>
-    <span>⏸️ Pausenzeit: <b id="rIdleTime">00:00:00</b></span>
-  </div>
+  <div class="time-chips-grid" id="rTimeChipsGrid" style="margin-top:6px"></div>
 </div>
 
 <table class="rtbl">
@@ -1577,13 +1606,14 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 <script>
 var done = false, lastR = null;
 var localElapsed = 0;
-var isChargingActive = false;
+var sessionStarted = false;
 var localTimerInterval = null;
 
 var STROMPREIS_NETTO = 0.35;
 var currentCountry = { code: 'DE', name: 'Deutschland', flag: '🇩🇪', vat_name: 'MwSt.', rate: 19.0 };
 var currentDevice = { num: 1, name: 'Gerät 1: Lampe / Beleuchtung', mode: 'continuous', is_battery: false, nominal_wh: 0, user_confirmed: false };
 var latestAiSuggestion = null;
+var allRecordedDevices = [];
 
 function fs(s){
   s = Math.floor(Math.max(0, s));
@@ -1598,21 +1628,15 @@ function updateTimerDisplay(){
   if (el) el.innerText = fs(localElapsed);
 }
 
-function startLocalTimer(){
+// Daueruhr läuft immer durchgehend ab dem ersten Start
+function startContinuousTimer(){
   if (localTimerInterval) return;
   localTimerInterval = setInterval(function(){
-    if (isChargingActive && !done) {
+    if (sessionStarted && !done) {
       localElapsed += 1;
       updateTimerDisplay();
     }
   }, 1000);
-}
-
-function stopLocalTimer(){
-  if (localTimerInterval) {
-    clearInterval(localTimerInterval);
-    localTimerInterval = null;
-  }
 }
 
 function showM(id){ document.getElementById(id).style.display = 'flex'; }
@@ -1631,8 +1655,7 @@ function startFreshSession(){
     done = false;
     lastR = null;
     localElapsed = 0;
-    isChargingActive = false;
-    stopLocalTimer();
+    sessionStarted = false;
     document.getElementById('recC').style.display = 'none';
     document.getElementById('mainC').style.display = 'block';
     document.getElementById('sPill').className = 'pill pill-off';
@@ -1643,10 +1666,8 @@ function startFreshSession(){
     document.getElementById('costBrutto').innerText = '0.00000';
     document.getElementById('costNetto').innerText = '0.00000 €';
     document.getElementById('vatAmount').innerText = '0.00000 €';
-    document.getElementById('timeFlowText').innerText = '00:00:00';
-    document.getElementById('timeIdleText').innerText = '00:00:00';
-    document.getElementById('tbFlowSeg').style.width = '0%';
-    document.getElementById('tbPauseSeg').style.width = '100%';
+    document.getElementById('timeBarVisual').innerHTML = '';
+    document.getElementById('timeChipsGrid').innerHTML = '';
     document.getElementById('waitingPlugBanner').style.display = 'none';
     hideM('modalAskUnplug');
     hideM('modalAskNextDevice');
@@ -1656,8 +1677,8 @@ function startFreshSession(){
 
 function doStart(){
   if(done) return;
-  isChargingActive = true;
-  startLocalTimer();
+  sessionStarted = true;
+  startContinuousTimer();
   document.getElementById('sPill').className = 'pill pill-on';
   document.getElementById('sTxt').innerText = 'Aktiv';
   post('/start').then(function(){ poll(); });
@@ -1665,8 +1686,6 @@ function doStart(){
 
 function doStop(){
   if(done) return;
-  isChargingActive = false;
-  stopLocalTimer();
   document.getElementById('sPill').className = 'pill pill-p';
   document.getElementById('sTxt').innerText = 'Pause';
   post('/stop').then(function(){ poll(); });
@@ -1676,22 +1695,38 @@ function devAct(a){
   if(a === 'continue'){
     doStart();
   } else if(a === 'finish'){
-    isChargingActive = false;
-    stopLocalTimer();
     post('/logout').then(function(r){ showReceipt(r); });
   }
 }
 
 // ABSTECK- & WECHSEL-ANTWORTEN
-function handleUnplugResponse(action){
+function handleUnplugResponse(action, devIdx){
   hideM('modalAskUnplug');
   hideM('modalAskNextDevice');
-  post('/unplug_action', { action: action }).then(function(res){
+  var payload = { action: action };
+  if(action === 'select_existing'){
+    payload.device_idx = devIdx;
+  }
+  post('/unplug_action', payload).then(function(res){
     if(action === 'finish'){
       showReceipt(res);
     } else {
       poll();
     }
+  });
+}
+
+function renderReusableDevices(devs){
+  var c = document.getElementById('reusableDevicesContainer');
+  if(!c) return;
+  c.innerHTML = '';
+  (devs || []).forEach(function(d, idx){
+    var div = document.createElement('div');
+    div.className = 'reuse-card';
+    div.onclick = function(){ handleUnplugResponse('select_existing', idx); };
+    div.innerHTML = '<div class="reuse-title"><span>' + (d.icon || '🔌') + ' ' + (d.name || ('Gerät ' + (idx+1))) + '</span><span style="font-size:11px;background:#bfdbfe;color:#1e40af;padding:2px 8px;border-radius:10px">Wiederverwenden</span></div>' +
+                    '<div class="reuse-meta">Bisher: <b>' + fs(d.flow_duration_sec || 0) + '</b> Stromfluss · <b>' + (d.wh || 0).toFixed(3) + ' Wh</b></div>';
+    c.appendChild(div);
   });
 }
 
@@ -1814,10 +1849,57 @@ function updateWysiwygLook(dev, curW, curWh){
   }
 }
 
+// DYNAMISCHER MULTI-SEGMENT-BALKEN & CHIPS
+function updateDynamicTimeline(devs, totalFlowSec, totalIdleSec, totalElapsedSec){
+  var tot = Math.max(1, totalElapsedSec, (totalFlowSec + totalIdleSec));
+  var bar = document.getElementById('timeBarVisual');
+  var grid = document.getElementById('timeChipsGrid');
+  if(!bar || !grid) return;
+
+  bar.innerHTML = '';
+  grid.innerHTML = '';
+
+  var flowPct = Math.min(100, Math.round((totalFlowSec / tot) * 100));
+  var idlePct = 100 - flowPct;
+  document.getElementById('timelineFlowPct').innerText = flowPct + '% Strom aktiv (' + idlePct + '% Pausen)';
+
+  // 1. Segmente für jedes Gerät
+  (devs || []).forEach(function(d, idx){
+    var dFlow = d.flow_duration_sec || 0;
+    var dPct = ((dFlow / tot) * 100).toFixed(1);
+    var color = d.color || '#2563eb';
+
+    if(dFlow > 0){
+      var seg = document.createElement('div');
+      seg.className = 'tb-seg';
+      seg.style.width = dPct + '%';
+      seg.style.background = color;
+      bar.appendChild(seg);
+    }
+
+    var chip = document.createElement('div');
+    chip.className = 'time-chip';
+    chip.innerHTML = '<div class="time-chip-left"><span class="time-chip-dot" style="background:' + color + '"></span><span>' + (d.icon || '🔌') + ' Gerät ' + (d.num || idx+1) + '</span></div><div class="time-chip-val">' + fs(dFlow) + ' <span style="font-size:9.5px;color:#64748b">(' + dPct + '%)</span></div>';
+    grid.appendChild(chip);
+  });
+
+  // 2. Segment für Pausen
+  if(totalIdleSec > 0 || totalFlowSec === 0){
+    var pausePct = ((totalIdleSec / tot) * 100).toFixed(1);
+    var pSeg = document.createElement('div');
+    pSeg.className = 'tb-seg tb-pause';
+    pSeg.style.width = pausePct + '%';
+    bar.appendChild(pSeg);
+
+    var pChip = document.createElement('div');
+    pChip.className = 'time-chip';
+    pChip.innerHTML = '<div class="time-chip-left"><span class="time-chip-dot" style="background:#94a3b8"></span><span>⏸️ Pausen (0 W)</span></div><div class="time-chip-val" style="color:#64748b">' + fs(totalIdleSec) + ' <span style="font-size:9.5px">(' + pausePct + '%)</span></div>';
+    grid.appendChild(pChip);
+  }
+}
+
 function showReceipt(rp){
   done = true;
-  isChargingActive = false;
-  stopLocalTimer();
   lastR = rp;
   document.getElementById('mainC').style.display = 'none';
   document.getElementById('recC').style.display = 'block';
@@ -1837,10 +1919,20 @@ function showReceipt(rp){
   document.getElementById('rCountryName').innerText = cName;
   document.getElementById('rVatRate').innerText = vatRate.toFixed(1);
   document.getElementById('rVatName').innerText = vatName;
+  document.getElementById('rTimelinePct').innerText = 'Gesamtdauer: ' + fs(totalSec) + ' · ' + flowPct + '% Stromfluss | ' + (100 - flowPct) + '% Pausen';
 
-  document.getElementById('rFlowTime').innerText = fs(flowSec);
-  document.getElementById('rIdleTime').innerText = fs(idleSec);
-  document.getElementById('rTimelinePct').innerText = flowPct + '% Stromfluss | ' + (100 - flowPct) + '% Pausen';
+  var rGrid = document.getElementById('rTimeChipsGrid');
+  rGrid.innerHTML = '';
+  (rp.devices || []).forEach(function(d, idx){
+    var chip = document.createElement('div');
+    chip.className = 'time-chip';
+    chip.innerHTML = '<div class="time-chip-left"><span class="time-chip-dot" style="background:' + (d.color || '#2563eb') + '"></span><span>' + (d.icon || '🔌') + ' ' + (d.name || ('Gerät ' + (idx+1))) + '</span></div><div class="time-chip-val">' + fs(d.flow_duration_sec || 0) + '</div>';
+    rGrid.appendChild(chip);
+  });
+  var pChip = document.createElement('div');
+  pChip.className = 'time-chip';
+  pChip.innerHTML = '<div class="time-chip-left"><span class="time-chip-dot" style="background:#94a3b8"></span><span>⏸️ Pausen/Leerlauf</span></div><div class="time-chip-val" style="color:#64748b">' + fs(idleSec) + '</div>';
+  rGrid.appendChild(pChip);
 
   var tb = document.getElementById('recB');
   tb.innerHTML = '';
@@ -1878,27 +1970,6 @@ function renderDevicePills(devs, activeIdx){
   });
 }
 
-function updateTimelineVisual(flowSec, idleSec){
-  var tot = flowSec + idleSec;
-  if(tot <= 0){
-    document.getElementById('timeFlowText').innerText = '00:00:00';
-    document.getElementById('timeIdleText').innerText = '00:00:00';
-    document.getElementById('timelineFlowPct').innerText = '0% Strom aktiv';
-    document.getElementById('tbFlowSeg').style.width = '0%';
-    document.getElementById('tbPauseSeg').style.width = '100%';
-    return;
-  }
-  var flowPct = Math.min(100, Math.max(0, Math.round((flowSec / tot) * 100)));
-  var pausePct = 100 - flowPct;
-
-  document.getElementById('timeFlowText').innerText = fs(flowSec);
-  document.getElementById('timeIdleText').innerText = fs(idleSec);
-  document.getElementById('timelineFlowPct').innerText = flowPct + '% Strom aktiv (' + pausePct + '% Pausen)';
-
-  document.getElementById('tbFlowSeg').style.width = flowPct + '%';
-  document.getElementById('tbPauseSeg').style.width = pausePct + '%';
-}
-
 function poll(){
   if(done) return;
   fetch('/status', {cache: 'no-store'}).then(function(r){return r.json()}).then(function(d){
@@ -1914,34 +1985,37 @@ function poll(){
     var flowSec = d.total_flow_seconds || 0.0;
     var idleSec = d.total_idle_seconds || 0.0;
 
+    allRecordedDevices = d.devices || [];
+
     // Land
     if(d.country){
       currentCountry = d.country;
       updateCountryDisplays();
     }
 
-    // Timer-Synchronisation ohne Ruckeln
-    if(d.active){
-      isChargingActive = true;
-      startLocalTimer();
-      document.getElementById('sPill').className = 'pill pill-on';
-      document.getElementById('sTxt').innerText = 'Aktiv';
+    // Kontinuierliche Daueruhr (stoppt nie!)
+    if(d.session_started){
+      sessionStarted = true;
+      startContinuousTimer();
       if(Math.abs(localElapsed - srvSec) > 2.0){
         localElapsed = Math.floor(srvSec);
         updateTimerDisplay();
       }
     } else {
-      isChargingActive = false;
-      stopLocalTimer();
-      localElapsed = Math.floor(srvSec);
+      sessionStarted = false;
+      localElapsed = 0;
       updateTimerDisplay();
-      if(d.paused){
-        document.getElementById('sPill').className = 'pill pill-p';
-        document.getElementById('sTxt').innerText = 'Pause';
-      } else {
-        document.getElementById('sPill').className = 'pill pill-off';
-        document.getElementById('sTxt').innerText = 'Bereit';
-      }
+    }
+
+    if(d.active){
+      document.getElementById('sPill').className = 'pill pill-on';
+      document.getElementById('sTxt').innerText = 'Aktiv';
+    } else if(d.paused){
+      document.getElementById('sPill').className = 'pill pill-p';
+      document.getElementById('sTxt').innerText = 'Pause';
+    } else {
+      document.getElementById('sPill').className = 'pill pill-off';
+      document.getElementById('sTxt').innerText = 'Bereit';
     }
 
     // Modal Status Management
@@ -1950,13 +2024,14 @@ function poll(){
       hideM('modalAskNextDevice');
     } else if(d.unplug_modal === 'ASK_NEXT_DEVICE'){
       hideM('modalAskUnplug');
+      renderReusableDevices(d.devices);
       showM('modalAskNextDevice');
     } else {
       hideM('modalAskUnplug');
       hideM('modalAskNextDevice');
     }
 
-    // Waiting for new plug banner
+    // Waiting for plug banner
     var wb = document.getElementById('waitingPlugBanner');
     if(d.waiting_for_new_plug){
       wb.style.display = 'block';
@@ -1972,8 +2047,8 @@ function poll(){
       unplugPill.style.display = 'none';
     }
 
-    // DYNAMISCHES SCHAUBILD (PAUSEN & STROMFLUSS)
-    updateTimelineVisual(flowSec, idleSec);
+    // DYNAMISCHES MULTI-SEGMENT SCHAUBILD
+    updateDynamicTimeline(d.devices, flowSec, idleSec, srvSec);
 
     // Geräte-Tabs
     renderDevicePills(d.devices, d.current_device_idx);
@@ -1986,7 +2061,7 @@ function poll(){
     document.getElementById('wh').innerText = curWh.toFixed(4);
     document.getElementById('mwh').innerText = (curWh * 1000).toFixed(1);
 
-    // Kosten (Netto, MwSt, Brutto)
+    // Kosten
     var brutto = d.cost_brutto || d.cost || 0.0;
     var netto = d.cost_netto || 0.0;
     var vatAmt = d.vat_amount || 0.0;
