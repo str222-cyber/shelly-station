@@ -1149,24 +1149,22 @@ def get_status():
 
         cid = get_client_id()
         owner = charge.get("owner_client_id")
-        
+
+        if owner is None:
+            charge["owner_client_id"] = cid
+            charge["owner_since"] = time.time()
+            owner = cid
+            is_owner = True
+        else:
+            is_owner = (owner == cid)
+
         other_clients = {k: v for k, v in active_clients.items() if k != cid}
         has_other_clients = len(other_clients) > 0
         other_dev_type = list(other_clients.values())[0]["type"] if other_clients else "Anderes Gerät"
 
-        if owner is None:
-            if not has_other_clients:
-                charge["owner_client_id"] = cid
-                owner = cid
-                is_owner = True
-            else:
-                is_owner = False
-        else:
-            is_owner = (owner == cid)
-
         return jsonify({
             "is_owner": is_owner,
-            "has_owner": owner is not None,
+            "has_owner": True,
             "has_other_clients": has_other_clients,
             "other_device_type": other_dev_type,
             "battery_state": batt_state,
