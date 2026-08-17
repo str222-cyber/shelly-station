@@ -213,11 +213,11 @@ def async_cloud_control(turn_on=True):
 
 # --- THREAD 1: ZENTRALER GETAKTETER SHELLY-POLLER (VERHINDERT RATE-LIMITS) ---
 def shelly_cloud_poller_loop():
+    time.sleep(1.0)
     while True:
         try:
-            time.sleep(2.5)
             payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID}
-            res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=3.5).json()
+            res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=4.0).json()
             
             if res.get("isok"):
                 status = res.get("data", {}).get("device_status", {})
@@ -251,12 +251,15 @@ def shelly_cloud_poller_loop():
                     global_state["last_valid_fetch_time"] = time.time()
                     global_state["history_w"].append(watt)
 
-            elif res.get("error") == "TOO_MANY_REQUESTS":
-                # Bei Rate Limit: Werte behalten und extra Pause
-                time.sleep(1.5)
+                time.sleep(3.5)
 
-        except Exception as e:
-            time.sleep(1.0)
+            elif res.get("error") == "TOO_MANY_REQUESTS":
+                time.sleep(4.0)
+            else:
+                time.sleep(3.5)
+
+        except Exception:
+            time.sleep(3.0)
 
 threading.Thread(target=shelly_cloud_poller_loop, daemon=True).start()
 
@@ -282,7 +285,7 @@ def background_metering_loop():
                 if not u.get("active") or u.get("terminated") or u.get("paused"):
                     continue
 
-                # 1. Energie-Integration
+                # 1. Energie-Integration (sekundengenau)
                 wh_increment = (watt * dt) / 3600.0
                 u["accumulated_seconds"] += dt
                 u["total_wh"] += wh_increment
@@ -1244,7 +1247,7 @@ MAIN_PAGE_HTML = """
             window.open('/download_invoice', '_blank');
         }
 
-        // TELEMETRIE-POLLING VOM SERVER (Greift ohne Verzögerung auf Server-Cache zu)
+        // TELEMETRIE-POLLING VOM SERVER
         async function fetchTelemetry() {
             if (isTerminated) return;
             try {
@@ -1294,7 +1297,7 @@ MAIN_PAGE_HTML = """
                 if (data.active) {
                     badge.className = "status-pill status-on";
                     statusText.innerText = "Aktiv / Strom fließt";
-                    document.getElementById('wattSub').innerText = data.watt > 0.1 ? "Fließt stabil" : "Bereit / Standby";
+                    document.getElementById('wattSub').innerText = (data.watt > 0.1) ? "Fließt stabil" : "Bereit / Standby";
                 } else if (data.paused) {
                     badge.className = "status-pill status-paused";
                     statusText.innerText = "Pausiert";
