@@ -2403,7 +2403,7 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 </style></head><body>
 
 <!-- DIALOG 1: WURDE GERÄT ABGESTECKT ODER SCHLAFMODUS? -->
-<div id="modalAskUnplug" class="modal">
+<div id="modalAskUnplug" class="modal" style="display:none">
 <div class="mbox" style="text-align:center;border:2px solid var(--red)">
   <div style="font-size:42px;margin-bottom:6px">🔌💤</div>
   <div style="font-size:18px;font-weight:800;margin-bottom:6px;color:#991b1b">Stromfluss auf 0.0 A abgefallen</div>
@@ -2424,7 +2424,7 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 </div>
 
 <!-- DIALOG 2: FRÜHERES GERÄT WIEDERVERWENDEN ODER NEUES GERÄT? -->
-<div id="modalAskNextDevice" class="modal">
+<div id="modalAskNextDevice" class="modal" style="display:none">
 <div class="mbox" style="text-align:left;border:2px solid var(--blue)">
   <div style="text-align:center;margin-bottom:12px">
     <div style="font-size:38px;margin-bottom:4px">🔄⚡</div>
@@ -2504,7 +2504,7 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 </div>
 
 <!-- DIALOG 3: DRASTISCHER LASTWECHSEL ERKANNT (NEUES GERÄT ODER DISPLAY/STANDBY?) -->
-<div id="modalPowerShift" class="modal">
+<div id="modalPowerShift" class="modal" style="display:none">
 <div class="mbox" style="text-align:center;border:2px solid var(--amber)">
   <div style="font-size:42px;margin-bottom:6px">⚡📈</div>
   <div style="font-size:18px;font-weight:800;margin-bottom:6px;color:#b45309">Lastwechsel erkannt</div>
@@ -2530,7 +2530,7 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 </div>
 
 <!-- DIALOG: 80% AKKUSCHUTZ ERREICHT -->
-<div id="modalBattery80" class="modal">
+<div id="modalBattery80" class="modal" style="display:none">
 <div class="mbox" style="text-align:center;border:2px solid #059669">
   <div style="font-size:42px;margin-bottom:6px">🛡️🔋</div>
   <div style="font-size:18px;font-weight:800;margin-bottom:6px;color:#065f46">80% Akkuschutz erreicht!</div>
@@ -2551,7 +2551,7 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 </div>
 
 <!-- DIALOG: 100% AKKU VOLLGELADEN -->
-<div id="modalBattery100" class="modal">
+<div id="modalBattery100" class="modal" style="display:none">
 <div class="mbox" style="text-align:center;border:2px solid #2563eb">
   <div style="font-size:42px;margin-bottom:6px">✅🔋</div>
   <div style="font-size:18px;font-weight:800;margin-bottom:6px;color:#1e40af">100% Akku voll geladen!</div>
@@ -2567,7 +2567,7 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 </div>
 
 <!-- MODAL: LAND & MWST WAHLEN -->
-<div id="countryModal" class="modal">
+<div id="countryModal" class="modal" style="display:none">
 <div class="mbox">
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
   <div style="font-size:16px;font-weight:800">🌍 Land & MwSt. / VAT wählen</div>
@@ -2621,7 +2621,7 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 </div>
 
 <!-- MODAL: GERAET / PROFIL WAHLEN -->
-<div id="devModal" class="modal">
+<div id="devModal" class="modal" style="display:none">
 <div class="mbox">
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
   <div style="font-size:16px;font-weight:800">⚡ Gerät / Profil wählen</div>
@@ -2856,7 +2856,7 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 </button>
 
 <!-- SLIDING CHAT DRAWER -->
-<div class="chat-drawer" id="chatDrawer">
+<div class="chat-drawer" id="chatDrawer" style="display:none">
   <div class="chat-hdr">
     <div class="chat-title">🤖 <span>Smart Power Bot</span></div>
     <div style="display:flex;align-items:center;gap:8px">
@@ -3662,6 +3662,24 @@ function sendChatMessage(){
     appendChatMsg('bot', '⚠️ Netzwerkfehler. Bitte erneut versuchen.');
   });
 }
+
+// Global functions for inline onclick handlers
+window.doStart = doStart;
+window.doStop = doStop;
+window.devAct = devAct;
+window.startFreshSession = startFreshSession;
+window.confirmSuggestion = confirmSuggestion;
+window.showM = showM;
+window.hideM = hideM;
+window.chooseCountry = chooseCountry;
+window.chooseDevice = chooseDevice;
+window.handleUnplugResponse = handleUnplugResponse;
+window.handlePowerShift = handlePowerShift;
+window.handleBatteryAction = handleBatteryAction;
+window.toggleChatDrawer = toggleChatDrawer;
+window.sendQuickChip = sendQuickChip;
+window.sendChatMessage = sendChatMessage;
+window.sendEm = sendEm;
 
 setInterval(poll, 1000);
 poll();
