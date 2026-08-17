@@ -316,12 +316,12 @@ def shelly_cloud_poller_loop():
         try:
             success, err = update_shelly_telemetry_once()
             if success:
-                time.sleep(8.0)
+                time.sleep(10.0)
             elif err in ["TOO_MANY_REQUESTS", "HTTP_429"]:
-                logger.info("[SHELLY-POLLER] Rate-Limit aktiv. Warte 15 Sekunden zur Entlastung...")
-                time.sleep(15.0)
+                logger.info("[SHELLY-POLLER] Rate-Limit aktiv. Warte 20 Sekunden zur Entlastung...")
+                time.sleep(20.0)
             else:
-                time.sleep(8.0)
+                time.sleep(10.0)
         except Exception as e:
             logger.error(f"[SHELLY-POLLER] Fehler in Poller-Schleife: {e}")
             time.sleep(8.0)
