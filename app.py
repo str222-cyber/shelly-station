@@ -1,5 +1,5 @@
 from flask import Flask, render_template_string, jsonify, session, request, send_file, redirect, url_for
-import requests as http_requests  # Umbenennung um Konflikte zu vermeiden
+import requests as http_requests
 import time
 import threading
 import uuid
@@ -42,109 +42,245 @@ SMTP_USER = ""
 SMTP_PASSWORD = ""
 
 # =====================================================================
-# ARCHITEKTUR v4 - KEIN HINTERGRUND-THREAD FUER KERNFUNKTIONEN
-#
-# PROBLEM: Gunicorn forkt Worker-Prozesse. Daemon-Threads, die beim
-# Modul-Import gestartet werden, sterben beim Fork. Das Flag bleibt
-# aber True -> Thread wird nie neu gestartet -> total_seconds bleibt 0.
-#
-# LOESUNG: ALLE Kernfunktionen laufen direkt in den HTTP-Handlern:
-# 1. Timer: On-the-fly berechnet (time.time() - start_time)
-# 2. Shelly: Direkt in /status gepollt (mit 1.5s Cache)
-# 3. Wh: In /status akkumuliert (dt seit letztem Aufruf)
-# 4. KI: In /status berechnet (alle 5 Aufrufe)
-#
-# KEIN Hintergrund-Thread noetig. Funktioniert garantiert mit
-# Gunicorn, Render, Heroku, Docker, egal was.
+# GERAETE-PROFILE & MODI (Dauerbetrieb vs. Akku)
 # =====================================================================
+DEVICE_PROFILES = {
+    # --- DAUERBETRIEB ---
+    "lamp": {
+        "key": "lamp",
+        "name": "Lampe / Beleuchtung",
+        "icon": "💡",
+        "mode": "continuous",
+        "is_battery": False,
+        "nominal_wh": 0.0,
+        "desc": "Dauerbetrieb (stetige Last)"
+    },
+    "tv": {
+        "key": "tv",
+        "name": "TV / Monitor / Audio",
+        "icon": "📺",
+        "mode": "continuous",
+        "is_battery": False,
+        "nominal_wh": 0.0,
+        "desc": "Dauerbetrieb (Unterhaltungselektronik)"
+    },
+    "appliance_s": {
+        "key": "appliance_s",
+        "name": "Kleingerät / Router",
+        "icon": "☕",
+        "mode": "continuous",
+        "is_battery": False,
+        "nominal_wh": 0.0,
+        "desc": "Dauerbetrieb (konstante Kleinlast)"
+    },
+    "appliance": {
+        "key": "appliance",
+        "name": "Großgerät / Dauerlast",
+        "icon": "🍳",
+        "mode": "continuous",
+        "is_battery": False,
+        "nominal_wh": 0.0,
+        "desc": "Dauerbetrieb (starke Verbraucher)"
+    },
+    "continuous_custom": {
+        "key": "continuous_custom",
+        "name": "Individueller Dauerbetrieb",
+        "icon": "🔌",
+        "mode": "continuous",
+        "is_battery": False,
+        "nominal_wh": 0.0,
+        "desc": "Dauerbetrieb ohne Akku"
+    },
 
+    # --- AKKU-GERAETE ---
+    "phone": {
+        "key": "phone",
+        "name": "Smartphone / Tablet",
+        "icon": "📱",
+        "mode": "battery",
+        "is_battery": True,
+        "nominal_wh": 18.0,
+        "desc": "Akku ca. 18 Wh"
+    },
+    "laptop": {
+        "key": "laptop",
+        "name": "Laptop / Ultrabook",
+        "icon": "💻",
+        "mode": "battery",
+        "is_battery": True,
+        "nominal_wh": 65.0,
+        "desc": "Akku ca. 65 Wh"
+    },
+    "ebike": {
+        "key": "ebike",
+        "name": "E-Bike Akku (Standard)",
+        "icon": "🚲",
+        "mode": "battery",
+        "is_battery": True,
+        "nominal_wh": 500.0,
+        "desc": "Akku ca. 500 Wh"
+    },
+    "ebike_fast": {
+        "key": "ebike_fast",
+        "name": "E-Bike Schnelllader",
+        "icon": "⚡",
+        "mode": "battery",
+        "is_battery": True,
+        "nominal_wh": 750.0,
+        "desc": "Akku ca. 750 Wh"
+    },
+    "battery_custom": {
+        "key": "battery_custom",
+        "name": "Individueller Akku",
+        "icon": "🔋",
+        "mode": "battery",
+        "is_battery": True,
+        "nominal_wh": 80.0,
+        "desc": "Akku ca. 80 Wh"
+    }
+}
+
+# =====================================================================
+# GLOBALER STATE
+# =====================================================================
 lock = threading.Lock()
 
-# Shelly-Rohwerte (gecacht, max 1.5s alt)
 shelly = {
     "watt": 0.0, "amp": 0.0, "volt": 230.0,
     "ok": False, "poll_time": 0.0, "error": ""
 }
 
-# Globaler Lade-Zustand
 charge = {
     "active": False,
     "paused": False,
     "terminated": False,
     "relay_on": False,
-    # Timer: On-the-fly berechnet aus diesen 2 Werten
-    "accumulated_seconds": 0.0,  # Gespeicherte Zeit aus frueheren Aktiv-Phasen
-    "last_start_time": None,     # Beginn der aktuellen Aktiv-Phase (oder None)
-    # Energie: Akkumuliert bei jedem /status-Aufruf
-    "last_wh_time": None,        # Letzter Zeitpunkt der Wh-Berechnung
+    "accumulated_seconds": 0.0,
+    "last_start_time": None,
+    "last_wh_time": None,
     "total_wh": 0.0,
     "total_kwh": 0.0,
     "total_cost": 0.0,
-    # KI
     "power_history": [],
     "ai_result": None,
     "ai_tick": 0,
-    # Geraete
     "devices": [],
     "current_device_idx": 0,
     "last_report": None,
 }
 
-# Historie
 history_records = []
 history_stats = {"sessions": 0, "kwh": 0.0, "revenue": 0.0}
 HISTORY_FILE = "station_history.json"
 
 
 # =====================================================================
-# KI-GERAETEERKENNUNG
+# KI-GERAETEERKENNUNG & VORSCHLAEGE
 # =====================================================================
 class DeviceAI:
     @staticmethod
     def classify(power_history):
-        if len(power_history) < 3:
-            return {"type": "unknown", "icon": "\U0001f50c", "name": "Erkennung...",
-                    "confidence": 0, "stage": "Daten werden gesammelt...", "soc_pct": 0,
-                    "is_battery": None, "peak_w": 0, "avg_w": 0, "trend_ratio": 1.0, "cv": 0}
-        watts = [w for _, w in power_history if w > 0.05]
-        if not watts:
-            return {"type": "unknown", "icon": "\U0001f50c", "name": "Kein Verbrauch",
-                    "confidence": 0, "stage": "Warte auf Strom...", "soc_pct": 0,
-                    "is_battery": None, "peak_w": 0, "avg_w": 0, "trend_ratio": 1.0, "cv": 0}
-        cw, pw, aw, n = watts[-1], max(watts), sum(watts)/len(watts), len(watts)
-        if n >= 5:
-            fh = sum(watts[:n//2]) / max(1, n//2)
-            sh = sum(watts[n//2:]) / max(1, n - n//2)
-            tr = sh / fh if fh > 0 else 1.0
-            var = sum((w - aw)**2 for w in watts) / n
-            cv = (var**0.5) / aw if aw > 0 else 0
+        if len(power_history) < 2:
+            return {
+                "suggested_key": "lamp",
+                "name": "Erkennung läuft...",
+                "icon": "💡",
+                "mode": "continuous",
+                "is_battery": False,
+                "confidence": 0,
+                "reason": "Sammle Leistungsdaten...",
+                "peak_w": 0.0, "avg_w": 0.0, "current_w": 0.0
+            }
+
+        watts = [w for _, w in power_history]
+        cw = watts[-1]
+        valid_watts = [w for w in watts if w > 0.1]
+
+        if not valid_watts:
+            return {
+                "suggested_key": "lamp",
+                "name": "Kein Stromfluss",
+                "icon": "🔌",
+                "mode": "continuous",
+                "is_battery": False,
+                "confidence": 0,
+                "reason": "Gerät einstecken oder einschalten",
+                "peak_w": 0.0, "avg_w": 0.0, "current_w": cw
+            }
+
+        pw = max(valid_watts)
+        aw = sum(valid_watts) / len(valid_watts)
+        n = len(valid_watts)
+
+        # Trend- & Stabilitäts-Analyse
+        if n >= 4:
+            fh = sum(valid_watts[:n//2]) / max(1, n//2)
+            sh = sum(valid_watts[n//2:]) / max(1, n - n//2)
+            trend_ratio = sh / fh if fh > 0 else 1.0
+            variance = sum((w - aw)**2 for w in valid_watts) / n
+            cv = (variance**0.5) / aw if aw > 0 else 0
         else:
-            tr, cv = 1.0, 0.0
-        ib, conf = None, 0
-        if cv < 0.15 and tr > 0.90:
-            ib, conf = False, min(95, 50 + n * 5)
-            if pw < 15: t, ic, nm = "lamp", "\U0001f4a1", "Lampe / LED"
-            elif pw < 60: t, ic, nm = "tv", "\U0001f4fa", "TV / Monitor"
-            elif pw < 250: t, ic, nm = "appliance_s", "\u2615", "Kleines Geraet"
-            else: t, ic, nm = "appliance", "\U0001f373", "Grossgeraet"
-        elif tr < 0.88 or (pw < 120 and cw < pw * 0.75 and n > 8):
-            ib, conf = True, min(92, 40 + n * 6)
-            if pw < 25: t, ic, nm = "phone", "\U0001f4f1", "Smartphone / Tablet"
-            elif pw < 100: t, ic, nm = "laptop", "\U0001f4bb", "Laptop"
-            elif pw < 300: t, ic, nm = "ebike", "\U0001f6b2", "E-Bike Akku"
-            else: t, ic, nm = "ebike_fast", "\u26a1", "E-Bike Schnelllader"
+            trend_ratio = 1.0
+            cv = 0.0
+
+        # Klassifizierung
+        if cv < 0.18 and trend_ratio > 0.88:
+            # Stabile Leistung -> Dauerbetrieb
+            confidence = min(95, 45 + n * 6)
+            if pw < 20:
+                s_key = "lamp"
+                reason = f"Gleichmäßige Kleinlast ({aw:.1f} W) typisch für Beleuchtung"
+            elif pw < 80:
+                s_key = "tv"
+                reason = f"Konstante mittlere Last ({aw:.1f} W) typisch für Monitor/TV"
+            elif pw < 250:
+                s_key = "appliance_s"
+                reason = f"Dauerhafte mittlere Leistung ({aw:.1f} W)"
+            else:
+                s_key = "appliance"
+                reason = f"Hohe Dauerlast ({aw:.1f} W)"
+        elif trend_ratio < 0.88 or (pw < 120 and cw < pw * 0.75 and n >= 6):
+            # Abnehmende Leistung -> Akkuladung
+            confidence = min(92, 40 + n * 6)
+            if pw < 25:
+                s_key = "phone"
+                reason = f"Ladekurve bis {pw:.1f} W typisch für Smartphone/Tablet"
+            elif pw < 100:
+                s_key = "laptop"
+                reason = f"Ladekurve bis {pw:.1f} W typisch für Laptop"
+            elif pw < 350:
+                s_key = "ebike"
+                reason = f"Starke Ladeleistung ({pw:.1f} W) typisch für E-Bike"
+            else:
+                s_key = "ebike_fast"
+                reason = f"Sehr hohe Ladeleistung ({pw:.1f} W)"
         else:
-            ib, conf = None, 25
-            t, ic, nm = "unknown", "\U0001f50c", "Analyse..."
-        soc, stage = 0, "Dauerbetrieb"
-        if ib and n >= 2:
-            if cw >= pw * 0.85: stage, soc = "Schnellladung (CC)", min(75, max(5, int((1-tr)*200)))
-            elif cw >= pw * 0.35: stage, soc = "Saettigung (CV)", min(95, max(75, 75+int((1-(cw/pw))*60)))
-            else: stage, soc = "Erhaltungsladung", 98
-        elif ib is False: stage, soc = "Dauerbetrieb aktiv", 100
-        return {"type": t, "icon": ic, "name": nm, "confidence": conf, "stage": stage,
-                "soc_pct": soc, "is_battery": ib, "peak_w": round(pw,2), "avg_w": round(aw,3),
-                "current_w": round(cw,3), "trend_ratio": round(tr,3), "cv": round(cv,3)}
+            # Vorerst Dauerbetrieb annehmen, bis Trend sichtbar wird
+            confidence = 30
+            if pw < 30:
+                s_key = "lamp"
+                reason = f"Aktuelle Leistung {aw:.1f} W"
+            elif pw < 100:
+                s_key = "tv"
+                reason = f"Aktuelle Leistung {aw:.1f} W"
+            else:
+                s_key = "appliance"
+                reason = f"Aktuelle Leistung {aw:.1f} W"
+
+        prof = DEVICE_PROFILES.get(s_key, DEVICE_PROFILES["lamp"])
+        return {
+            "suggested_key": s_key,
+            "name": prof["name"],
+            "icon": prof["icon"],
+            "mode": prof["mode"],
+            "is_battery": prof["is_battery"],
+            "nominal_wh": prof["nominal_wh"],
+            "confidence": confidence,
+            "reason": reason,
+            "peak_w": round(pw, 2),
+            "avg_w": round(aw, 2),
+            "current_w": round(cw, 2)
+        }
 
 
 # =====================================================================
@@ -176,12 +312,9 @@ load_history()
 # SHELLY CLOUD - POLL & RELAIS
 # =====================================================================
 def poll_shelly():
-    """Pollt Shelly Cloud API. Ergebnis wird in shelly-Dict gecacht.
-    Aufgerufen aus /status (vom Browser ca. jede Sekunde).
-    Cache: Maximal 1 Abfrage alle 2.0 Sekunden, um Rate-Limits (HTTP 429) zu vermeiden."""
     now = time.time()
     if now < shelly["poll_time"] + 2.0:
-        return  # Cache noch frisch
+        return
 
     try:
         r = http_requests.post(
@@ -207,13 +340,11 @@ def poll_shelly():
                     shelly["volt"] = float(m.get("voltage", 230) or 230)
                     shelly["ok"] = True
                     shelly["error"] = ""
-                else:
-                    shelly["error"] = f"Unbekannte Keys: {list(ds.keys())[:3]}"
             else:
                 shelly["error"] = j.get("error", "isok=false")
         elif r.status_code == 429:
             shelly["error"] = "Rate Limit (429)"
-            shelly["poll_time"] = now + 4.0  # 4s Pause bei Rate Limit
+            shelly["poll_time"] = now + 4.0
             return
         else:
             shelly["error"] = f"HTTP {r.status_code}"
@@ -226,7 +357,6 @@ def poll_shelly():
 
 
 def relay_control(turn_on):
-    """Relais schalten (asynchron, blockiert nicht)."""
     def _do():
         s = "on" if turn_on else "off"
         try:
@@ -244,19 +374,33 @@ def relay_control(turn_on):
 
 
 # =====================================================================
-# KERNFUNKTIONEN (aufgerufen aus HTTP-Handlern, KEIN Thread)
+# KERNFUNKTIONEN
 # =====================================================================
-
 def get_elapsed():
-    """Berechnet verstrichene Sekunden on-the-fly. Immer exakt."""
     if charge["active"] and charge["last_start_time"]:
         return charge["accumulated_seconds"] + (time.time() - charge["last_start_time"])
     return charge["accumulated_seconds"]
 
 
+def new_device_entry(idx, key="lamp"):
+    prof = DEVICE_PROFILES.get(key, DEVICE_PROFILES["lamp"])
+    return {
+        "id": idx,
+        "key": prof["key"],
+        "name": prof["name"],
+        "icon": prof["icon"],
+        "mode": prof["mode"],
+        "is_battery": prof["is_battery"],
+        "nominal_wh": prof["nominal_wh"],
+        "user_confirmed": False,
+        "duration_sec": 0.0,
+        "wh": 0.0,
+        "cost": 0.0,
+        "peak_w": 0.0
+    }
+
+
 def accumulate_energy():
-    """Akkumuliert Wh basierend auf aktuellem Watt und dt seit letztem Aufruf.
-    Wird bei jedem /status Aufruf aufgerufen (ca. 1x pro Sekunde)."""
     if not charge["active"]:
         return
 
@@ -265,22 +409,18 @@ def accumulate_energy():
 
     if last and last > 0:
         dt = now - last
-        # Nur realistische dt-Werte akzeptieren (0.2s - 15s)
         if 0.2 < dt < 15.0:
             w = shelly["watt"]
-            delta_wh = 0.0
-            if w > 0.05:
-                delta_wh = (w * dt) / 3600.0
-                charge["total_wh"] += delta_wh
-                charge["total_kwh"] = charge["total_wh"] / 1000.0
-                charge["total_cost"] = charge["total_kwh"] * STROMPREIS_PER_KWH
+            delta_wh = (w * dt) / 3600.0 if w > 0.05 else 0.0
 
-            # Power-History fuer KI (max 120 Punkte)
+            charge["total_wh"] += delta_wh
+            charge["total_kwh"] = charge["total_wh"] / 1000.0
+            charge["total_cost"] = charge["total_kwh"] * STROMPREIS_PER_KWH
+
             charge["power_history"].append((now, w))
             if len(charge["power_history"]) > 120:
                 charge["power_history"] = charge["power_history"][-120:]
 
-            # Aktuelles Geraet aktualisieren
             idx = charge["current_device_idx"]
             devs = charge["devices"]
             if 0 <= idx < len(devs):
@@ -292,42 +432,36 @@ def accumulate_energy():
 
     charge["last_wh_time"] = now
 
-    # KI alle 5 Aufrufe
+    # KI-Klassifizierung alle 3 Status-Aufrufe
     charge["ai_tick"] = charge.get("ai_tick", 0) + 1
-    if charge["ai_tick"] % 5 == 0 or charge["ai_result"] is None:
+    if charge["ai_tick"] % 3 == 0 or charge["ai_result"] is None:
         ai = DeviceAI.classify(charge["power_history"])
         charge["ai_result"] = ai
+
+        # Wenn der Benutzer das Gerät noch NICHT manuell bestätigt hat:
+        # Vorschlag automatisch als aktives Profil übernehmen
         idx = charge["current_device_idx"]
         devs = charge["devices"]
         if 0 <= idx < len(devs):
-            devs[idx]["ai_name"] = ai.get("name", "?")
-            devs[idx]["ai_icon"] = ai.get("icon", "\U0001f50c")
-            devs[idx]["ai_type"] = ai.get("type", "unknown")
-            devs[idx]["ai_confidence"] = ai.get("confidence", 0)
-            devs[idx]["is_battery"] = ai.get("is_battery")
-            devs[idx]["stage"] = ai.get("stage", "?")
-            devs[idx]["soc_pct"] = ai.get("soc_pct", 0)
+            cur_dev = devs[idx]
+            if not cur_dev.get("user_confirmed", False) and ai.get("suggested_key") in DEVICE_PROFILES:
+                s_prof = DEVICE_PROFILES[ai["suggested_key"]]
+                cur_dev["key"] = s_prof["key"]
+                cur_dev["name"] = s_prof["name"]
+                cur_dev["icon"] = s_prof["icon"]
+                cur_dev["mode"] = s_prof["mode"]
+                cur_dev["is_battery"] = s_prof["is_battery"]
+                cur_dev["nominal_wh"] = s_prof["nominal_wh"]
 
 
-# =====================================================================
-# HILFSFUNKTIONEN
-# =====================================================================
 def fmt_time(s):
     s = int(max(0, s))
     return f"{s//3600:02d}:{(s%3600)//60:02d}:{s%60:02d}"
-
-def new_device_entry(idx):
-    return {"id": idx, "key": "auto",
-            "ai_name": "Erkennung...", "ai_icon": "\U0001f50c",
-            "ai_type": "unknown", "ai_confidence": 0, "is_battery": None,
-            "duration_sec": 0, "wh": 0, "cost": 0, "peak_w": 0,
-            "stage": "Bereit", "soc_pct": 0}
 
 
 # =====================================================================
 # ROUTES
 # =====================================================================
-
 @app.after_request
 def headers(r):
     r.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
@@ -347,21 +481,18 @@ def scan(token):
         session.permanent = True
         session.modified = True
         return redirect(url_for('index'))
-    return "Ungueltiger Token.", 403
+    return "Ungültiger Token.", 403
 
-
-# --- STATUS: HERZSTÜCK - berechnet alles on-the-fly ---
 @app.route('/status')
 def get_status():
-    # 1. Shelly pollen (gecacht, max alle 1.5s)
     poll_shelly()
 
-    # 2. Energie akkumulieren (wenn aktiv)
     with lock:
         accumulate_energy()
-
-        # 3. Timer on-the-fly berechnen
         elapsed = get_elapsed()
+        curr_idx = charge["current_device_idx"]
+        devices = [dict(d) for d in charge["devices"]]
+        active_dev = devices[curr_idx] if 0 <= curr_idx < len(devices) else new_device_entry(1)
 
         return jsonify({
             "active": charge["active"],
@@ -378,18 +509,16 @@ def get_status():
             "kwh": round(charge["total_kwh"], 6),
             "cost": round(charge["total_cost"], 5),
             "ai_result": charge["ai_result"] or {},
-            "devices": [dict(d) for d in charge["devices"]],
+            "active_device": active_dev,
+            "devices": devices,
             "session_terminated": charge["terminated"],
             "report": charge["last_report"] if charge["terminated"] else None
         })
 
-
-# --- START ---
 @app.route('/start', methods=['POST', 'GET'])
 def start_charge():
     with lock:
         if charge["terminated"]:
-            # Neue Sitzung
             charge["terminated"] = False
             charge["last_report"] = None
             charge["accumulated_seconds"] = 0.0
@@ -401,7 +530,7 @@ def start_charge():
             charge["power_history"] = []
             charge["ai_result"] = None
             charge["ai_tick"] = 0
-            charge["devices"] = [new_device_entry(1)]
+            charge["devices"] = [new_device_entry(1, "lamp")]
             charge["current_device_idx"] = 0
 
         if not charge["active"]:
@@ -410,7 +539,7 @@ def start_charge():
             charge["last_start_time"] = time.time()
             charge["last_wh_time"] = time.time()
             if not charge["devices"]:
-                charge["devices"] = [new_device_entry(1)]
+                charge["devices"] = [new_device_entry(1, "lamp")]
                 charge["current_device_idx"] = 0
             charge["power_history"] = []
             charge["ai_result"] = None
@@ -420,15 +549,12 @@ def start_charge():
     relay_control(True)
     return jsonify({"status": "ok"})
 
-
-# --- STOP / PAUSE ---
 @app.route('/stop', methods=['POST', 'GET'])
 def stop_charge():
     with lock:
         if charge["active"] and charge["last_start_time"]:
-            # Akkumulierte Zeit sichern
             charge["accumulated_seconds"] += time.time() - charge["last_start_time"]
-            accumulate_energy()  # Letzte Wh berechnen
+            accumulate_energy()
         charge["active"] = False
         charge["paused"] = True
         charge["last_start_time"] = None
@@ -437,21 +563,40 @@ def stop_charge():
     logger.info(f">>> PAUSE (t_acc={charge['accumulated_seconds']:.1f}s) <<<")
     return jsonify({"status": "ok"})
 
+@app.route('/set_device', methods=['POST'])
+def set_device():
+    data = request.get_json() or {}
+    key = data.get("key")
+    confirmed = data.get("confirmed", True)
 
-# --- NEUES GERAET ---
+    with lock:
+        idx = charge["current_device_idx"]
+        if 0 <= idx < len(charge["devices"]):
+            dev = charge["devices"][idx]
+            if key in DEVICE_PROFILES:
+                prof = DEVICE_PROFILES[key]
+                dev["key"] = prof["key"]
+                dev["name"] = prof["name"]
+                dev["icon"] = prof["icon"]
+                dev["mode"] = prof["mode"]
+                dev["is_battery"] = prof["is_battery"]
+                dev["nominal_wh"] = prof["nominal_wh"]
+                dev["user_confirmed"] = confirmed
+                logger.info(f"Gerät geändert auf: {dev['name']} ({dev['mode']}) | Bestätigt: {confirmed}")
+                return jsonify({"status": "ok", "device": dev})
+    return jsonify({"status": "error", "message": "Gerät nicht gefunden"}), 400
+
 @app.route('/new_device', methods=['POST'])
 def new_device():
     with lock:
         idx = len(charge["devices"]) + 1
-        charge["devices"].append(new_device_entry(idx))
+        charge["devices"].append(new_device_entry(idx, "lamp"))
         charge["current_device_idx"] = len(charge["devices"]) - 1
         charge["power_history"] = []
         charge["ai_result"] = None
         charge["ai_tick"] = 0
     return jsonify({"status": "ok"})
 
-
-# --- BEENDEN & QUITTUNG ---
 @app.route('/logout', methods=['POST', 'GET'])
 def logout():
     with lock:
@@ -467,10 +612,6 @@ def logout():
 
         elapsed = charge["accumulated_seconds"]
         invoice_id = f"RE-{time.strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}"
-
-        for d in charge["devices"]:
-            d.setdefault("ai_icon", "\U0001f50c")
-            d.setdefault("ai_name", d.get("name", "Geraet"))
 
         report = {
             "invoice_id": invoice_id,
@@ -494,28 +635,6 @@ def logout():
     logger.info(f"LOGOUT {invoice_id} | {fmt_time(elapsed)} | {report['total_wh']:.3f}Wh | {report['total_cost']:.5f}EUR")
     return jsonify(report)
 
-
-# --- DEBUG ---
-@app.route('/debug')
-def debug():
-    elapsed = get_elapsed()
-    return jsonify({
-        "shelly": dict(shelly),
-        "charge_active": charge["active"],
-        "charge_paused": charge["paused"],
-        "accumulated_seconds": charge["accumulated_seconds"],
-        "last_start_time": charge["last_start_time"],
-        "elapsed_calculated": round(elapsed, 1),
-        "total_wh": charge["total_wh"],
-        "total_cost": charge["total_cost"],
-        "devices_count": len(charge["devices"]),
-        "power_history_len": len(charge["power_history"]),
-        "ai_result": charge["ai_result"],
-        "server_time": time.time()
-    })
-
-
-# --- PDF ---
 @app.route('/download_invoice')
 def download_invoice():
     report = charge.get("last_report") or {
@@ -524,7 +643,7 @@ def download_invoice():
         "total_wh": 0, "total_kwh": 0, "total_cost": 0, "devices": []}
     pdf = generate_pdf(report)
     return send_file(pdf, mimetype="application/pdf", as_attachment=True,
-                     download_name=f"{report.get('invoice_id', 'Q')}.pdf")
+                     download_name=f"{report.get('invoice_id', 'Quittung')}.pdf")
 
 def generate_pdf(report):
     buf = io.BytesIO()
@@ -534,16 +653,18 @@ def generate_pdf(report):
         story = []
         ts = ParagraphStyle('T', parent=styles['Heading1'], fontSize=18, textColor=colors.HexColor("#2563eb"))
         ms = ParagraphStyle('M', parent=styles['Normal'], fontSize=9, textColor=colors.HexColor("#64748b"), spaceAfter=12)
-        story.append(Paragraph("Smart Power Hub - Quittung", ts))
-        story.append(Paragraph(f"Nr: {report.get('invoice_id')} | {report.get('date')} | {STROMPREIS_PER_KWH:.2f} EUR/kWh", ms))
+        story.append(Paragraph("Smart Power Hub - Stromquittung", ts))
+        story.append(Paragraph(f"Nr: {report.get('invoice_id')} | Datum: {report.get('date')} | Tarif: {STROMPREIS_PER_KWH:.2f} €/kWh", ms))
         story.append(HRFlowable(width="100%", thickness=1.5, color=colors.HexColor("#2563eb"), spaceAfter=14))
-        tbl = [["Pos", "Geraet", "Dauer", "Wh", "EUR"]]
+        tbl = [["Pos", "Gerät & Modus", "Dauer", "Wh", "Betrag (€)"]]
         for i, d in enumerate(report.get("devices", []), 1):
-            tbl.append([str(i), d.get("ai_name", "Geraet"), fmt_time(d.get("duration_sec", 0)),
-                        f"{d.get('wh', 0):.3f}", f"{d.get('cost', 0):.5f}"])
-        tbl.append(["", "GESAMT", fmt_time(report.get("total_seconds", 0)),
-                     f"{report.get('total_wh', 0):.4f}", f"{report.get('total_cost', 0):.5f}"])
-        t = Table(tbl, colWidths=[30, 210, 80, 100, 90])
+            m_label = "Akku" if d.get("is_battery") else "Dauerbetrieb"
+            tbl.append([str(i), f"{d.get('icon','🔌')} {d.get('name','Gerät')} ({m_label})",
+                        fmt_time(d.get("duration_sec", 0)),
+                        f"{d.get('wh', 0):.3f} Wh", f"{d.get('cost', 0):.5f} €"])
+        tbl.append(["", "GESAMTSUMME", fmt_time(report.get("total_seconds", 0)),
+                     f"{report.get('total_wh', 0):.4f} Wh", f"{report.get('total_cost', 0):.5f} €"])
+        t = Table(tbl, colWidths=[30, 220, 80, 90, 90])
         t.setStyle(TableStyle([
             ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#f1f5f9")),
             ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
@@ -562,15 +683,13 @@ def generate_pdf(report):
     buf.seek(0)
     return buf
 
-
-# --- EMAIL ---
 @app.route('/send_email_invoice', methods=['POST'])
 def send_email():
     data = request.get_json() or {}
     email_to = data.get("email")
     report = data.get("report") or charge.get("last_report") or {}
     if not email_to or "@" not in email_to:
-        return jsonify({"status": "error", "message": "Ungueltige E-Mail"})
+        return jsonify({"status": "error", "message": "Ungültige E-Mail"})
     if not SMTP_USER:
         return jsonify({"status": "error", "message": "SMTP nicht konfiguriert."})
     try:
@@ -578,7 +697,7 @@ def send_email():
         msg = MIMEMultipart()
         msg["From"] = SMTP_USER; msg["To"] = email_to
         msg["Subject"] = f"Quittung {report.get('invoice_id', '')}"
-        msg.attach(MIMEText(f"Betrag: {report.get('total_cost',0):.5f} EUR", "plain", "utf-8"))
+        msg.attach(MIMEText(f"Gesamtbetrag: {report.get('total_cost',0):.5f} EUR", "plain", "utf-8"))
         att = MIMEApplication(pdf.read(), _subtype="pdf")
         att.add_header("Content-Disposition", "attachment", filename="Quittung.pdf")
         msg.attach(att)
@@ -588,8 +707,22 @@ def send_email():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)})
 
+@app.route('/debug')
+def debug():
+    elapsed = get_elapsed()
+    return jsonify({
+        "shelly": dict(shelly),
+        "charge_active": charge["active"],
+        "charge_paused": charge["paused"],
+        "accumulated_seconds": charge["accumulated_seconds"],
+        "elapsed_calculated": round(elapsed, 1),
+        "total_wh": charge["total_wh"],
+        "total_cost": charge["total_cost"],
+        "devices": charge["devices"],
+        "ai_result": charge["ai_result"],
+        "server_time": time.time()
+    })
 
-# --- ADMIN ---
 @app.route(f'/admin/{ADMIN_SECRET_TOKEN}')
 def admin():
     today = time.strftime('%d.%m.%Y')
@@ -626,7 +759,7 @@ def admin_override():
 
 
 # =====================================================================
-# HTML TEMPLATES
+# HTML UI TEMPLATES (WYSIWYG ADAPTIV)
 # =====================================================================
 
 LOCK_HTML = """<!DOCTYPE html>
@@ -646,7 +779,7 @@ p{font-size:13.5px;color:#94a3b8;line-height:1.5;margin-bottom:20px}
 </style></head><body>
 <div class="card">
 <div style="font-size:54px">🔒</div>
-<h1>Vor-Ort-Sicherheitspruefung</h1>
+<h1>Vor-Ort-Sicherheitsprüfung</h1>
 <p>Scanne den QR-Code an der Ladestation.</p>
 <div class="tbox"><div class="tlbl">Token:</div><div class="tcode">{{ required_token }}</div></div>
 <a href="/scan/{{ required_token }}" class="btn">📲 Station freischalten</a>
@@ -658,14 +791,20 @@ MAIN_HTML = """<!DOCTYPE html>
 <html lang="de"><head><meta charset="utf-8"><title>Smart Power Hub</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <style>
-:root{--bg:#f8fafc;--card:#fff;--text:#090d16;--muted:#64748b;--blue:#2563eb;--green:#059669;--red:#dc2626;--border:#e2e8f0}
+:root{
+  --bg:#f8fafc;--card:#ffffff;--text:#090d16;--muted:#64748b;
+  --blue:#2563eb;--green:#059669;--amber:#d97706;--red:#dc2626;
+  --border:#e2e8f0;--indigo:#4f46e5;--emerald:#10b981;
+}
 *{box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:0;padding:0}
 body{background:var(--bg);color:var(--text);display:flex;justify-content:center;padding:18px 12px;min-height:100vh}
 .wrap{width:100%;max-width:440px}
-.card{background:var(--card);border-radius:24px;padding:22px 18px;box-shadow:0 12px 30px -6px rgba(15,23,42,.08);border:1px solid var(--border)}
-.hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+.card{background:var(--card);border-radius:24px;padding:22px 18px;box-shadow:0 12px 30px -6px rgba(15,23,42,.08);border:1px solid var(--border);position:relative;overflow:hidden}
+
+.hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
 .brand{font-size:18px;font-weight:800;letter-spacing:-.3px}
 .rate{background:#f1f5f9;color:var(--muted);font-size:11.5px;padding:4px 10px;border-radius:20px;font-weight:700}
+
 .badges{display:flex;justify-content:center;gap:8px;flex-wrap:wrap;margin-bottom:14px}
 .pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:700;padding:5px 13px;border-radius:30px}
 .pill-g{background:#ecfdf5;color:#065f46;border:1px solid #a7f3d0}
@@ -676,18 +815,49 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 .pill-on .dot{background:#059669;box-shadow:0 0 8px rgba(5,150,105,.7)}
 .pill-p .dot{background:#d97706}
 .pill-off .dot{background:#94a3b8}
-.ai-b{background:#f8fafc;border:1px solid var(--border);border-radius:18px;padding:16px;margin-bottom:14px}
-.ai-h{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
-.ai-l{font-size:10.5px;font-weight:800;text-transform:uppercase;color:var(--blue);letter-spacing:.6px;background:#eff6ff;padding:3px 8px;border-radius:6px}
-.ai-c{font-size:11px;color:var(--muted);font-weight:600}
-.ai-row{display:flex;align-items:center;gap:12px;margin-bottom:8px}
-.ai-i{font-size:34px}
-.ai-n{font-size:16px;font-weight:800}
-.ai-s{font-size:12px;font-weight:600;color:var(--blue);margin-top:2px}
-.ai-sub{font-size:11px;color:var(--muted);margin-top:2px}
-.soc-w{background:#e2e8f0;border-radius:10px;height:7px;overflow:hidden;margin-top:4px}
-.soc-f{background:linear-gradient(90deg,#2563eb,#10b981);height:100%;border-radius:10px;transition:width .6s}
-.soc-r{display:flex;justify-content:space-between;font-size:10.5px;color:var(--muted);margin-top:4px;font-weight:600}
+
+/* KI-VORSCHLAG & GERAETE-AUSWAHL */
+.ai-box{background:#f8fafc;border:1.5px solid var(--border);border-radius:18px;padding:14px;margin-bottom:14px;text-align:left;transition:border-color .2s}
+.ai-box.confirmed{border-color:#bbf7d0;background:#f0fdf4}
+.ai-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.ai-tag{font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.5px;padding:3px 8px;border-radius:6px;background:#eff6ff;color:var(--blue)}
+.ai-box.confirmed .ai-tag{background:#dcfce7;color:#15803d}
+.ai-conf{font-size:11px;color:var(--muted);font-weight:600}
+
+.ai-main{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+.ai-ico{font-size:32px;line-height:1}
+.ai-title{font-size:15.5px;font-weight:800;color:var(--text)}
+.ai-mode-badge{display:inline-block;font-size:10.5px;font-weight:700;padding:2px 7px;border-radius:10px;margin-top:2px}
+.badge-cont{background:#e0e7ff;color:#3730a3}
+.badge-batt{background:#d1fae5;color:#065f46}
+
+.ai-reason{font-size:11.5px;color:var(--muted);margin-bottom:10px;line-height:1.4}
+.ai-actions{display:flex;gap:8px}
+.btn-confirm{flex:1;background:#059669;color:#fff;border:none;border-radius:10px;padding:8px 12px;font-size:12.5px;font-weight:700;cursor:pointer}
+.btn-change{background:#f1f5f9;color:var(--text);border:1px solid var(--border);border-radius:10px;padding:8px 12px;font-size:12.5px;font-weight:700;cursor:pointer}
+
+/* WYSIWYG ADAPTIVES PROGNOSE-PANEL */
+.prognosis-panel{border-radius:18px;padding:14px;margin-bottom:14px;text-align:left;animation:fadein .25s ease-out}
+@keyframes fadein{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
+
+/* 1. DAUERBETRIEB LOOK */
+.panel-continuous{background:#f8fafc;border:1.5px solid #cbd5e1}
+.panel-continuous .prog-head{color:#334155;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;display:flex;align-items:center;gap:6px}
+.panel-continuous .prog-val-big{font-size:22px;font-weight:800;color:#1e293b;font-variant-numeric:tabular-nums;font-family:ui-monospace,monospace}
+.panel-continuous .prog-sub{font-size:11.5px;color:#64748b;margin-top:4px}
+.prog-grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}
+.prog-chip{background:#ffffff;border:1px solid #e2e8f0;border-radius:12px;padding:8px 10px}
+.prog-chip .lbl{font-size:10px;font-weight:700;color:#64748b;text-transform:uppercase}
+.prog-chip .val{font-size:14.5px;font-weight:800;color:#0f172a;margin-top:2px;font-family:ui-monospace,monospace}
+
+/* 2. AKKU-LADEMODUS LOOK */
+.panel-battery{background:#ecfdf5;border:1.5px solid #a7f3d0}
+.panel-battery .prog-head{color:#065f46;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;display:flex;align-items:center;gap:6px}
+.soc-track{background:#d1fae5;height:9px;border-radius:10px;overflow:hidden;margin:8px 0 4px}
+.soc-bar{background:linear-gradient(90deg,#059669,#10b981);height:100%;border-radius:10px;transition:width .5s ease}
+.soc-labels{display:flex;justify-content:space-between;font-size:11px;font-weight:700;color:#065f46}
+
+/* TELEMETRIE-GRID */
 .g2{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px}
 .st{background:#f8fafc;border:1px solid var(--border);border-radius:16px;padding:12px;text-align:left}
 .st-l{font-size:10.5px;font-weight:700;text-transform:uppercase;color:var(--muted);letter-spacing:.4px}
@@ -695,17 +865,28 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 .st-s{font-size:10.5px;color:var(--muted);margin-top:2px}
 .bl .st-v{color:var(--blue)}
 .gr .st-v{color:var(--green)}
+
+/* BUTTONS */
 .btns{display:flex;flex-direction:column;gap:8px;margin-top:14px}
 .btn{width:100%;padding:13px;font-size:14.5px;font-weight:700;border:none;border-radius:14px;cursor:pointer;transition:transform .1s}
 .btn:active{transform:scale(.98)}
 .bp{background:#0f172a;color:#fff}
 .bs{background:#f1f5f9;color:var(--text);border:1px solid var(--border)}
 .bd{background:#fee2e2;color:var(--red)}
-.modal{display:none;position:fixed;inset:0;background:rgba(9,13,22,.75);backdrop-filter:blur(5px);z-index:999;padding:20px;align-items:center;justify-content:center}
-.mbox{background:#fff;border-radius:24px;padding:24px 20px;text-align:center;max-width:360px;width:100%;animation:pop .25s ease-out}
-@keyframes pop{from{transform:scale(.88);opacity:0}to{transform:scale(1);opacity:1}}
-.mbox h3{font-size:17px;margin-bottom:6px}
-.mbox p{font-size:12.5px;color:var(--muted);margin-bottom:16px}
+
+/* MODAL: SCHNELLAUSWAHL GERAET */
+.modal{display:none;position:fixed;inset:0;background:rgba(9,13,22,.75);backdrop-filter:blur(5px);z-index:999;padding:16px;align-items:center;justify-content:center}
+.mbox{background:#fff;border-radius:24px;padding:22px 18px;text-align:left;max-width:390px;width:100%;max-height:90vh;overflow-y:auto;animation:pop .2s ease-out}
+@keyframes pop{from{transform:scale(.9);opacity:0}to{transform:scale(1);opacity:1}}
+.m-sec-title{font-size:11px;font-weight:800;text-transform:uppercase;color:var(--muted);letter-spacing:.5px;margin:12px 0 6px}
+.dev-option{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border:1px solid var(--border);border-radius:12px;margin-bottom:6px;cursor:pointer;background:#ffffff;transition:background .15s, border-color .15s}
+.dev-option:hover{background:#f8fafc;border-color:var(--blue)}
+.dev-opt-left{display:flex;align-items:center;gap:10px}
+.dev-opt-ico{font-size:22px}
+.dev-opt-nm{font-size:13.5px;font-weight:700;color:var(--text)}
+.dev-opt-sub{font-size:11px;color:var(--muted)}
+.dev-opt-tag{font-size:10px;font-weight:700;padding:3px 7px;border-radius:6px}
+
 .receipt{display:none}
 .rtbl{width:100%;border-collapse:collapse;margin:14px 0;font-size:12.5px}
 .rtbl th{background:#f1f5f9;padding:8px;font-size:11px;text-transform:uppercase;color:var(--muted)}
@@ -714,66 +895,188 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 .ein{width:100%;padding:11px;border:1px solid var(--border);border-radius:10px;font-size:13.5px;margin-bottom:8px}
 </style></head><body>
 
-<div id="swapM" class="modal"><div class="mbox" style="border:2px solid var(--blue)">
+<!-- MODAL: GERAET WAHLEN -->
+<div id="devModal" class="modal">
+<div class="mbox">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+  <div style="font-size:16px;font-weight:800">⚡ Gerät / Modus wählen</div>
+  <button style="background:none;border:none;font-size:20px;cursor:pointer;color:var(--muted)" onclick="hideM('devModal')">✕</button>
+</div>
+<p style="font-size:12px;color:var(--muted);margin-bottom:12px">Wähle den passenden Typ, damit die Web App die Prognosen (24h Dauerbetrieb vs. Akku 100%) anpasst.</p>
+
+<div class="m-sec-title">🔌 Dauerbetrieb (ohne Akku)</div>
+<div class="dev-option" onclick="chooseDevice('lamp')">
+  <div class="dev-opt-left"><span class="dev-opt-ico">💡</span><div><div class="dev-opt-nm">Lampe / Beleuchtung</div><div class="dev-opt-sub">Stetige Last ca. 5–30 W</div></div></div>
+  <span class="dev-opt-tag badge-cont">Dauerbetrieb</span>
+</div>
+<div class="dev-option" onclick="chooseDevice('tv')">
+  <div class="dev-opt-left"><span class="dev-opt-ico">📺</span><div><div class="dev-opt-nm">TV / Monitor / Audio</div><div class="dev-opt-sub">Stetige Last ca. 30–120 W</div></div></div>
+  <span class="dev-opt-tag badge-cont">Dauerbetrieb</span>
+</div>
+<div class="dev-option" onclick="chooseDevice('appliance_s')">
+  <div class="dev-opt-left"><span class="dev-opt-ico">☕</span><div><div class="dev-opt-nm">Kleingerät / Router</div><div class="dev-opt-sub">Stetige Last ca. 10–250 W</div></div></div>
+  <span class="dev-opt-tag badge-cont">Dauerbetrieb</span>
+</div>
+<div class="dev-option" onclick="chooseDevice('appliance')">
+  <div class="dev-opt-left"><span class="dev-opt-ico">🍳</span><div><div class="dev-opt-nm">Großgerät / Dauerlast</div><div class="dev-opt-sub">Hohe Last > 250 W</div></div></div>
+  <span class="dev-opt-tag badge-cont">Dauerbetrieb</span>
+</div>
+
+<div class="m-sec-title">🔋 Akku-Geräte (Ladevorgang)</div>
+<div class="dev-option" onclick="chooseDevice('phone')">
+  <div class="dev-opt-left"><span class="dev-opt-ico">📱</span><div><div class="dev-opt-nm">Smartphone / Tablet</div><div class="dev-opt-sub">Akku ca. 18 Wh (5–25 W)</div></div></div>
+  <span class="dev-opt-tag badge-batt">Akku</span>
+</div>
+<div class="dev-option" onclick="chooseDevice('laptop')">
+  <div class="dev-opt-left"><span class="dev-opt-ico">💻</span><div><div class="dev-opt-nm">Laptop / Ultrabook</div><div class="dev-opt-sub">Akku ca. 65 Wh (30–90 W)</div></div></div>
+  <span class="dev-opt-tag badge-batt">Akku</span>
+</div>
+<div class="dev-option" onclick="chooseDevice('ebike')">
+  <div class="dev-opt-left"><span class="dev-opt-ico">🚲</span><div><div class="dev-opt-nm">E-Bike Akku</div><div class="dev-opt-sub">Akku ca. 500 Wh (100–250 W)</div></div></div>
+  <span class="dev-opt-tag badge-batt">Akku</span>
+</div>
+<div class="dev-option" onclick="chooseDevice('ebike_fast')">
+  <div class="dev-opt-left"><span class="dev-opt-ico">⚡</span><div><div class="dev-opt-nm">E-Bike Schnelllader</div><div class="dev-opt-sub">Akku ca. 750 Wh (> 300 W)</div></div></div>
+  <span class="dev-opt-tag badge-batt">Akku</span>
+</div>
+<div class="dev-option" onclick="chooseDevice('battery_custom')">
+  <div class="dev-opt-left"><span class="dev-opt-ico">🔋</span><div><div class="dev-opt-nm">Sonstiger Akku</div><div class="dev-opt-sub">Akku ca. 80 Wh</div></div></div>
+  <span class="dev-opt-tag badge-batt">Akku</span>
+</div>
+
+<button class="btn bs" style="margin-top:12px;padding:10px" onclick="hideM('devModal')">Abbrechen</button>
+</div>
+</div>
+
+<!-- MODAL: GERAET WECHSELN BEI PAUSE -->
+<div id="swapM" class="modal"><div class="mbox" style="border:2px solid var(--blue);text-align:center">
 <div style="font-size:38px;margin-bottom:6px">🔄🔌</div>
-<h3>Pause / Geraet wechseln</h3><p>Wie fortfahren?</p>
-<button class="btn bp" style="background:var(--green);margin-bottom:8px" onclick="devAct('continue')">▶️ Gleiches Geraet</button>
-<button class="btn bp" style="background:var(--blue);margin-bottom:8px" onclick="startNew()">➕ Neues Geraet</button>
-<button class="btn bd" onclick="devAct('finish')">🧾 Beenden</button>
+<h3 style="font-size:17px;margin-bottom:6px">Pause / Gerät gewechselt</h3>
+<p style="font-size:12.5px;color:var(--muted);margin-bottom:16px">Wie möchtest du fortfahren?</p>
+<button class="btn bp" style="background:var(--green);margin-bottom:8px" onclick="devAct('continue')">▶️ Gleiches Gerät fortsetzen</button>
+<button class="btn bp" style="background:var(--blue);margin-bottom:8px" onclick="startNew()">➕ Neues Gerät anschließen</button>
+<button class="btn bd" onclick="devAct('finish')">🧾 Beenden & Quittung</button>
 </div></div>
 
+<!-- HAUPTANSICHT -->
 <div class="wrap">
 <div class="card" id="mainC">
-<div class="hdr"><span class="brand">⚡ Smart Power Hub</span><span class="rate">{{ strompreis }} EUR/kWh</span></div>
+<div class="hdr">
+  <span class="brand">⚡ Smart Power Hub</span>
+  <span class="rate">{{ strompreis }} €/kWh</span>
+</div>
+
 <div class="badges">
-<span class="pill pill-g">🔒 Verifiziert</span>
-<span class="pill pill-off" id="sPill"><span class="dot"></span><span id="sTxt">Bereit</span></span>
+  <span class="pill pill-g">🔒 Verifiziert</span>
+  <span class="pill pill-off" id="sPill"><span class="dot"></span><span id="sTxt">Bereit</span></span>
 </div>
 
-<div class="ai-b">
-<div class="ai-h"><span class="ai-l">⚡ KI-Erkennung</span><span class="ai-c" id="aiC">Warte...</span></div>
-<div class="ai-row"><div class="ai-i" id="aiI">🔌</div><div><div class="ai-n" id="aiN">Automatische Erkennung</div><div class="ai-s" id="aiS">Start druecken</div><div class="ai-sub" id="aiSub">KI analysiert den Stromfluss</div></div></div>
-<div id="socSec" style="display:none"><div class="soc-w"><div class="soc-f" id="socF" style="width:5%"></div></div><div class="soc-r"><span>Ladestand: <b id="socP">5%</b></span><span id="socE"></span></div></div>
+<!-- KI-VORSCHLAG & GERAETE-LEISTE -->
+<div class="ai-box" id="aiBox">
+  <div class="ai-top">
+    <span class="ai-tag" id="aiTag">⚡ KI-Erkennung</span>
+    <span class="ai-conf" id="aiConf">Sammle Daten...</span>
+  </div>
+  <div class="ai-main">
+    <div class="ai-ico" id="aiIco">💡</div>
+    <div>
+      <div class="ai-title" id="aiTitle">Lampe / Beleuchtung</div>
+      <span class="ai-mode-badge badge-cont" id="aiModeBadge">Dauerbetrieb</span>
+    </div>
+  </div>
+  <div class="ai-reason" id="aiReason">Analyse des Stromflusses läuft...</div>
+  <div class="ai-actions">
+    <button class="btn-confirm" id="btnConfirm" onclick="confirmSuggestion()">✅ Bestätigen</button>
+    <button class="btn-change" onclick="showM('devModal')">✏️ Ändern</button>
+  </div>
 </div>
 
+<!-- WYSIWYG ADAPTIVES PROGNOSE-PANEL -->
+<div id="prognosisContainer">
+  <!-- 1. DAUERBETRIEB PROGNOSE -->
+  <div id="panelContinuous" class="prognosis-panel panel-continuous">
+    <div class="prog-head">🔌 24h Dauerbetrieb Prognose</div>
+    <div style="display:flex;justify-content:space-between;align-items:baseline">
+      <div class="prog-val-big"><span id="p24Wh">0.0</span> Wh <span style="font-size:14px;color:#64748b">/ 24h</span></div>
+      <div style="font-size:18px;font-weight:800;color:#059669"><span id="p24Cost">0.00</span> € <span style="font-size:12px;color:#64748b">/ Tag</span></div>
+    </div>
+    <div class="prog-sub">Hochrechnung bei gleichbleibender Dauerlast (<span id="p24Watt">0.0</span> W)</div>
+    <div class="prog-grid2">
+      <div class="prog-chip">
+        <div class="lbl">Verbrauch / 24h</div>
+        <div class="val" id="p24Kwh">0.000 kWh</div>
+      </div>
+      <div class="prog-chip">
+        <div class="lbl">Kosten / 30 Tage</div>
+        <div class="val" style="color:#2563eb" id="p30Cost">0.00 €</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 2. AKKU-LADEMODUS PROGNOSE -->
+  <div id="panelBattery" class="prognosis-panel panel-battery" style="display:none">
+    <div class="prog-head">🔋 Akku-Ladefortschritt & Restbedarf bis 100%</div>
+    <div class="soc-track"><div class="soc-bar" id="socBar" style="width:10%"></div></div>
+    <div class="soc-labels">
+      <span>Ladestand: <b id="socPctText">10%</b></span>
+      <span id="socEtaText">~ -- Min</span>
+    </div>
+    <div class="prog-grid2" style="margin-top:10px">
+      <div class="prog-chip">
+        <div class="lbl">Noch bis 100% voll</div>
+        <div class="val" style="color:#059669" id="battWhNeeded">-- Wh</div>
+      </div>
+      <div class="prog-chip">
+        <div class="lbl">Rest-Ladekosten</div>
+        <div class="val" id="battCostNeeded">-- €</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- TELEMETRIE-WERTE -->
 <div class="g2">
-<div class="st"><div class="st-l">Spannung (U)</div><div class="st-v"><span id="volt">230.0</span> V</div></div>
-<div class="st"><div class="st-l">Strom (I)</div><div class="st-v"><span id="amp">0.000</span> A</div><div class="st-s"><span id="ma">0</span> mA</div></div>
+  <div class="st"><div class="st-l">Spannung (U)</div><div class="st-v"><span id="volt">230.0</span> V</div></div>
+  <div class="st"><div class="st-l">Strom (I)</div><div class="st-v"><span id="amp">0.000</span> A</div><div class="st-s"><span id="ma">0</span> mA</div></div>
 </div>
 <div class="g2">
-<div class="st bl"><div class="st-l">Leistung (P)</div><div class="st-v"><span id="watt">0.000</span> W</div><div class="st-s" id="wSub">Kein Strom</div></div>
-<div class="st"><div class="st-l">Laufzeit</div><div class="st-v" id="timer">00:00:00</div></div>
+  <div class="st bl"><div class="st-l">Wirkleistung (P)</div><div class="st-v"><span id="watt">0.000</span> W</div><div class="st-s" id="wSub">Kein Strom</div></div>
+  <div class="st"><div class="st-l">Laufzeit</div><div class="st-v" id="timer">00:00:00</div></div>
 </div>
 <div class="g2">
-<div class="st bl"><div class="st-l">Verbrauch</div><div class="st-v"><span id="wh">0.0000</span> Wh</div><div class="st-s"><span id="mwh">0.0</span> mWh</div></div>
-<div class="st gr"><div class="st-l">Kosten</div><div class="st-v"><span id="cost">0.00000</span> EUR</div><div class="st-s"><span id="cent">0.000</span> Cent</div></div>
+  <div class="st bl"><div class="st-l">Verbrauch (Wh)</div><div class="st-v"><span id="wh">0.0000</span> Wh</div><div class="st-s"><span id="mwh">0.0</span> mWh</div></div>
+  <div class="st gr"><div class="st-l">Bisherige Kosten</div><div class="st-v"><span id="cost">0.00000</span> €</div><div class="st-s"><span id="cent">0.000</span> Cent</div></div>
 </div>
 
 <div class="btns">
-<button class="btn bp" onclick="doStart()">▶️ Start / Fortsetzen</button>
-<button class="btn bs" onclick="doStop()">⏸️ Pause</button>
-<button class="btn bs" style="background:#eff6ff;color:var(--blue);border-color:#bfdbfe" onclick="showM('swapM')">🔄 Geraet wechseln</button>
-<button class="btn bd" onclick="devAct('finish')">🧾 Beenden & Quittung</button>
+  <button class="btn bp" onclick="doStart()">▶️ Start / Fortsetzen</button>
+  <button class="btn bs" onclick="doStop()">⏸️ Pause</button>
+  <button class="btn bs" style="background:#eff6ff;color:var(--blue);border-color:#bfdbfe" onclick="showM('swapM')">🔄 Gerät wechseln</button>
+  <button class="btn bd" onclick="devAct('finish')">🧾 Beenden & Quittung</button>
 </div>
 </div>
 
+<!-- QUITTUNGS-ANSICHT -->
 <div class="card receipt" id="recC" style="margin-top:0">
 <div style="text-align:center;margin-bottom:18px">
-<div style="font-size:44px;margin-bottom:6px">🧾</div>
-<div style="font-size:20px;font-weight:800">Stromquittung</div>
+  <div style="font-size:44px;margin-bottom:6px">🧾</div>
+  <div style="font-size:20px;font-weight:800">Stromquittung</div>
 </div>
-<table class="rtbl"><thead><tr><th>Geraet</th><th style="text-align:center">Dauer</th><th style="text-align:right">Wh</th><th style="text-align:right">EUR</th></tr></thead><tbody id="recB"></tbody></table>
+<table class="rtbl">
+  <thead><tr><th>Gerät</th><th style="text-align:center">Dauer</th><th style="text-align:right">Wh</th><th style="text-align:right">EUR</th></tr></thead>
+  <tbody id="recB"></tbody>
+</table>
 <div class="tbox">
-<div style="font-size:11px;color:#166534;font-weight:700">GESAMTBETRAG</div>
-<div style="font-size:24px;font-weight:800;color:#15803d" id="rCost">0 EUR</div>
-<div style="font-size:11px;color:#166534;margin-top:2px"><span id="rWh">0</span> Wh (<span id="rKwh">0</span> kWh)</div>
+  <div style="font-size:11px;color:#166534;font-weight:700">GESAMTBETRAG</div>
+  <div style="font-size:24px;font-weight:800;color:#15803d" id="rCost">0 EUR</div>
+  <div style="font-size:11px;color:#166534;margin-top:2px"><span id="rWh">0</span> Wh (<span id="rKwh">0</span> kWh)</div>
 </div>
 <div style="margin-top:18px;background:#f8fafc;border:1px solid var(--border);border-radius:14px;padding:14px">
-<div style="font-size:12px;font-weight:700;margin-bottom:6px">📧 Quittung per E-Mail:</div>
-<input type="email" id="emIn" class="ein" placeholder="deine@email.de">
-<button class="btn bp" style="background:var(--blue);font-size:13.5px;padding:11px" onclick="sendEm()">Senden</button>
-<button class="btn bs" style="font-size:13px;padding:9px;margin-top:6px" onclick="window.open('/download_invoice','_blank')">📥 PDF</button>
-<div id="emFb" style="display:none;font-size:12px;font-weight:600;margin-top:8px"></div>
+  <div style="font-size:12px;font-weight:700;margin-bottom:6px">📧 Quittung per E-Mail:</div>
+  <input type="email" id="emIn" class="ein" placeholder="deine@email.de">
+  <button class="btn bp" style="background:var(--blue);font-size:13.5px;padding:11px" onclick="sendEm()">Senden</button>
+  <button class="btn bs" style="font-size:13px;padding:9px;margin-top:6px" onclick="window.open('/download_invoice','_blank')">📥 PDF</button>
+  <div id="emFb" style="display:none;font-size:12px;font-weight:600;margin-top:8px"></div>
 </div>
 </div>
 </div>
@@ -783,6 +1086,9 @@ var done = false, lastR = null;
 var localElapsed = 0;
 var isChargingActive = false;
 var localTimerInterval = null;
+var STROMPREIS = 0.35;
+var currentDevice = { mode: 'continuous', is_battery: false, nominal_wh: 0, user_confirmed: false };
+var latestAiSuggestion = null;
 
 function fs(s){
   s = Math.floor(Math.max(0, s));
@@ -814,8 +1120,8 @@ function stopLocalTimer(){
   }
 }
 
-function showM(id){document.getElementById(id).style.display='flex'}
-function hideM(id){document.getElementById(id).style.display='none'}
+function showM(id){ document.getElementById(id).style.display = 'flex'; }
+function hideM(id){ document.getElementById(id).style.display = 'none'; }
 
 function post(u,d){
   return fetch(u, {
@@ -859,6 +1165,98 @@ function devAct(a){
   }
 }
 
+function chooseDevice(key){
+  hideM('devModal');
+  post('/set_device', { key: key, confirmed: true }).then(function(res){
+    if(res.status === 'ok' && res.device){
+      currentDevice = res.device;
+      updateWysiwygLook(currentDevice, parseFloat(document.getElementById('watt').innerText) || 0, parseFloat(document.getElementById('wh').innerText) || 0);
+    }
+    poll();
+  });
+}
+
+function confirmSuggestion(){
+  if(!latestAiSuggestion) return;
+  post('/set_device', { key: latestAiSuggestion.suggested_key, confirmed: true }).then(function(res){
+    if(res.status === 'ok' && res.device){
+      currentDevice = res.device;
+      updateWysiwygLook(currentDevice, parseFloat(document.getElementById('watt').innerText) || 0, parseFloat(document.getElementById('wh').innerText) || 0);
+    }
+    poll();
+  });
+}
+
+function updateWysiwygLook(dev, curW, curWh){
+  var isBatt = dev.is_battery || dev.mode === 'battery';
+  var pCont = document.getElementById('panelContinuous');
+  var pBatt = document.getElementById('panelBattery');
+
+  // AI Box Styling & Status
+  var aiBox = document.getElementById('aiBox');
+  var aiTag = document.getElementById('aiTag');
+  var btnConf = document.getElementById('btnConfirm');
+  var aiIco = document.getElementById('aiIco');
+  var aiTitle = document.getElementById('aiTitle');
+  var aiModeBadge = document.getElementById('aiModeBadge');
+
+  aiIco.innerText = dev.icon || '🔌';
+  aiTitle.innerText = dev.name || 'Gerät';
+
+  if(isBatt){
+    aiModeBadge.className = 'ai-mode-badge badge-batt';
+    aiModeBadge.innerText = '🔋 Akku-Lademodus';
+  } else {
+    aiModeBadge.className = 'ai-mode-badge badge-cont';
+    aiModeBadge.innerText = '🔌 Dauerbetrieb';
+  }
+
+  if(dev.user_confirmed){
+    aiBox.className = 'ai-box confirmed';
+    aiTag.innerText = '✓ Bestätigt';
+    btnConf.style.display = 'none';
+  } else {
+    aiBox.className = 'ai-box';
+    aiTag.innerText = '⚡ KI-Vorschlag';
+    btnConf.style.display = 'inline-block';
+  }
+
+  // UMSCHALTEN DES WYSIWYG PROGNOSE-PANELS
+  if(isBatt){
+    pCont.style.display = 'none';
+    pBatt.style.display = 'block';
+
+    var nomWh = dev.nominal_wh || 65.0;
+    var loadedWh = curWh || 0.0;
+    var whNeeded = Math.max(0.0, nomWh - loadedWh);
+    var socPct = Math.min(100, Math.max(5, Math.round((loadedWh / nomWh) * 100)));
+    if(loadedWh >= nomWh) socPct = 100;
+
+    var etaMin = curW > 0.5 ? Math.round((whNeeded / curW) * 60) : 0;
+    var costNeeded = (whNeeded / 1000.0) * STROMPREIS;
+
+    document.getElementById('socBar').style.width = socPct + '%';
+    document.getElementById('socPctText').innerText = socPct + '%';
+    document.getElementById('socEtaText').innerText = curW > 0.5 ? ('Restzeit: ~' + etaMin + ' Min') : 'Warte auf Strom...';
+    document.getElementById('battWhNeeded').innerText = whNeeded.toFixed(2) + ' Wh';
+    document.getElementById('battCostNeeded').innerText = '+' + costNeeded.toFixed(4) + ' €';
+  } else {
+    pBatt.style.display = 'none';
+    pCont.style.display = 'block';
+
+    var p24_wh = curW * 24.0;
+    var p24_kwh = p24_wh / 1000.0;
+    var p24_cost = p24_kwh * STROMPREIS;
+    var p30_cost = p24_cost * 30.0;
+
+    document.getElementById('p24Wh').innerText = p24_wh.toFixed(1);
+    document.getElementById('p24Cost').innerText = p24_cost.toFixed(2);
+    document.getElementById('p24Watt').innerText = curW.toFixed(1);
+    document.getElementById('p24Kwh').innerText = p24_kwh.toFixed(3) + ' kWh';
+    document.getElementById('p30Cost').innerText = p30_cost.toFixed(2) + ' €';
+  }
+}
+
 function showReceipt(rp){
   done = true;
   isChargingActive = false;
@@ -869,8 +1267,9 @@ function showReceipt(rp){
   var tb = document.getElementById('recB');
   tb.innerHTML = '';
   (rp.devices || []).forEach(function(d){
+    var m = d.is_battery ? 'Akku' : 'Dauerbetrieb';
     var tr = document.createElement('tr');
-    tr.innerHTML = '<td><b>' + (d.ai_icon || '🔌') + ' ' + (d.ai_name || 'Geraet') + '</b></td><td style="text-align:center">' + fs(d.duration_sec || 0) + '</td><td style="text-align:right">' + (d.wh || 0).toFixed(3) + '</td><td style="text-align:right"><b>' + (d.cost || 0).toFixed(5) + '</b></td>';
+    tr.innerHTML = '<td><b>' + (d.icon || '🔌') + ' ' + (d.name || 'Gerät') + '</b><br><span style="font-size:10.5px;color:#64748b">' + m + '</span></td><td style="text-align:center">' + fs(d.duration_sec || 0) + '</td><td style="text-align:right">' + (d.wh || 0).toFixed(3) + '</td><td style="text-align:right"><b>' + (d.cost || 0).toFixed(5) + '</b></td>';
     tb.appendChild(tr);
   });
   document.getElementById('rCost').innerText = (rp.total_cost || 0).toFixed(5) + ' EUR';
@@ -887,14 +1286,15 @@ function poll(){
     }
 
     var srvSec = d.elapsed_seconds || 0;
+    var curW = d.watt || 0.0;
+    var curWh = d.wh || 0.0;
 
-    // Status-Steuerung & gleichmäßige Zeit-Synchronisation
+    // Timer-Synchronisation ohne Ruckeln
     if(d.active){
       isChargingActive = true;
       startLocalTimer();
       document.getElementById('sPill').className = 'pill pill-on';
       document.getElementById('sTxt').innerText = 'Aktiv';
-      // Nur bei nennenswerter Abweichung (> 2s) sanft nachjustieren, sonst läuft der lokale 1s-Takt gleichmäßig
       if(Math.abs(localElapsed - srvSec) > 2.0){
         localElapsed = Math.floor(srvSec);
         updateTimerDisplay();
@@ -917,32 +1317,26 @@ function poll(){
     document.getElementById('volt').innerText = (d.voltage || 230).toFixed(1);
     document.getElementById('amp').innerText = (d.current_ampere || 0).toFixed(3);
     document.getElementById('ma').innerText = ((d.current_ampere || 0) * 1000).toFixed(0);
-    document.getElementById('watt').innerText = (d.watt || 0).toFixed(3);
-    document.getElementById('wh').innerText = (d.wh || 0).toFixed(4);
-    document.getElementById('mwh').innerText = ((d.wh || 0) * 1000).toFixed(1);
+    document.getElementById('watt').innerText = curW.toFixed(3);
+    document.getElementById('wh').innerText = curWh.toFixed(4);
+    document.getElementById('mwh').innerText = (curWh * 1000).toFixed(1);
     document.getElementById('cost').innerText = (d.cost || 0).toFixed(5);
     document.getElementById('cent').innerText = ((d.cost || 0) * 100).toFixed(3);
-    document.getElementById('wSub').innerText = (d.watt > 0.1) ? 'Strom fliesst' : 'Kein Strom';
+    document.getElementById('wSub').innerText = (curW > 0.1) ? 'Strom fließt' : 'Kein Strom';
 
-    // KI-Geräteerkennung
-    var ai = d.ai_result || {};
-    document.getElementById('aiI').innerText = ai.icon || '🔌';
-    document.getElementById('aiN').innerText = ai.name || 'Erkenne...';
-    document.getElementById('aiS').innerText = ai.stage || 'Analyse';
-    var c = ai.confidence || 0;
-    document.getElementById('aiC').innerText = c > 0 ? ('Sicherheit: ' + c + '%') : 'Warte...';
-    document.getElementById('aiSub').innerText = ai.is_battery === true
-      ? ('Akku | Spitze: ' + (ai.peak_w || 0) + 'W')
-      : (ai.is_battery === false ? ('Dauerbetrieb | Avg ' + (ai.avg_w || 0) + 'W') : 'KI sammelt Daten...');
-
-    if(ai.is_battery === true && ai.soc_pct > 0){
-      document.getElementById('socSec').style.display = 'block';
-      document.getElementById('socF').style.width = Math.min(100, ai.soc_pct) + '%';
-      document.getElementById('socP').innerText = ai.soc_pct + '%';
-      document.getElementById('socE').innerText = ai.stage || '';
-    } else {
-      document.getElementById('socSec').style.display = 'none';
+    // KI-Vorschlag & Aktives Gerät
+    if(d.active_device){
+      currentDevice = d.active_device;
     }
+
+    latestAiSuggestion = d.ai_result || {};
+    var conf = latestAiSuggestion.confidence || 0;
+    document.getElementById('aiConf').innerText = conf > 0 ? ('Sicherheit: ' + conf + '%') : 'Sammle Daten...';
+    document.getElementById('aiReason').innerText = latestAiSuggestion.reason || 'Analyse des Stromflusses...';
+
+    // WYSIWYG Look anpassen
+    updateWysiwygLook(currentDevice, curW, curWh);
+
   }).catch(function(){});
 }
 
@@ -951,7 +1345,7 @@ function sendEm(){
   if(em.indexOf('@') < 0){
     fb.style.display = 'block';
     fb.style.color = '#dc2626';
-    fb.innerText = 'Gueltige E-Mail!';
+    fb.innerText = 'Gültige E-Mail eingeben!';
     return;
   }
   fb.style.display = 'block';
@@ -963,8 +1357,7 @@ function sendEm(){
   });
 }
 
-// Polling: alle 1 Sekunde
-setInterval(poll,1000);
+setInterval(poll, 1000);
 poll();
 </script></body></html>"""
 
@@ -999,7 +1392,7 @@ td{padding:10px;border-bottom:1px solid #1e293b}
 <div class="wrap">
 <div class="hdr"><div><div class="brand">⚡ Admin Dashboard</div><div style="font-size:12px;color:#94a3b8;margin-top:4px">Station: <code>{{ physical_token }}</code></div></div><span class="badge">Admin</span></div>
 <div class="g4">
-<div class="kpi"><div class="kpi-l">Umsatz</div><div class="kpi-v" style="color:#10b981">{{ "%.5f"|format(today_revenue) }} EUR</div><div class="kpi-s">Gesamt: {{ "%.5f"|format(total_revenue) }} EUR</div></div>
+<div class="kpi"><div class="kpi-l">Umsatz</div><div class="kpi-v" style="color:#10b981">{{ "%.5f"|format(today_revenue) }} €</div><div class="kpi-s">Gesamt: {{ "%.5f"|format(total_revenue) }} €</div></div>
 <div class="kpi"><div class="kpi-l">Energie</div><div class="kpi-v" style="color:#3b82f6">{{ "%.2f"|format(today_wh) }} Wh</div><div class="kpi-s">Gesamt: {{ "%.4f"|format(total_kwh) }} kWh</div></div>
 <div class="kpi"><div class="kpi-l">Sitzungen</div><div class="kpi-v">{{ today_sessions }}</div><div class="kpi-s">Gesamt: {{ total_sessions }}</div></div>
 <div class="kpi"><div class="kpi-l">Live</div><div class="kpi-v" style="color:{% if live_active %}#10b981{% else %}#94a3b8{% endif %}">{% if live_active %}AKTIV{% else %}BEREIT{% endif %}</div><div class="kpi-s">Relais: {% if relay_on %}EIN{% else %}AUS{% endif %}</div></div>
@@ -1014,8 +1407,8 @@ td{padding:10px;border-bottom:1px solid #1e293b}
 </div></div>
 <div class="sec">
 <div class="sec-t">Sitzungen</div>
-<table><thead><tr><th>Beleg</th><th>Datum</th><th>Geraet</th><th>Dauer</th><th>Wh</th><th>EUR</th></tr></thead>
-<tbody>{% for r in history_records|reverse %}<tr><td><code>{{ r.invoice_id }}</code></td><td>{{ r.date }}</td><td>{% for d in r.devices %}{{ d.ai_icon|default('🔌') }} {{ d.ai_name|default('?') }}<br>{% endfor %}</td><td>{{ r.time_formatted }}</td><td>{{ "%.3f"|format(r.total_wh) }}</td><td><b style="color:#10b981">{{ "%.5f"|format(r.total_cost) }}</b></td></tr>{% else %}<tr><td colspan="6" style="text-align:center;color:#94a3b8">Keine.</td></tr>{% endfor %}</tbody></table>
+<table><thead><tr><th>Beleg</th><th>Datum</th><th>Gerät</th><th>Dauer</th><th>Wh</th><th>EUR</th></tr></thead>
+<tbody>{% for r in history_records|reverse %}<tr><td><code>{{ r.invoice_id }}</code></td><td>{{ r.date }}</td><td>{% for d in r.devices %}{{ d.icon|default('🔌') }} {{ d.name|default('?') }} ({{ 'Akku' if d.is_battery else 'Dauerbetrieb' }})<br>{% endfor %}</td><td>{{ r.time_formatted }}</td><td>{{ "%.3f"|format(r.total_wh) }}</td><td><b style="color:#10b981">{{ "%.5f"|format(r.total_cost) }}</b></td></tr>{% else %}<tr><td colspan="6" style="text-align:center;color:#94a3b8">Keine.</td></tr>{% endfor %}</tbody></table>
 </div></div>
 <script>function ovr(a){fetch('/admin_api/override',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:a})}).then(function(r){return r.json()}).then(function(d){alert(d.message||'OK');location.reload()})}</script>
 </body></html>"""
