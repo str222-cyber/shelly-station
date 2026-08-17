@@ -1709,6 +1709,8 @@ def get_status():
 
     now = time.time()
     live_elapsed = u.get("accumulated_seconds", 0.0)
+    if u.get("active") and u.get("start_timestamp"):
+        live_elapsed = u.get("accumulated_seconds", 0.0) + (now - u["start_timestamp"])
 
     curr_idx = u.get("current_device_idx", 0)
     devices_copy = []
