@@ -627,8 +627,9 @@ def accumulate_energy():
             devs = charge.get("devices", [])
             prev_d = devs[curr_idx] if (0 <= curr_idx < len(devs)) else None
             
-            # Hat das vorherige Gerät bereits Energie geladen (> 0.04 Wh)?
-            if prev_d and prev_d.get("wh", 0) > 0.04:
+            # Neues separates Gerät NUR anlegen, wenn target_is_new explizit True gesetzt wurde!
+            if charge.get("target_is_new", False) and prev_d and prev_d.get("wh", 0) > 0.04:
+                charge["target_is_new"] = False
                 next_num = len(devs) + 1
                 charge["power_history"] = [(now, w)]
                 ai = DeviceAI.classify(charge["power_history"])
@@ -647,22 +648,16 @@ def accumulate_energy():
                 charge["devices"].append(new_dev)
                 charge["current_device_idx"] = len(charge["devices"]) - 1
                 charge["ai_result"] = ai
-                logger.info(f"⚡ Neues Gerät #{next_num} ({new_dev['name']}) gestartet ({w:.1f} W). Schonfrist aktiv bis +12s.")
+                logger.info(f"⚡ Neues separates Gerät #{next_num} ({new_dev['name']}) gestartet ({w:.1f} W).")
             else:
-                charge["power_history"] = [(now, w)]
-                ai = DeviceAI.classify(charge["power_history"])
-                s_key = ai.get("suggested_key", "phone")
-                prof = DEVICE_PROFILES.get(s_key, DEVICE_PROFILES["phone"])
-                if prev_d and not prev_d.get("user_confirmed", False):
-                    prev_d["key"] = s_key
-                    prev_d["raw_name"] = prof["name"]
-                    prev_d["name"] = f"Gerät {prev_d['num']}: {prof['name']}"
-                    prev_d["icon"] = prof["icon"]
-                    prev_d["mode"] = prof["mode"]
-                    prev_d["is_battery"] = prof["is_battery"]
-                    prev_d["nominal_wh"] = prof["nominal_wh"]
-                charge["ai_result"] = ai
-                logger.info(f"⚡ Gerät ({prev_d['name'] if prev_d else '1'}) aktiv erkannt ({w:.1f} W).")
+                # Gleiches Gerät fortsetzen!
+                charge["target_is_new"] = False
+                if prev_d:
+                    logger.info(f"⚡ Gleiches Gerät ({prev_d['name']}) wird nahtlos fortgesetzt ({w:.1f} W).")
+                else:
+                    charge["power_history"] = [(now, w)]
+                    ai = DeviceAI.classify(charge["power_history"])
+                    charge["ai_result"] = ai
 
     # =====================================================================
     # 2. STABILER STROMFLUSS-AUFBAU (Schonfrist & Standby-Berücksichtigung)
@@ -1069,17 +1064,18 @@ def start_charge():
         charge["unplug_modal"] = None
         charge["battery_modal"] = None
         charge["power_shift_modal"] = None
-        charge["unplug_cooldown_until"] = now + 12.0
+        charge["unplug_cooldown_until"] = now + 15.0
         charge["flow_continuous_seconds"] = 0.0
         charge["had_flowing"] = False
         charge["waiting_for_new_plug"] = False
+        charge["target_is_new"] = False
         charge["last_wh_time"] = now
         charge["last_stable_w"] = shelly["watt"]
         charge["stable_samples_count"] = 1
         if not charge["devices"]:
             charge["devices"] = [new_device_entry(1, "lamp")]
             charge["current_device_idx"] = 0
-        logger.info(f">>> START (Schonfrist bis +10s aktiviert) <<<")
+        logger.info(f">>> START / FORTSETZEN: Relais EIN, selbes Gerät aktiv fortgesetzt <<<")
 
     relay_control(True)
     return jsonify({"status": "ok"})
