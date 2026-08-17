@@ -168,6 +168,7 @@ DEVICE_PROFILES = {
 # GLOBALER STATE
 # =====================================================================
 lock = threading.Lock()
+poll_lock = threading.Lock()
 
 shelly = {
     "watt": 0.0, "amp": 0.0, "volt": 230.0,
@@ -496,18 +497,21 @@ DeviceAI.load_learned()
 
 
 # =====================================================================
-# SHELLY CLOUD - POLL & RELAIS
+# SHELLY CLOUD - ZENTRALER GEPUFFERTER POLLER (RATE-LIMIT SCHUTZ)
 # =====================================================================
 def poll_shelly():
     now = time.time()
-    if now < shelly["poll_time"] + 1.8:
+    if now < shelly["poll_time"] + 2.2:
+        return
+
+    if not poll_lock.acquire(blocking=False):
         return
 
     try:
         r = http_requests.post(
             f"{SHELLY_CLOUD_URL}/device/status",
             data={"auth_key": AUTH_KEY, "id": DEVICE_ID},
-            timeout=3.5
+            timeout=4.0
         )
         if r.status_code == 200:
             j = r.json()
@@ -531,16 +535,15 @@ def poll_shelly():
                 shelly["error"] = j.get("error", "isok=false")
         elif r.status_code == 429:
             shelly["error"] = "Rate Limit (429)"
-            shelly["poll_time"] = now + 3.0
+            shelly["poll_time"] = now + 4.0
             return
         else:
             shelly["error"] = f"HTTP {r.status_code}"
-    except http_requests.exceptions.Timeout:
-        shelly["error"] = "Timeout"
     except Exception as e:
         shelly["error"] = str(e)[:80]
-
-    shelly["poll_time"] = now
+    finally:
+        shelly["poll_time"] = time.time()
+        poll_lock.release()
 
 
 def relay_control(turn_on):
@@ -620,12 +623,11 @@ def accumulate_energy():
     charge["is_flowing"] = is_flowing
 
     # =====================================================================
-    # 1. ERKENNUNG: GERAET EINGESTECKT (AMPERE-ANSTIEG)
+    # 1. ERKENNUNG: GERAET EINGESTECKT / WIEDERANLAUF
     # =====================================================================
-    if charge["waiting_for_new_plug"] and is_flowing:
+    if (charge["waiting_for_new_plug"] or not charge["active"]) and is_flowing and not charge["paused"] and not charge["terminated"]:
         charge["waiting_for_new_plug"] = False
         charge["active"] = True
-        charge["paused"] = False
         charge["last_wh_time"] = now
         charge["unplug_cooldown_until"] = now + 10.0
         charge["flow_continuous_seconds"] = 0.0
@@ -633,7 +635,7 @@ def accumulate_energy():
         charge["last_stable_w"] = w
         charge["stable_samples_count"] = 1
         
-        if charge.get("target_is_new", True):
+        if charge.get("target_is_new", True) and len(charge["devices"]) > 0 and charge["devices"][-1].get("wh", 0) > 0.05:
             next_num = len(charge["devices"]) + 1
             new_dev = new_device_entry(next_num, "lamp")
             charge["devices"].append(new_dev)
@@ -641,12 +643,9 @@ def accumulate_energy():
             logger.info(f"⚡ Neues Gerät #{next_num} gestartet ({w:.1f} W). Schonfrist aktiv bis +10s.")
         else:
             reused_idx = charge.get("current_device_idx", 0)
-            cur_d = charge["devices"][reused_idx]
-            logger.info(f"⚡ Bisheriges Gerät ({cur_d['name']}) fortgesetzt ({w:.1f} W). Schonfrist aktiv bis +10s.")
-
-        charge["power_history"] = []
-        charge["ai_result"] = None
-        charge["ai_tick"] = 0
+            if 0 <= reused_idx < len(charge["devices"]):
+                cur_d = charge["devices"][reused_idx]
+                logger.info(f"⚡ Gerät ({cur_d['name']}) läuft aktiv ({w:.1f} W).")
 
     # =====================================================================
     # 2. STABILER STROMFLUSS-AUFBAU (Schonfrist & Standby-Berücksichtigung)
@@ -680,17 +679,17 @@ def accumulate_energy():
         base_w = charge.get("last_stable_w", 0.0)
         s_cnt = charge.get("stable_samples_count", 0)
         
-        if s_cnt >= 6 and base_w > 3.0:
+        if s_cnt >= 6 and base_w > 4.0:
             ratio = w / base_w
             delta = abs(w - base_w)
             
-            # Signifikanter Lastsprung (z.B. von 12W auf 85W oder 120W auf 10W bei Delta > 18W)
-            if (ratio >= 2.6 or ratio <= 0.38) and delta >= 18.0:
+            # Signifikanter Lastsprung (z.B. von 12W auf 85W oder 120W auf 10W bei Delta > 20W)
+            if (ratio >= 2.8 or ratio <= 0.35) and delta >= 20.0:
                 charge["power_shift_modal"] = {
                     "from_w": round(base_w, 1),
                     "to_w": round(w, 1)
                 }
-                charge["power_shift_cooldown_until"] = now + 30.0  # 30s Cooldown
+                charge["power_shift_cooldown_until"] = now + 35.0
                 logger.info(f"⚡ Signifikanter Lastsprung: {base_w:.1f} W -> {w:.1f} W (Delta {delta:.1f} W)!")
 
         # Laufende Aktualisierung der stabilen Referenzleistung
@@ -806,7 +805,7 @@ def background_energy_daemon():
                 accumulate_energy()
         except Exception as e:
             logger.error(f"Energy daemon error: {e}")
-        time.sleep(1.0)
+        time.sleep(1.2)
 
 daemon_thread = threading.Thread(target=background_energy_daemon, daemon=True)
 daemon_thread.start()
@@ -1108,7 +1107,6 @@ def power_shift_action():
         charge["power_shift_cooldown_until"] = now + 25.0
 
         if action == "new_device":
-            # Neues separates Gerät erstellen
             next_num = len(charge["devices"]) + 1
             new_dev = new_device_entry(next_num, "lamp")
             charge["devices"].append(new_dev)
@@ -1119,7 +1117,6 @@ def power_shift_action():
             return jsonify({"status": "ok", "device": new_dev})
 
         elif action == "same_device":
-            # Bestätigt: Gleiches Gerät (z.B. Display an / Standby / Schlafmodus beendet)
             idx = charge["current_device_idx"]
             devs = charge["devices"]
             if 0 <= idx < len(devs):
@@ -2026,7 +2023,6 @@ var currentDevice = { num: 1, name: 'Gerät 1: Lampe / Beleuchtung', mode: 'cont
 var latestAiSuggestion = null;
 var allRecordedDevices = [];
 
-// Screen WakeLock
 async function requestWakeLock(){
   try {
     if('wakeLock' in navigator){ await navigator.wakeLock.request('screen'); }
