@@ -957,40 +957,50 @@ def scan(token):
         session.permanent = True
         session.modified = True
         with lock:
-            charge["terminated"] = False
-            charge["last_report"] = None
-            charge["active"] = True
-            charge["paused"] = False
-            charge["relay_on"] = True
-            charge["unplug_modal"] = None
-            charge["battery_modal"] = None
-            charge["power_shift_modal"] = None
-            charge["power_shift_cooldown_until"] = 0.0
-            charge["last_stable_w"] = 0.0
-            charge["stable_samples_count"] = 0
-            charge["unplug_cooldown_until"] = 0.0
-            charge["flow_continuous_seconds"] = 0.0
-            charge["waiting_for_new_plug"] = False
-            charge["target_is_new"] = True
-            charge["had_flowing"] = False
-            charge["session_start_time"] = None
-            charge["total_session_seconds"] = 0.0
-            charge["total_flow_seconds"] = 0.0
-            charge["total_idle_seconds"] = 0.0
-            charge["last_wh_time"] = None
-            charge["total_wh"] = 0.0
-            charge["total_kwh"] = 0.0
-            charge["total_cost_netto"] = 0.0
-            charge["total_vat_amount"] = 0.0
-            charge["total_cost_brutto"] = 0.0
-            charge["power_history"] = []
-            charge["ai_result"] = None
-            charge["ai_tick"] = 0
-            charge["devices"] = [new_device_entry(1, "lamp")]
-            charge["current_device_idx"] = 0
+            has_existing = (
+                charge["active"] or
+                charge.get("total_wh", 0.0) > 0.02 or
+                len(charge.get("devices", [])) > 1 or
+                charge.get("session_start_time") is not None
+            )
+            if not has_existing:
+                # Frische Station: Initialisieren
+                charge["terminated"] = False
+                charge["last_report"] = None
+                charge["active"] = True
+                charge["paused"] = False
+                charge["relay_on"] = True
+                charge["unplug_modal"] = None
+                charge["battery_modal"] = None
+                charge["power_shift_modal"] = None
+                charge["power_shift_cooldown_until"] = 0.0
+                charge["last_stable_w"] = 0.0
+                charge["stable_samples_count"] = 0
+                charge["unplug_cooldown_until"] = 0.0
+                charge["flow_continuous_seconds"] = 0.0
+                charge["waiting_for_new_plug"] = False
+                charge["target_is_new"] = True
+                charge["had_flowing"] = False
+                charge["session_start_time"] = None
+                charge["total_session_seconds"] = 0.0
+                charge["total_flow_seconds"] = 0.0
+                charge["total_idle_seconds"] = 0.0
+                charge["last_wh_time"] = None
+                charge["total_wh"] = 0.0
+                charge["total_kwh"] = 0.0
+                charge["total_cost_netto"] = 0.0
+                charge["total_vat_amount"] = 0.0
+                charge["total_cost_brutto"] = 0.0
+                charge["power_history"] = []
+                charge["ai_result"] = None
+                charge["ai_tick"] = 0
+                charge["devices"] = [new_device_entry(1, "lamp")]
+                charge["current_device_idx"] = 0
+                logger.info(">>> QR-CODE GESCANNT -> NEUE STATION INITIALISIERT & RELAIS EIN <<<")
+            else:
+                logger.info(">>> QR-CODE GESCANNT -> LAUFENDE SITZUNG ERKANNT (KEIN RESET) <<<")
         relay_control(True)
-        logger.info(">>> QR-CODE GESCANNT -> RELAIS SOFORT EIN & BEREIT FÜR STROMFLUSS <<<")
-        return redirect(url_for('index'))
+        return redirect(url_for('index', join='1' if has_existing else None))
     return "Ungültiger Token.", 403
 
 @app.route('/reset_session', methods=['POST', 'GET'])
@@ -1986,6 +1996,31 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 .ein{width:100%;padding:11px;border:1px solid var(--border);border-radius:10px;font-size:13.5px;margin-bottom:8px}
 </style></head><body>
 
+<!-- MODAL: BEREITS LAUFENDE SITZUNG UEBERNEHMEN ODER NEUES GERAET -->
+<div id="modalJoinSession" class="modal" style="display:none">
+<div class="mbox" style="text-align:center;border:2px solid var(--blue)">
+  <div style="font-size:38px;margin-bottom:6px">⚡📲</div>
+  <div style="font-size:18px;font-weight:800;margin-bottom:6px;color:#1e40af">Aktive Ladung an der Station</div>
+  <p style="font-size:13px;color:var(--muted);margin-bottom:16px;line-height:1.4">
+    An dieser Steckdose läuft bereits ein Ladevorgang:<br/>
+    <b id="joinDevName">Gerät 1</b> · <b id="joinWh">0.00 Wh</b> (<b id="joinCost">0.00 €</b>)<br/>
+    <span style="font-size:11.5px;color:#059669;font-weight:700">Was möchtest du tun?</span>
+  </p>
+  
+  <div style="display:flex;flex-direction:column;gap:8px">
+    <button class="btn bp" style="background:#059669;padding:12px;font-size:13.5px" onclick="chooseJoinOption('takeover')">
+      📲 Bestehende Ladung & Kosten übernehmen
+    </button>
+    <button class="btn bs" style="background:#eff6ff;color:#1e40af;border:1px solid #bfdbfe;padding:12px;font-size:13.5px" onclick="chooseJoinOption('new_device')">
+      ➕ Mein eigenes Gerät als neues Gerät einstecken
+    </button>
+    <button class="btn bd" style="padding:10px;font-size:12px" onclick="chooseJoinOption('fresh_start')">
+      🔄 Neue Gesamtsitzung starten (Zurücksetzen)
+    </button>
+  </div>
+</div>
+</div>
+
 <!-- DIALOG 1: WURDE GERÄT ABGESTECKT ODER SCHLAFMODUS? -->
 <div id="modalAskUnplug" class="modal">
 <div class="mbox" style="text-align:center;border:2px solid var(--red)">
@@ -2495,6 +2530,20 @@ function post(u,d){
   }).then(function(r){return r.json()}).catch(function(){return {}});
 }
 
+
+function chooseJoinOption(opt){
+  hideM('modalJoinSession');
+  sessionStorage.setItem('join_handled', '1');
+  if(opt === 'takeover'){
+    poll();
+  } else if(opt === 'new_device'){
+    showM('devModal');
+  } else if(opt === 'fresh_start'){
+    startFreshSession();
+  }
+}
+window.chooseJoinOption = chooseJoinOption;
+
 function startFreshSession(){
   lastActionLocalTime = Date.now();
   post('/reset_session').then(function(){
@@ -2967,6 +3016,19 @@ function poll(){
     var idleSec = d.total_idle_seconds || 0.0;
 
     allRecordedDevices = d.devices || [];
+    // QR-Join Erkennung bei neu gescanntem Geraet
+    var urlP = new URLSearchParams(window.location.search);
+    if(urlP.get('join') === '1' && !sessionStorage.getItem('join_handled') && (d.wh > 0.01 || (d.devices && d.devices.length > 1) || d.active)){
+      var curDName = (d.active_device && d.active_device.name) ? d.active_device.name : 'Gerät 1';
+      var jdn = document.getElementById('joinDevName');
+      var jwh = document.getElementById('joinWh');
+      var jc = document.getElementById('joinCost');
+      if(jdn) jdn.innerText = curDName;
+      if(jwh) jwh.innerText = (d.wh || 0).toFixed(2) + ' Wh';
+      if(jc) jc.innerText = (d.cost_brutto || 0).toFixed(4) + ' €';
+      showM('modalJoinSession');
+    }
+
 
     // Land
     if(d.country){
