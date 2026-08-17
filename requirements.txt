@@ -1,4 +1,7 @@
-flask
-requests
-gunicorn
-weasyprint
+flask>=3.0.0
+requests>=2.31.0
+qrcode>=7.4.2
+pillow>=10.0.0
+gunicorn>=21.2.0
+reportlab>=4.0.0
+weasyprint>=60.0
