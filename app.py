@@ -1331,14 +1331,27 @@ def set_country():
             return jsonify({"status": "ok", "country": c_info})
     return jsonify({"status": "error", "message": "Land nicht gefunden"}), 400
 
+@app.route('/switch_active_device', methods=['POST'])
+def switch_active_device():
+    data = request.get_json() or {}
+    dev_idx = int(data.get("device_idx", 0))
+    with lock:
+        devs = charge["devices"]
+        if 0 <= dev_idx < len(devs):
+            charge["current_device_idx"] = dev_idx
+            cur_d = devs[dev_idx]
+            logger.info(f"👉 Aktives Gerät proaktiv gewechselt auf Gerät #{cur_d['num']} ({cur_d['name']})!")
+            return jsonify({"status": "ok", "current_device_idx": dev_idx, "device": cur_d})
+    return jsonify({"status": "error", "message": "Ungültiger Index"}), 400
+
 @app.route('/set_device', methods=['POST'])
 def set_device():
     data = request.get_json() or {}
     key = data.get("key")
-    confirmed = data.get("confirmed", True)
+    dev_idx = data.get("device_idx", None)
 
     with lock:
-        idx = charge["current_device_idx"]
+        idx = int(dev_idx) if dev_idx is not None else charge["current_device_idx"]
         if 0 <= idx < len(charge["devices"]):
             dev = charge["devices"][idx]
             if key in DEVICE_PROFILES:
@@ -1350,15 +1363,10 @@ def set_device():
                 dev["mode"] = prof["mode"]
                 dev["is_battery"] = prof["is_battery"]
                 dev["nominal_wh"] = prof["nominal_wh"]
-                dev["user_confirmed"] = confirmed
-
-                # 🧠 KI-LERNEN: Lerne Fingerprint aus den aktuellen Leistungsdaten
-                if confirmed:
-                    DeviceAI.learn_from_feedback(key, charge.get("power_history", []), shelly["watt"])
-
-                logger.info(f"Gerät {dev['num']} konfiguriert: {dev['name']} ({dev['mode']}) | Bestätigt: {confirmed}")
+                dev["user_confirmed"] = True
+                logger.info(f"Gerät #{dev['num']} manuell auf '{prof['name']}' ({prof['mode']}) gesetzt.")
                 return jsonify({"status": "ok", "device": dev})
-    return jsonify({"status": "error", "message": "Gerät nicht gefunden"}), 400
+    return jsonify({"status": "error"}), 400
 
 @app.route('/logout', methods=['POST', 'GET'])
 def logout():
@@ -2677,9 +2685,18 @@ function renderDevicePills(devs, activeIdx){
   c.style.display = 'flex';
   c.innerHTML = '';
   (devs || []).forEach(function(d, idx){
+    var isCur = (idx === activeIdx);
     var sp = document.createElement('span');
-    sp.className = 'dev-pill' + (idx === activeIdx ? ' active' : '');
-    sp.innerHTML = (d.icon || '🔌') + ' <b>' + (d.raw_name || d.name || ('Gerät ' + (idx+1))) + '</b> <span style="opacity:0.8">(' + (d.wh || 0).toFixed(2) + ' Wh)</span>';
+    sp.className = 'dev-pill' + (isCur ? ' active' : '');
+    sp.style.cursor = 'pointer';
+    sp.title = isCur ? 'Aktives Aufzeichnungs-Gerät' : 'Hier klicken, um dieses Gerät aktiv zu laden';
+    sp.onclick = function(){
+      if(idx !== activeIdx){
+        post('/switch_active_device', { device_idx: idx }).then(function(){ poll(); });
+      }
+    };
+    sp.innerHTML = (d.icon || '🔌') + ' <b>' + (d.raw_name || d.name || ('Gerät ' + (idx+1))) + '</b> <span style="opacity:0.8">(' + (d.wh || 0).toFixed(2) + ' Wh)</span>' +
+                   (isCur ? ' <span style="background:#059669;color:#fff;font-size:9px;font-weight:800;padding:1px 5px;border-radius:6px;margin-left:4px">AKTIV</span>' : '');
     c.appendChild(sp);
   });
   
