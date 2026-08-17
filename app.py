@@ -779,83 +779,188 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 </div>
 
 <script>
-var done=false, lastR=null;
+var done = false, lastR = null;
+var localElapsed = 0;
+var isChargingActive = false;
+var localTimerInterval = null;
 
-function fs(s){s=Math.floor(Math.max(0,s));return String(Math.floor(s/3600)).padStart(2,'0')+':'+String(Math.floor((s%3600)/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0')}
+function fs(s){
+  s = Math.floor(Math.max(0, s));
+  var h = Math.floor(s / 3600);
+  var m = Math.floor((s % 3600) / 60);
+  var sec = s % 60;
+  return String(h).padStart(2,'0') + ':' + String(m).padStart(2,'0') + ':' + String(sec).padStart(2,'0');
+}
+
+function updateTimerDisplay(){
+  var el = document.getElementById('timer');
+  if (el) el.innerText = fs(localElapsed);
+}
+
+function startLocalTimer(){
+  if (localTimerInterval) return;
+  localTimerInterval = setInterval(function(){
+    if (isChargingActive && !done) {
+      localElapsed += 1;
+      updateTimerDisplay();
+    }
+  }, 1000);
+}
+
+function stopLocalTimer(){
+  if (localTimerInterval) {
+    clearInterval(localTimerInterval);
+    localTimerInterval = null;
+  }
+}
+
 function showM(id){document.getElementById(id).style.display='flex'}
 function hideM(id){document.getElementById(id).style.display='none'}
 
-function post(u,d){return fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d||{})}).then(function(r){return r.json()}).catch(function(){return {}})}
+function post(u,d){
+  return fetch(u, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(d || {})
+  }).then(function(r){return r.json()}).catch(function(){return {}});
+}
 
 function doStart(){
-  if(done)return;
-  post('/start').then(function(){poll()});
+  if(done) return;
+  isChargingActive = true;
+  startLocalTimer();
+  document.getElementById('sPill').className = 'pill pill-on';
+  document.getElementById('sTxt').innerText = 'Aktiv';
+  post('/start').then(function(){ poll(); });
 }
+
 function doStop(){
-  if(done)return;
-  post('/stop').then(function(){poll()});
+  if(done) return;
+  isChargingActive = false;
+  stopLocalTimer();
+  document.getElementById('sPill').className = 'pill pill-p';
+  document.getElementById('sTxt').innerText = 'Pause';
+  post('/stop').then(function(){ poll(); });
 }
-function startNew(){hideM('swapM');post('/new_device').then(function(){doStart()})}
+
+function startNew(){
+  hideM('swapM');
+  post('/new_device').then(function(){ doStart(); });
+}
+
 function devAct(a){
   hideM('swapM');
-  if(a==='continue'){doStart()}
-  else if(a==='finish'){post('/logout').then(function(r){showReceipt(r)})}
+  if(a === 'continue'){
+    doStart();
+  } else if(a === 'finish'){
+    isChargingActive = false;
+    stopLocalTimer();
+    post('/logout').then(function(r){ showReceipt(r); });
+  }
 }
 
 function showReceipt(rp){
-  done=true;lastR=rp;
-  document.getElementById('mainC').style.display='none';
-  document.getElementById('recC').style.display='block';
-  var tb=document.getElementById('recB');tb.innerHTML='';
-  (rp.devices||[]).forEach(function(d){var tr=document.createElement('tr');tr.innerHTML='<td><b>'+(d.ai_icon||'🔌')+' '+(d.ai_name||'Geraet')+'</b></td><td style="text-align:center">'+fs(d.duration_sec||0)+'</td><td style="text-align:right">'+(d.wh||0).toFixed(3)+'</td><td style="text-align:right"><b>'+(d.cost||0).toFixed(5)+'</b></td>';tb.appendChild(tr)});
-  document.getElementById('rCost').innerText=(rp.total_cost||0).toFixed(5)+' EUR';
-  document.getElementById('rWh').innerText=(rp.total_wh||0).toFixed(4);
-  document.getElementById('rKwh').innerText=(rp.total_kwh||0).toFixed(6);
+  done = true;
+  isChargingActive = false;
+  stopLocalTimer();
+  lastR = rp;
+  document.getElementById('mainC').style.display = 'none';
+  document.getElementById('recC').style.display = 'block';
+  var tb = document.getElementById('recB');
+  tb.innerHTML = '';
+  (rp.devices || []).forEach(function(d){
+    var tr = document.createElement('tr');
+    tr.innerHTML = '<td><b>' + (d.ai_icon || '🔌') + ' ' + (d.ai_name || 'Geraet') + '</b></td><td style="text-align:center">' + fs(d.duration_sec || 0) + '</td><td style="text-align:right">' + (d.wh || 0).toFixed(3) + '</td><td style="text-align:right"><b>' + (d.cost || 0).toFixed(5) + '</b></td>';
+    tb.appendChild(tr);
+  });
+  document.getElementById('rCost').innerText = (rp.total_cost || 0).toFixed(5) + ' EUR';
+  document.getElementById('rWh').innerText = (rp.total_wh || 0).toFixed(4);
+  document.getElementById('rKwh').innerText = (rp.total_kwh || 0).toFixed(6);
 }
 
 function poll(){
-  if(done)return;
-  fetch('/status',{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){
-    if(d.session_terminated&&d.report){showReceipt(d.report);return}
+  if(done) return;
+  fetch('/status', {cache: 'no-store'}).then(function(r){return r.json()}).then(function(d){
+    if(d.session_terminated && d.report){
+      showReceipt(d.report);
+      return;
+    }
 
-    // Timer: Server-Wert ist die EINZIGE Wahrheit (on-the-fly berechnet)
-    document.getElementById('timer').innerText=fs(d.elapsed_seconds||0);
+    var srvSec = d.elapsed_seconds || 0;
 
-    // Status-Badge
-    var pill=document.getElementById('sPill'), txt=document.getElementById('sTxt');
-    if(d.active){pill.className='pill pill-on';txt.innerText='Aktiv'}
-    else if(d.paused){pill.className='pill pill-p';txt.innerText='Pause'}
-    else{pill.className='pill pill-off';txt.innerText='Bereit'}
+    // Status-Steuerung & gleichmäßige Zeit-Synchronisation
+    if(d.active){
+      isChargingActive = true;
+      startLocalTimer();
+      document.getElementById('sPill').className = 'pill pill-on';
+      document.getElementById('sTxt').innerText = 'Aktiv';
+      // Nur bei nennenswerter Abweichung (> 2s) sanft nachjustieren, sonst läuft der lokale 1s-Takt gleichmäßig
+      if(Math.abs(localElapsed - srvSec) > 2.0){
+        localElapsed = Math.floor(srvSec);
+        updateTimerDisplay();
+      }
+    } else {
+      isChargingActive = false;
+      stopLocalTimer();
+      localElapsed = Math.floor(srvSec);
+      updateTimerDisplay();
+      if(d.paused){
+        document.getElementById('sPill').className = 'pill pill-p';
+        document.getElementById('sTxt').innerText = 'Pause';
+      } else {
+        document.getElementById('sPill').className = 'pill pill-off';
+        document.getElementById('sTxt').innerText = 'Bereit';
+      }
+    }
 
-    // Messwerte direkt vom Server
-    document.getElementById('volt').innerText=(d.voltage||230).toFixed(1);
-    document.getElementById('amp').innerText=(d.current_ampere||0).toFixed(3);
-    document.getElementById('ma').innerText=((d.current_ampere||0)*1000).toFixed(0);
-    document.getElementById('watt').innerText=(d.watt||0).toFixed(3);
-    document.getElementById('wh').innerText=(d.wh||0).toFixed(4);
-    document.getElementById('mwh').innerText=((d.wh||0)*1000).toFixed(1);
-    document.getElementById('cost').innerText=(d.cost||0).toFixed(5);
-    document.getElementById('cent').innerText=((d.cost||0)*100).toFixed(3);
-    document.getElementById('wSub').innerText=(d.watt>0.1)?'Strom fliesst':'Kein Strom';
+    // Messwerte
+    document.getElementById('volt').innerText = (d.voltage || 230).toFixed(1);
+    document.getElementById('amp').innerText = (d.current_ampere || 0).toFixed(3);
+    document.getElementById('ma').innerText = ((d.current_ampere || 0) * 1000).toFixed(0);
+    document.getElementById('watt').innerText = (d.watt || 0).toFixed(3);
+    document.getElementById('wh').innerText = (d.wh || 0).toFixed(4);
+    document.getElementById('mwh').innerText = ((d.wh || 0) * 1000).toFixed(1);
+    document.getElementById('cost').innerText = (d.cost || 0).toFixed(5);
+    document.getElementById('cent').innerText = ((d.cost || 0) * 100).toFixed(3);
+    document.getElementById('wSub').innerText = (d.watt > 0.1) ? 'Strom fliesst' : 'Kein Strom';
 
-    // KI
-    var ai=d.ai_result||{};
-    document.getElementById('aiI').innerText=ai.icon||'🔌';
-    document.getElementById('aiN').innerText=ai.name||'Erkenne...';
-    document.getElementById('aiS').innerText=ai.stage||'Analyse';
-    var c=ai.confidence||0;
-    document.getElementById('aiC').innerText=c>0?'Sicherheit: '+c+'%':'Warte...';
-    document.getElementById('aiSub').innerText=ai.is_battery===true?'Akku | Spitze: '+(ai.peak_w||0)+'W':ai.is_battery===false?'Dauerbetrieb | Avg '+(ai.avg_w||0)+'W':'KI sammelt Daten...';
-    if(ai.is_battery===true&&ai.soc_pct>0){document.getElementById('socSec').style.display='block';document.getElementById('socF').style.width=Math.min(100,ai.soc_pct)+'%';document.getElementById('socP').innerText=ai.soc_pct+'%';document.getElementById('socE').innerText=ai.stage||''}
-    else{document.getElementById('socSec').style.display='none'}
+    // KI-Geräteerkennung
+    var ai = d.ai_result || {};
+    document.getElementById('aiI').innerText = ai.icon || '🔌';
+    document.getElementById('aiN').innerText = ai.name || 'Erkenne...';
+    document.getElementById('aiS').innerText = ai.stage || 'Analyse';
+    var c = ai.confidence || 0;
+    document.getElementById('aiC').innerText = c > 0 ? ('Sicherheit: ' + c + '%') : 'Warte...';
+    document.getElementById('aiSub').innerText = ai.is_battery === true
+      ? ('Akku | Spitze: ' + (ai.peak_w || 0) + 'W')
+      : (ai.is_battery === false ? ('Dauerbetrieb | Avg ' + (ai.avg_w || 0) + 'W') : 'KI sammelt Daten...');
+
+    if(ai.is_battery === true && ai.soc_pct > 0){
+      document.getElementById('socSec').style.display = 'block';
+      document.getElementById('socF').style.width = Math.min(100, ai.soc_pct) + '%';
+      document.getElementById('socP').innerText = ai.soc_pct + '%';
+      document.getElementById('socE').innerText = ai.stage || '';
+    } else {
+      document.getElementById('socSec').style.display = 'none';
+    }
   }).catch(function(){});
 }
 
 function sendEm(){
-  var em=document.getElementById('emIn').value.trim(),fb=document.getElementById('emFb');
-  if(em.indexOf('@')<0){fb.style.display='block';fb.style.color='#dc2626';fb.innerText='Gueltige E-Mail!';return}
-  fb.style.display='block';fb.style.color='var(--blue)';fb.innerText='Sende...';
-  post('/send_email_invoice',{email:em,report:lastR}).then(function(r){fb.style.color=r.status==='ok'?'#059669':'#d97706';fb.innerText=r.status==='ok'?'Gesendet!':r.message||'Fehler.'});
+  var em = document.getElementById('emIn').value.trim(), fb = document.getElementById('emFb');
+  if(em.indexOf('@') < 0){
+    fb.style.display = 'block';
+    fb.style.color = '#dc2626';
+    fb.innerText = 'Gueltige E-Mail!';
+    return;
+  }
+  fb.style.display = 'block';
+  fb.style.color = 'var(--blue)';
+  fb.innerText = 'Sende...';
+  post('/send_email_invoice', {email: em, report: lastR}).then(function(r){
+    fb.style.color = r.status === 'ok' ? '#059669' : '#d97706';
+    fb.innerText = r.status === 'ok' ? 'Gesendet!' : (r.message || 'Fehler.');
+  });
 }
 
 // Polling: alle 1 Sekunde
