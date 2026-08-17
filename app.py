@@ -838,14 +838,15 @@ def accumulate_energy():
                     d["cost"] = d["cost_brutto"]
                     d["peak_w"] = max(d.get("peak_w", 0), w)
 
-                    # --- 80% & 100% AKKU-ABSCHALTAUTOMATIK ---
+                    # --- 80% & 100% AKKU-ABSCHALTAUTOMATIK & DROSSELUNGS-ERKENNUNG ---
                     if d.get("is_battery") and d.get("nominal_wh", 0) > 0:
                         nom_wh = d["nominal_wh"]
                         cur_wh = d["wh"]
+                        peak_w = d.get("peak_w", 0.0)
                         soc_pct = (cur_wh / nom_wh) * 100.0
 
-                        # Fall A: 80% Akkuschutz schlägt an
-                        if soc_pct >= 80.0 and not d.get("charge_to_100", False) and not d.get("notified_80", False):
+                        # Fall A: 80% Akkuschutz schlägt an (wenn nicht explizit auf 100% freigegeben)
+                        if soc_pct >= 80.0 and not d.get("charge_to_100", False) and not d.get("notified_80", False) and not d.get("notified_100", False):
                             d["notified_80"] = True
                             charge["active"] = False
                             charge["paused"] = True
@@ -853,14 +854,17 @@ def accumulate_energy():
                             relay_control(False)
                             logger.info(f"🔋 80% Akkuschutz erreicht ({cur_wh:.2f} Wh / {nom_wh} Wh) -> Relais AUS, Modal BATTERY_80!")
 
-                        # Fall B: 100% Vollladung erreicht
-                        elif (soc_pct >= 100.0 or (soc_pct >= 92.0 and w < 1.5)) and d.get("charge_to_100", False) and not d.get("notified_100", False):
+                        # Fall B: 100% Vollladung & BMS-Drosselung erkannt
+                        # Triggert wenn:
+                        # 1. SoC rechnerisch >= 95% erreicht ODER
+                        # 2. Akku hatte vorher substantielle Ladeleistung (Peak >= 15W, Dauer >= 20s) und ist nun auf <= 2.2W gedrosselt (BMS-Ladeschluss)
+                        is_throttled_full = (peak_w >= 15.0 and d.get("flow_duration_sec", 0) >= 20.0 and w <= 2.2 and w > 0.02)
+                        is_wh_full = (soc_pct >= 95.0 and w < 10.0)
+
+                        if (is_throttled_full or is_wh_full) and not d.get("notified_100", False):
                             d["notified_100"] = True
-                            charge["active"] = False
-                            charge["paused"] = True
                             charge["battery_modal"] = "BATTERY_100"
-                            relay_control(False)
-                            logger.info(f"🔋 100% Akku voll geladen ({cur_wh:.2f} Wh / {nom_wh} Wh) -> Relais AUS, Modal BATTERY_100!")
+                            logger.info(f"🔋 100% Akku voll geladen / gedrosselt ({w:.1f} W / Peak {peak_w:.1f} W) -> Modal BATTERY_100!")
 
             else:
                 # Standby / Pause-Zeit nur buchen, wenn Session läuft und (Relais aus ODER Cooldown abgelaufen)
@@ -1405,6 +1409,10 @@ def battery_action():
             return jsonify({"status": "ok", "charge_to_100": True})
         elif action == "finish":
             return logout()
+        elif action == "change_device":
+            return jsonify({"status": "ok", "action": "change_device"})
+        elif action == "dismiss":
+            return jsonify({"status": "ok", "action": "dismiss"})
 
     return jsonify({"status": "error"}), 400
 
@@ -2170,18 +2178,26 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 </div>
 
 <!-- DIALOG: 100% AKKU VOLLGELADEN -->
-<div id="modalBattery100" class="modal">
+<div id="modalBattery100" class="modal" style="display:none">
 <div class="mbox" style="text-align:center;border:2px solid #2563eb">
   <div style="font-size:42px;margin-bottom:6px">✅🔋</div>
-  <div style="font-size:18px;font-weight:800;margin-bottom:6px;color:#1e40af">100% Akku voll geladen!</div>
-  <p style="font-size:13px;color:var(--muted);margin-bottom:18px;line-height:1.4">
-    Der Ladevorgang ist <b>vollständig abgeschlossen (100%)</b>.<br/>
-    Die Steckdose wurde automatisch stromlos geschaltet.
+  <div style="font-size:18px;font-weight:800;margin-bottom:6px;color:#1e40af">Akku ist voll geladen (~100%)</div>
+  <p style="font-size:13px;color:var(--muted);margin-bottom:16px;line-height:1.4">
+    Die Ladeleistung wurde auf ein Minimum gedrosselt (BMS-Ladeschluss).<br/>
+    <b>Dein Akku ist jetzt vollständig geladen!</b>
   </p>
   
-  <button class="btn bp" style="background:var(--blue);padding:14px;font-size:15px" onclick="handleBatteryAction('finish')">
-    🧾 Beenden & Quittung anzeigen
-  </button>
+  <div style="display:flex;flex-direction:column;gap:8px">
+    <button class="btn bp" style="background:#059669;padding:13px;font-size:14px" onclick="handleBatteryAction('finish')">
+      🧾 Ladevorgang beenden & Quittung anzeigen
+    </button>
+    <button class="btn bs" style="background:#eff6ff;color:#1e40af;border:1px solid #bfdbfe;padding:12px;font-size:13px;font-weight:700" onclick="handleBatteryAction('change_device')">
+      🔄 Anderes Gerät anschließen
+    </button>
+    <button class="btn bd" style="padding:10px;font-size:12px;background:#f1f5f9;color:var(--muted);border:1px solid var(--border)" onclick="handleBatteryAction('dismiss')">
+      ⚡ Erhaltungsladung aktiv lassen (Schließen)
+    </button>
+  </div>
 </div>
 </div>
 
@@ -2672,6 +2688,8 @@ function handleBatteryAction(action){
   post('/battery_action', { action: action }).then(function(res){
     if(action === 'finish'){
       showReceipt(res);
+    } else if(action === 'change_device'){
+      showM('devModal');
     } else {
       poll();
     }
