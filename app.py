@@ -519,15 +519,24 @@ def poll_shelly():
                 ds = j.get("data", {}).get("device_status", {})
                 if "switch:0" in ds:
                     sw = ds["switch:0"]
-                    shelly["watt"] = float(sw.get("apower", 0) or 0)
-                    shelly["amp"]  = float(sw.get("current", 0) or 0)
+                    is_out_on = sw.get("output", True)
+                    if (not is_out_on) or (not charge.get("relay_on", True)) or charge.get("paused", False) or (not charge.get("active", False)):
+                        shelly["watt"] = 0.0
+                        shelly["amp"]  = 0.0
+                    else:
+                        shelly["watt"] = float(sw.get("apower", 0) or 0)
+                        shelly["amp"]  = float(sw.get("current", 0) or 0)
                     shelly["volt"] = float(sw.get("voltage", 230) or 230)
                     shelly["ok"] = True
                     shelly["error"] = ""
                 elif "meters" in ds and ds["meters"]:
                     m = ds["meters"][0]
-                    shelly["watt"] = float(m.get("power", 0) or 0)
-                    shelly["amp"]  = float(m.get("current", shelly["watt"]/230 if shelly["watt"] > 0 else 0))
+                    if (not charge.get("relay_on", True)) or charge.get("paused", False) or (not charge.get("active", False)):
+                        shelly["watt"] = 0.0
+                        shelly["amp"]  = 0.0
+                    else:
+                        shelly["watt"] = float(m.get("power", 0) or 0)
+                        shelly["amp"]  = float(m.get("current", shelly["watt"]/230 if shelly["watt"] > 0 else 0))
                     shelly["volt"] = float(m.get("voltage", 230) or 230)
                     shelly["ok"] = True
                     shelly["error"] = ""
@@ -961,13 +970,17 @@ def get_status():
         vat_amt = charge["total_vat_amount"]
         brutto = charge["total_cost_brutto"]
 
+        is_plug_off = (not charge["relay_on"]) or charge["paused"] or charge["terminated"] or (not charge["active"])
+        live_watt = 0.0 if is_plug_off else round(shelly["watt"], 3)
+        live_amp  = 0.0 if is_plug_off else round(shelly["amp"], 3)
+
         return jsonify({
             "active": charge["active"],
             "paused": charge["paused"],
             "terminated": charge["terminated"],
             "relay_on": charge["relay_on"],
-            "watt": round(shelly["watt"], 3),
-            "current_ampere": round(shelly["amp"], 3),
+            "watt": live_watt,
+            "current_ampere": live_amp,
             "voltage": round(shelly["volt"], 1),
             "shelly_ok": shelly["ok"],
             "shelly_error": shelly["error"],
@@ -1059,9 +1072,12 @@ def stop_charge():
         accumulate_energy()
         charge["active"] = False
         charge["paused"] = True
+        charge["relay_on"] = False
         charge["last_wh_time"] = None
+        shelly["watt"] = 0.0
+        shelly["amp"] = 0.0
     relay_control(False)
-    logger.info(">>> PAUSE <<<")
+    logger.info(">>> PAUSE: Relais AUS, Watt & Ampere auf 0.0 gesetzt <<<")
     return jsonify({"status": "ok"})
 
 # =====================================================================
@@ -2511,8 +2527,9 @@ function poll(){
     }
 
     var srvSec = d.elapsed_seconds || 0;
-    var curW = d.watt || 0.0;
-    var curA = d.current_ampere || 0.0;
+    var isPlugOff = (d.paused || !d.relay_on || !d.active);
+    var curW = isPlugOff ? 0.0 : (d.watt || 0.0);
+    var curA = isPlugOff ? 0.0 : (d.current_ampere || 0.0);
     var curWh = d.wh || 0.0;
     var flowSec = d.total_flow_seconds || 0.0;
     var idleSec = d.total_idle_seconds || 0.0;
