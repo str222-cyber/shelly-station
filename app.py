@@ -181,11 +181,13 @@ charge = {
     "relay_on": False,
     "selected_country": "DE",
     
-    # --- PRÄZISER ABSTECK- & WECHSEL-WORKFLOW ---
+    # --- PRÄZISER ABSTECK- & WECHSEL-WORKFLOW MIT SCHONFRIST ---
     "unplug_modal": None,            # None | "ASK_UNPLUG" | "ASK_NEXT_DEVICE"
+    "unplug_cooldown_until": 0.0,    # Timestamp: Bis wann kein Absteck-Popup getriggert werden darf (Schonfrist)
+    "flow_continuous_seconds": 0.0,  # Zählt zusammenhängende Sekunden stabilen Stromflusses
     "waiting_for_new_plug": False,   # True, wenn Relais wieder EIN ist und auf Strom gewartet wird
     "target_is_new": True,           # True -> erstellt neues Gerät; False -> verwendet selected_device_idx
-    "had_flowing": False,            # True, sobald nach Start mindestens 1x Strom floss
+    "had_flowing": False,            # True, erst nachdem Strom mindestens 3s stabil floss
     "is_flowing": False,
     
     # --- DURCHGEHENDER SITZUNGS-TIMER (STOPPT NIE) ---
@@ -458,51 +460,65 @@ def accumulate_energy():
     w = shelly["watt"]
     a = shelly["amp"]
     
-    # Echter Stromfluss (> 0.25 W oder > 0.015 A)
+    # Echter Stromfluss (> 0.25 W oder > 0.018 A)
     is_flowing = (a >= 0.018 or w >= 0.25)
     charge["is_flowing"] = is_flowing
 
-    if is_flowing and charge["active"]:
-        charge["had_flowing"] = True
-
     # =====================================================================
-    # 1. ERKENNUNG: ABSTECKEN DES KABELS (AMPERE -> 0.000 A)
-    # =====================================================================
-    if charge["active"] and not charge["paused"] and charge["had_flowing"]:
-        if not is_flowing and (a < 0.015 and w < 0.25):
-            charge["active"] = False
-            charge["paused"] = True
-            charge["unplug_modal"] = "ASK_UNPLUG"
-            relay_control(False)
-            logger.info("🔌 Ampere auf 0.0 A abgefallen -> Ladevorgang pausiert, Relais AUS, Modal ASK_UNPLUG geöffnet!")
-
-    # =====================================================================
-    # 2. ERKENNUNG: GERAET EINGESTECKT (AMPERE-ANSTIEG)
+    # 1. ERKENNUNG: GERAET EINGESTECKT (AMPERE-ANSTIEG)
     # =====================================================================
     if charge["waiting_for_new_plug"] and is_flowing:
         charge["waiting_for_new_plug"] = False
         charge["active"] = True
         charge["paused"] = False
         charge["last_wh_time"] = now
-        charge["had_flowing"] = True
+        charge["unplug_cooldown_until"] = now + 10.0  # 10 Sekunden Schonfrist nach dem Einstecken!
+        charge["flow_continuous_seconds"] = 0.0
+        charge["had_flowing"] = False
         
         if charge.get("target_is_new", True):
             next_num = len(charge["devices"]) + 1
             new_dev = new_device_entry(next_num, "lamp")
             charge["devices"].append(new_dev)
             charge["current_device_idx"] = len(charge["devices"]) - 1
-            logger.info(f"⚡ Neues Gerät #{next_num} erkannt & gestartet ({w:.1f} W).")
+            logger.info(f"⚡ Neues Gerät #{next_num} gestartet ({w:.1f} W). Schonfrist aktiv bis +10s.")
         else:
             reused_idx = charge.get("current_device_idx", 0)
             cur_d = charge["devices"][reused_idx]
-            logger.info(f"⚡ Bisheriges Gerät ({cur_d['name']}) fortgesetzt ({w:.1f} W).")
+            logger.info(f"⚡ Bisheriges Gerät ({cur_d['name']}) fortgesetzt ({w:.1f} W). Schonfrist aktiv bis +10s.")
 
         charge["power_history"] = []
         charge["ai_result"] = None
         charge["ai_tick"] = 0
 
     # =====================================================================
-    # 3. ENERGIE- & ZEIT-AKKUMULATION
+    # 2. STABILER STROMFLUSS-AUFBAU (Schonfrist & Entprellung)
+    # =====================================================================
+    if last and last > 0:
+        dt = min(15.0, max(0.0, now - last))
+        if is_flowing and charge["active"]:
+            charge["flow_continuous_seconds"] += dt
+            # Erst wenn mindestens 3 Sekunden stabiler Stromfluss da war UND Schonfrist vorbei ist:
+            if charge["flow_continuous_seconds"] >= 3.0 and now > charge["unplug_cooldown_until"]:
+                charge["had_flowing"] = True
+        else:
+            charge["flow_continuous_seconds"] = 0.0
+
+    # =====================================================================
+    # 3. ERKENNUNG: ABSTECKEN DES KABELS (AMPERE -> 0.000 A)
+    # =====================================================================
+    if charge["active"] and not charge["paused"] and charge["had_flowing"] and now > charge["unplug_cooldown_until"]:
+        if not is_flowing and (a < 0.015 and w < 0.25):
+            charge["active"] = False
+            charge["paused"] = True
+            charge["unplug_modal"] = "ASK_UNPLUG"
+            charge["had_flowing"] = False
+            charge["unplug_cooldown_until"] = now + 8.0  # Mindestens 8s Pause vor nächstem Event
+            relay_control(False)
+            logger.info("🔌 Ampere auf 0.0 A abgefallen -> Ladevorgang pausiert, Relais AUS, Modal ASK_UNPLUG geöffnet!")
+
+    # =====================================================================
+    # 4. ENERGIE- & ZEIT-AKKUMULATION
     # =====================================================================
     if last and last > 0 and charge["session_start_time"] is not None:
         dt = now - last
@@ -602,6 +618,8 @@ def scan(token):
             charge["active"] = False
             charge["paused"] = False
             charge["unplug_modal"] = None
+            charge["unplug_cooldown_until"] = 0.0
+            charge["flow_continuous_seconds"] = 0.0
             charge["waiting_for_new_plug"] = False
             charge["target_is_new"] = True
             charge["had_flowing"] = False
@@ -632,6 +650,8 @@ def reset_session():
         charge["active"] = False
         charge["paused"] = False
         charge["unplug_modal"] = None
+        charge["unplug_cooldown_until"] = 0.0
+        charge["flow_continuous_seconds"] = 0.0
         charge["waiting_for_new_plug"] = False
         charge["target_is_new"] = True
         charge["had_flowing"] = False
@@ -718,6 +738,7 @@ def get_status():
 @app.route('/start', methods=['POST', 'GET'])
 def start_charge():
     with lock:
+        now = time.time()
         if charge["terminated"]:
             charge["terminated"] = False
             charge["last_report"] = None
@@ -737,19 +758,21 @@ def start_charge():
             charge["devices"] = [new_device_entry(1, "lamp")]
             charge["current_device_idx"] = 0
 
-        # Erster Start setzt die kontinuierliche Sitzungsuhr
         if charge["session_start_time"] is None:
-            charge["session_start_time"] = time.time()
+            charge["session_start_time"] = now
 
         charge["active"] = True
         charge["paused"] = False
         charge["unplug_modal"] = None
+        charge["unplug_cooldown_until"] = now + 10.0  # 10s Schonfrist beim Start
+        charge["flow_continuous_seconds"] = 0.0
+        charge["had_flowing"] = False
         charge["waiting_for_new_plug"] = False
-        charge["last_wh_time"] = time.time()
+        charge["last_wh_time"] = now
         if not charge["devices"]:
             charge["devices"] = [new_device_entry(1, "lamp")]
             charge["current_device_idx"] = 0
-        logger.info(f">>> START (Gesamtlaufzeit läuft durchgehend) <<<")
+        logger.info(f">>> START (Schonfrist bis +10s aktiviert) <<<")
 
     relay_control(True)
     return jsonify({"status": "ok"})
@@ -762,7 +785,7 @@ def stop_charge():
         charge["paused"] = True
         charge["last_wh_time"] = None
     relay_control(False)
-    logger.info(">>> PAUSE (Gesamtlaufzeit läuft weiter) <<<")
+    logger.info(">>> PAUSE <<<")
     return jsonify({"status": "ok"})
 
 # =====================================================================
@@ -774,6 +797,7 @@ def unplug_action():
     action = data.get("action")
     # action: "no_resume" | "yes_unplugged" | "select_existing" | "prep_new_device" | "finish"
 
+    now = time.time()
     with lock:
         if action == "no_resume":
             # 1. Selbes aktuelles Gerät fortsetzen
@@ -781,15 +805,18 @@ def unplug_action():
             charge["waiting_for_new_plug"] = False
             charge["active"] = True
             charge["paused"] = False
-            charge["last_wh_time"] = time.time()
+            charge["unplug_cooldown_until"] = now + 10.0  # 10s Schonfrist
+            charge["flow_continuous_seconds"] = 0.0
+            charge["last_wh_time"] = now
             relay_control(True)
-            logger.info("Unplug: Selbes Gerät direkt fortgesetzt -> Relais EIN.")
+            logger.info("Unplug: Selbes Gerät direkt fortgesetzt -> Relais EIN, Schonfrist +10s.")
             return jsonify({"status": "ok", "state": "resumed"})
 
         elif action == "yes_unplugged":
             # 2. Stecker abgezogen -> Zeige Auswahl: Früheres Gerät vs. Neues Gerät vs. Beenden
             charge["unplug_modal"] = "ASK_NEXT_DEVICE"
             charge["waiting_for_new_plug"] = False
+            charge["unplug_cooldown_until"] = now + 10.0
             logger.info("Unplug: Bestätigt -> Zeige Geräteauswahl (früheres Gerät oder neues Gerät).")
             return jsonify({"status": "ok", "state": "ask_next_device", "devices": charge["devices"]})
 
@@ -801,6 +828,9 @@ def unplug_action():
                 charge["target_is_new"] = False
                 charge["unplug_modal"] = None
                 charge["waiting_for_new_plug"] = True
+                charge["unplug_cooldown_until"] = now + 10.0
+                charge["flow_continuous_seconds"] = 0.0
+                charge["had_flowing"] = False
                 charge["active"] = False
                 charge["paused"] = True
                 relay_control(True)
@@ -813,10 +843,13 @@ def unplug_action():
             charge["target_is_new"] = True
             charge["unplug_modal"] = None
             charge["waiting_for_new_plug"] = True
+            charge["unplug_cooldown_until"] = now + 10.0
+            charge["flow_continuous_seconds"] = 0.0
+            charge["had_flowing"] = False
             charge["active"] = False
             charge["paused"] = True
             relay_control(True)
-            logger.info("Unplug: Neues Gerät vorbereitet -> Relais EIN geschaltet!")
+            logger.info("Unplug: Neues Gerät vorbereitet -> Relais EIN, warte auf Stromfluss!")
             return jsonify({"status": "ok", "state": "waiting_for_plug"})
 
         elif action == "finish":
@@ -1058,6 +1091,8 @@ def debug():
         "charge_active": charge["active"],
         "charge_paused": charge["paused"],
         "unplug_modal": charge["unplug_modal"],
+        "unplug_cooldown_until": charge["unplug_cooldown_until"],
+        "flow_continuous_seconds": charge["flow_continuous_seconds"],
         "waiting_for_new_plug": charge["waiting_for_new_plug"],
         "target_is_new": charge.get("target_is_new", True),
         "session_elapsed": round(elapsed, 1),
@@ -1608,6 +1643,7 @@ var done = false, lastR = null;
 var localElapsed = 0;
 var sessionStarted = false;
 var localTimerInterval = null;
+var lastActionLocalTime = 0; // Lokale Schonfrist im Frontend (verhindert Pop-up Kaskaden)
 
 var STROMPREIS_NETTO = 0.35;
 var currentCountry = { code: 'DE', name: 'Deutschland', flag: '🇩🇪', vat_name: 'MwSt.', rate: 19.0 };
@@ -1628,7 +1664,6 @@ function updateTimerDisplay(){
   if (el) el.innerText = fs(localElapsed);
 }
 
-// Daueruhr läuft immer durchgehend ab dem ersten Start
 function startContinuousTimer(){
   if (localTimerInterval) return;
   localTimerInterval = setInterval(function(){
@@ -1651,6 +1686,7 @@ function post(u,d){
 }
 
 function startFreshSession(){
+  lastActionLocalTime = Date.now();
   post('/reset_session').then(function(){
     done = false;
     lastR = null;
@@ -1677,6 +1713,7 @@ function startFreshSession(){
 
 function doStart(){
   if(done) return;
+  lastActionLocalTime = Date.now();
   sessionStarted = true;
   startContinuousTimer();
   document.getElementById('sPill').className = 'pill pill-on';
@@ -1686,6 +1723,7 @@ function doStart(){
 
 function doStop(){
   if(done) return;
+  lastActionLocalTime = Date.now();
   document.getElementById('sPill').className = 'pill pill-p';
   document.getElementById('sTxt').innerText = 'Pause';
   post('/stop').then(function(){ poll(); });
@@ -1695,12 +1733,14 @@ function devAct(a){
   if(a === 'continue'){
     doStart();
   } else if(a === 'finish'){
+    lastActionLocalTime = Date.now();
     post('/logout').then(function(r){ showReceipt(r); });
   }
 }
 
 // ABSTECK- & WECHSEL-ANTWORTEN
 function handleUnplugResponse(action, devIdx){
+  lastActionLocalTime = Date.now();
   hideM('modalAskUnplug');
   hideM('modalAskNextDevice');
   var payload = { action: action };
@@ -1724,7 +1764,7 @@ function renderReusableDevices(devs){
     var div = document.createElement('div');
     div.className = 'reuse-card';
     div.onclick = function(){ handleUnplugResponse('select_existing', idx); };
-    div.innerHTML = '<div class="reuse-title"><span>' + (d.icon || '🔌') + ' ' + (d.name || ('Gerät ' + (idx+1))) + '</span><span style="font-size:11px;background:#bfdbfe;color:#1e40af;padding:2px 8px;border-radius:10px">Wiederverwenden</span></div>' +
+    div.innerHTML = '<div class="reuse-title"><span>' + (d.icon || '🔌') + ' ' + (d.name || ('Gerät ' + (idx+1))) + '</span><span style="font-size:11px;background:#bfdbfe;color:#1e40af;padding:2px 8px;border-radius:10px">Fortsetzen</span></div>' +
                     '<div class="reuse-meta">Bisher: <b>' + fs(d.flow_duration_sec || 0) + '</b> Stromfluss · <b>' + (d.wh || 0).toFixed(3) + ' Wh</b></div>';
     c.appendChild(div);
   });
@@ -2018,15 +2058,16 @@ function poll(){
       document.getElementById('sTxt').innerText = 'Bereit';
     }
 
-    // Modal Status Management
-    if(d.unplug_modal === 'ASK_UNPLUG'){
+    // Modal Status Management (mit 6s lokaler Schonfrist gegen Pop-up Kaskaden)
+    var isRecentAction = (Date.now() - lastActionLocalTime < 6000);
+    if(d.unplug_modal === 'ASK_UNPLUG' && !isRecentAction){
       showM('modalAskUnplug');
       hideM('modalAskNextDevice');
-    } else if(d.unplug_modal === 'ASK_NEXT_DEVICE'){
+    } else if(d.unplug_modal === 'ASK_NEXT_DEVICE' && !isRecentAction){
       hideM('modalAskUnplug');
       renderReusableDevices(d.devices);
       showM('modalAskNextDevice');
-    } else {
+    } else if(!d.unplug_modal || isRecentAction){
       hideM('modalAskUnplug');
       hideM('modalAskNextDevice');
     }
