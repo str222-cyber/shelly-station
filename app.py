@@ -213,6 +213,10 @@ def async_cloud_control(turn_on=True):
 
 def fetch_live_cloud_metrics():
     now = time.time()
+    with state_lock:
+        if now - global_state["last_fetch_time"] < 0.8:
+            return global_state["last_watt"], global_state["last_amp"], global_state["last_volt"]
+
     payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID}
     try:
         res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=2.0).json()
@@ -252,13 +256,13 @@ def fetch_live_cloud_metrics():
 # --- SERVER-HINTERGRUND-THREAD (TRACKING & AI ENGINE) ---
 # Immun gegen Handy-Standby / Verbindungsabbruch
 def background_metering_loop():
-    last_tick = time.time()
+    last_loop_time = time.time()
     while True:
         try:
             time.sleep(1.0)
             now = time.time()
-            dt = max(0.1, min(5.0, now - last_tick))
-            last_tick = now
+            dt = max(0.1, min(5.0, now - last_loop_time))
+            last_loop_time = now
 
             watt, amp, volt = fetch_live_cloud_metrics()
 
@@ -273,7 +277,7 @@ def background_metering_loop():
 
                 # 1. Kontinuierliche Integration
                 wh_increment = (watt * dt) / 3600.0
-                u["total_seconds"] += dt
+                u["accumulated_seconds"] += dt
                 u["total_wh"] += wh_increment
                 u["total_kwh"] = u["total_wh"] / 1000.0
                 u["total_cost"] = u["total_kwh"] * STROMPREIS_PER_KWH
@@ -294,7 +298,6 @@ def background_metering_loop():
                         peak_w = max(dev["peak_w"], prof["typical_w"] * 0.7)
                         nom_wh = prof["nominal_wh"] or 20.0
                         
-                        # Schätzung des State of Charge (SoC) basierend auf geladener Energie & aktuellem Leistungsabfall
                         energy_soc = (dev["wh"] / nom_wh) * 100.0
                         
                         if watt > peak_w * prof["cv_ratio"]:
@@ -335,7 +338,7 @@ def background_metering_loop():
                 # 5. Erkennung: Gerät ausgesteckt / Null-Last
                 if watt < 0.3 and u.get("active") and not u.get("paused"):
                     global_state["consecutive_zero_w_count"] += 1
-                    if global_state["consecutive_zero_w_count"] >= 4 and u["total_seconds"] > 10:
+                    if global_state["consecutive_zero_w_count"] >= 4 and u["accumulated_seconds"] > 10:
                         u["unplug_dialog_active"] = True
                         u["active"] = False
                         u["paused"] = True
@@ -350,7 +353,7 @@ def background_metering_loop():
 # Hintergrund-Thread starten
 threading.Thread(target=background_metering_loop, daemon=True).start()
 
-# --- PDF-GENERATOR (WEASYPRINT MIT ROBUST REPORTLAB FALLBACK) ---
+# --- PDF-GENERATOR ---
 def generate_pdf_invoice(report_data):
     if WEASYPRINT_AVAILABLE:
         try:
@@ -378,10 +381,6 @@ def generate_pdf_invoice(report_data):
             .brand {{ font-size: 20pt; font-weight: 800; color: #2563eb; letter-spacing: -0.5px; }}
             .meta {{ font-size: 9pt; color: #64748b; margin-top: 4px; }}
             .sec-badge {{ background: #eff6ff; border: 1px solid #bfdbfe; color: #1e40af; font-size: 8.5pt; font-weight: 700; padding: 4px 8px; border-radius: 6px; display: inline-block; margin-top: 6px; }}
-            .summary-cards {{ display: table; width: 100%; margin: 15px 0 20px 0; }}
-            .card-cell {{ display: table-cell; width: 33.33%; padding: 10px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; vertical-align: middle; }}
-            .card-title {{ font-size: 8pt; text-transform: uppercase; color: #64748b; font-weight: 700; }}
-            .card-val {{ font-size: 14pt; font-weight: 800; color: #0f172a; margin-top: 3px; }}
             table {{ width: 100%; border-collapse: collapse; margin-top: 15px; }}
             th {{ background-color: #f1f5f9; color: #334155; text-align: left; padding: 9px 10px; font-size: 9pt; border-bottom: 2px solid #cbd5e1; text-transform: uppercase; }}
             td {{ padding: 9px 10px; font-size: 9pt; border-bottom: 1px solid #e2e8f0; vertical-align: middle; }}
@@ -448,15 +447,11 @@ def generate_pdf_invoice(report_data):
 
     title_style = ParagraphStyle('TitleStyle', parent=styles['Heading1'], fontSize=18, textColor=colors.HexColor("#2563eb"), spaceAfter=4)
     meta_style = ParagraphStyle('MetaStyle', parent=styles['Normal'], fontSize=9, textColor=colors.HexColor("#64748b"), spaceAfter=12)
-    h2_style = ParagraphStyle('H2Style', parent=styles['Heading2'], fontSize=12, textColor=colors.HexColor("#0f172a"), spaceBefore=10, spaceAfter=6)
-    body_style = ParagraphStyle('BodyStyle', parent=styles['Normal'], fontSize=9, textColor=colors.HexColor("#334155"))
-    bold_style = ParagraphStyle('BoldStyle', parent=styles['Normal'], fontSize=9, textColor=colors.HexColor("#0f172a"), fontName="Helvetica-Bold")
 
     story.append(Paragraph("⚡ Smart Power Hub", title_style))
     story.append(Paragraph(f"Sammelquittung • Beleg-Nr: {report_data.get('invoice_id')} • Datum: {time.strftime('%d.%m.%Y %H:%M')}<br/>Station: {PHYSICAL_STATION_TOKEN} | Arbeitspreis: {STROMPREIS_PER_KWH:.3f} €/kWh", meta_style))
     story.append(HRFlowable(width="100%", thickness=1.5, color=colors.HexColor("#2563eb"), spaceAfter=14))
 
-    # Geräte-Tabelle
     table_data = [["Pos", "Gerät", "Dauer", "Energie (Wh)", "Betrag (€)"]]
     for idx, d in enumerate(report_data.get("devices", []), 1):
         table_data.append([
@@ -520,7 +515,8 @@ def get_or_create_user_session():
                 "paused": False,
                 "terminated": False,
                 "station_verified": session.get("station_verified", False),
-                "total_seconds": 0,
+                "start_timestamp": None,
+                "accumulated_seconds": 0.0,
                 "total_wh": 0.0,
                 "total_kwh": 0.0,
                 "total_cost": 0.0,
@@ -536,7 +532,8 @@ def get_or_create_user_session():
                         "name": "📱 Smartphone / Tablet",
                         "icon": "📱",
                         "is_battery": True,
-                        "duration_sec": 0,
+                        "start_timestamp": None,
+                        "duration_sec": 0.0,
                         "wh": 0.0,
                         "cost": 0.0,
                         "peak_w": 0.0,
@@ -549,7 +546,6 @@ def get_or_create_user_session():
                 "last_report": None
             }
         else:
-            # Synchronisiere Station-Verification falls per QR gesetzt
             if session.get("station_verified", False):
                 user_sessions[uid]["station_verified"] = True
         return user_sessions[uid], uid
@@ -642,11 +638,7 @@ MAIN_PAGE_HTML = """
             --accent-green: #059669;
             --accent-amber: #d97706;
             --accent-red: #dc2626;
-            --accent-purple: #7c3aed;
-            --accent-cyan: #0891b2;
             --border-color: #e2e8f0;
-            --border-dark: #cbd5e1;
-            --shadow-subtle: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -2px rgba(0, 0, 0, 0.05);
             --shadow-card: 0 12px 30px -6px rgba(15, 23, 42, 0.08), 0 4px 8px -4px rgba(15, 23, 42, 0.04);
         }
 
@@ -681,7 +673,7 @@ MAIN_PAGE_HTML = """
         .status-off .status-dot { background: #94a3b8; }
         .status-paused .status-dot { background: var(--accent-amber); }
 
-        /* AI LIVE BANNER & LASTPROFIL */
+        /* AI LIVE BANNER */
         .ai-banner {
             background: #f8fafc;
             border: 1px solid var(--border-color);
@@ -701,7 +693,6 @@ MAIN_PAGE_HTML = """
         .ai-stage { font-size: 12px; font-weight: 600; color: var(--accent-primary); margin-top: 2px; }
         .ai-metrics { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
 
-        /* BATTERY CHARGE BAR */
         .charge-bar-wrap { margin-top: 10px; background: #e2e8f0; border-radius: 10px; height: 8px; width: 100%; overflow: hidden; }
         .charge-bar-fill { background: linear-gradient(90deg, #2563eb, #10b981); height: 100%; width: 10%; border-radius: 10px; transition: width 0.4s ease; }
         .charge-info { display: flex; justify-content: space-between; font-size: 10.5px; color: var(--text-muted); margin-top: 4px; font-weight: 600; }
@@ -1009,7 +1000,7 @@ MAIN_PAGE_HTML = """
                 <div class="stat-card">
                     <div class="stat-label">Laufzeit</div>
                     <div class="stat-val" id="timer">00:00:00</div>
-                    <div class="stat-sub">Server-synchronisiert</div>
+                    <div class="stat-sub" id="timerSub">Läuft sekundengenau</div>
                 </div>
             </div>
 
@@ -1085,6 +1076,10 @@ MAIN_PAGE_HTML = """
         let active80ModalShown = false;
         let active100ModalShown = false;
 
+        let localElapsedSeconds = 0;
+        let isRunningLocally = false;
+        let localTimerInterval = null;
+
         function openModal(id) { document.getElementById(id).style.display = 'flex'; }
         function closeModal(id) { document.getElementById(id).style.display = 'none'; }
 
@@ -1094,6 +1089,27 @@ MAIN_PAGE_HTML = """
             let m = Math.floor((s % 3600) / 60).toString().padStart(2, '0');
             let secRem = Math.floor(s % 60).toString().padStart(2, '0');
             return `${h}:${m}:${secRem}`;
+        }
+
+        function updateTimerDisplay(sec) {
+            document.getElementById('timer').innerText = formatSeconds(sec);
+        }
+
+        function startTimerTick() {
+            if (localTimerInterval) clearInterval(localTimerInterval);
+            localTimerInterval = setInterval(() => {
+                if (isRunningLocally && !isTerminated) {
+                    localElapsedSeconds += 1;
+                    updateTimerDisplay(localElapsedSeconds);
+                }
+            }, 1000);
+        }
+
+        function stopTimerTick() {
+            if (localTimerInterval) {
+                clearInterval(localTimerInterval);
+                localTimerInterval = null;
+            }
         }
 
         async function sendAction(url, data={}) {
@@ -1109,14 +1125,26 @@ MAIN_PAGE_HTML = """
 
         async function startCharging() {
             if (isTerminated) return;
-            await sendAction('/start');
-            setTimeout(fetchTelemetry, 100);
+            isRunningLocally = true;
+            startTimerTick();
+            
+            document.getElementById('statusBadge').className = "status-pill status-on";
+            document.getElementById('statusText').innerText = "Aktiv / Strom fließt";
+            
+            sendAction('/start');
+            setTimeout(fetchTelemetry, 150);
         }
 
         async function pauseCharging() {
             if (isTerminated) return;
-            await sendAction('/stop');
-            setTimeout(fetchTelemetry, 100);
+            isRunningLocally = false;
+            stopTimerTick();
+            
+            document.getElementById('statusBadge').className = "status-pill status-paused";
+            document.getElementById('statusText').innerText = "Pausiert";
+            
+            sendAction('/stop');
+            setTimeout(fetchTelemetry, 150);
         }
 
         async function selectDeviceProfile(key) {
@@ -1138,11 +1166,11 @@ MAIN_PAGE_HTML = """
             closeModal('battery100Modal');
 
             if (action === 'continue') {
-                await sendAction('/device_action', { action: 'continue' });
-                fetchTelemetry();
+                await startCharging();
             } else if (action === 'new_device') {
                 openModal('deviceModal');
             } else if (action === 'finish') {
+                stopTimerTick();
                 let report = await sendAction('/logout');
                 renderFinalReceipt(report);
             }
@@ -1151,7 +1179,7 @@ MAIN_PAGE_HTML = """
         async function resumeBeyond80() {
             closeModal('battery80Modal');
             await sendAction('/resume_beyond_80');
-            fetchTelemetry();
+            startCharging();
         }
 
         async function toggle80Protection(enabled) {
@@ -1160,6 +1188,8 @@ MAIN_PAGE_HTML = """
 
         function renderFinalReceipt(report) {
             isTerminated = true;
+            isRunningLocally = false;
+            stopTimerTick();
             lastReport = report;
             document.getElementById('mainCard').style.display = 'none';
             document.getElementById('receiptCard').style.display = 'block';
@@ -1221,6 +1251,21 @@ MAIN_PAGE_HTML = """
                     return;
                 }
 
+                // Synchronisiere lokalen Timer mit dem Server
+                if (data.active) {
+                    isRunningLocally = true;
+                    if (!localTimerInterval) startTimerTick();
+                    if (Math.abs(localElapsedSeconds - data.elapsed_seconds) > 2) {
+                        localElapsedSeconds = Math.floor(data.elapsed_seconds);
+                        updateTimerDisplay(localElapsedSeconds);
+                    }
+                } else {
+                    isRunningLocally = false;
+                    stopTimerTick();
+                    localElapsedSeconds = Math.floor(data.elapsed_seconds);
+                    updateTimerDisplay(localElapsedSeconds);
+                }
+
                 // UNPLUG / PAUSE DIALOG TRIGGER
                 if (data.unplug_dialog_active) {
                     openModal('swapModal');
@@ -1260,7 +1305,6 @@ MAIN_PAGE_HTML = """
                 document.getElementById('amp').innerText = data.current_ampere.toFixed(3);
                 document.getElementById('milliAmp').innerText = (data.current_ampere * 1000.0).toFixed(0);
                 document.getElementById('watt').innerText = data.watt.toFixed(3);
-                document.getElementById('timer').innerText = formatSeconds(data.elapsed_seconds);
                 document.getElementById('wh').innerText = data.wh.toFixed(4);
                 document.getElementById('mwh').innerText = (data.wh * 1000.0).toFixed(1);
                 document.getElementById('cost').innerText = data.cost.toFixed(5);
@@ -1326,7 +1370,6 @@ ADMIN_DASHBOARD_HTML = """
             --accent-green: #10b981;
             --accent-amber: #f59e0b;
             --accent-red: #ef4444;
-            --accent-purple: #8b5cf6;
             --border-color: #1e293b;
         }
         * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; padding: 0; }
@@ -1346,17 +1389,14 @@ ADMIN_DASHBOARD_HTML = """
         .section-card { background: var(--card-bg); border: 1px solid var(--border-color); border-radius: 18px; padding: 20px; margin-bottom: 24px; }
         .section-title { font-size: 16px; font-weight: 700; color: #ffffff; margin-bottom: 14px; display: flex; justify-content: space-between; align-items: center; }
 
-        /* LIVE TELEMETRY WIDGET */
         .live-box { background: var(--card-sub); border-radius: 14px; padding: 14px; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 14px; }
         .live-item { text-align: left; }
         .live-label { font-size: 10.5px; text-transform: uppercase; color: var(--text-muted); font-weight: 700; }
         .live-val { font-size: 18px; font-weight: 800; color: #ffffff; margin-top: 2px; }
 
-        /* BREAKDOWN BAR */
         .dev-breakdown-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--border-color); font-size: 13.5px; }
         .dev-breakdown-row:last-child { border-bottom: none; }
 
-        /* TABLE */
         table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
         th { background: var(--card-sub); color: var(--text-muted); padding: 10px; text-align: left; font-size: 11px; text-transform: uppercase; }
         td { padding: 10px; border-bottom: 1px solid var(--border-color); }
@@ -1379,7 +1419,6 @@ ADMIN_DASHBOARD_HTML = """
             <span class="admin-badge">Admin Master Authentifiziert</span>
         </div>
 
-        <!-- KPI GRID -->
         <div class="grid-4">
             <div class="kpi-card">
                 <div class="kpi-label">Umsatz Heute</div>
@@ -1405,7 +1444,6 @@ ADMIN_DASHBOARD_HTML = """
             </div>
         </div>
 
-        <!-- LIVE STATIONS OVERVIEW & OVERRIDE CONTROLS -->
         <div class="section-card">
             <div class="section-title">
                 <span>🔴 Live Telemetrie & Notfall-Steuerung</span>
@@ -1434,7 +1472,6 @@ ADMIN_DASHBOARD_HTML = """
             </div>
         </div>
 
-        <!-- GERÄTE BREAKDOWN -->
         <div class="section-card">
             <div class="section-title">📊 Detailliertes Geräte-Breakdown</div>
             {% for key, prof in device_profiles.items() %}
@@ -1455,7 +1492,6 @@ ADMIN_DASHBOARD_HTML = """
             {% endfor %}
         </div>
 
-        <!-- SITZUNGSHISTORIE -->
         <div class="section-card">
             <div class="section-title">📑 Letzte Sitzungen</div>
             <table>
@@ -1515,7 +1551,6 @@ ADMIN_DASHBOARD_HTML = """
 def index():
     u, uid = get_or_create_user_session()
     
-    # Vor-Ort-Sicherheitsüberprüfung erforderlich
     if not u.get("station_verified"):
         return render_template_string(SECURITY_LOCK_HTML, required_token=PHYSICAL_STATION_TOKEN, admin_token=ADMIN_SECRET_TOKEN)
     
@@ -1543,6 +1578,13 @@ def get_status():
             "report": u.get("last_report")
         })
 
+    now = time.time()
+    
+    # Präzise Zeitberechnung (kumulierte Sekunden + aktuelle Live-Spanne)
+    live_elapsed = u.get("accumulated_seconds", 0.0)
+    if u.get("active") and u.get("start_timestamp"):
+        live_elapsed = u.get("accumulated_seconds", 0.0) + (now - u["start_timestamp"])
+
     with state_lock:
         w = global_state["last_watt"]
         a = global_state["last_amp"]
@@ -1550,7 +1592,16 @@ def get_status():
         relay = global_state["relay_on"]
 
     curr_idx = u.get("current_device_idx", 0)
-    current_device = u["devices"][curr_idx] if 0 <= curr_idx < len(u.get("devices", [])) else None
+    devices_copy = []
+    for idx, d in enumerate(u.get("devices", [])):
+        dev_dur = d.get("duration_sec", 0.0)
+        if u.get("active") and idx == curr_idx and d.get("start_timestamp"):
+            dev_dur += (now - d["start_timestamp"])
+        d_dict = dict(d)
+        d_dict["duration_sec"] = dev_dur
+        devices_copy.append(d_dict)
+
+    current_device = devices_copy[curr_idx] if 0 <= curr_idx < len(devices_copy) else None
 
     return jsonify({
         "active": u.get("active", False),
@@ -1559,7 +1610,7 @@ def get_status():
         "current_ampere": a,
         "voltage": v,
         "relay_on": relay,
-        "elapsed_seconds": u.get("total_seconds", 0),
+        "elapsed_seconds": live_elapsed,
         "wh": u.get("total_wh", 0.0),
         "kwh": u.get("total_kwh", 0.0),
         "cost": u.get("total_cost", 0.0),
@@ -1570,7 +1621,7 @@ def get_status():
         "unplug_dialog_active": u.get("unplug_dialog_active", False),
         "current_device_idx": curr_idx,
         "current_device": current_device,
-        "devices": u.get("devices", []),
+        "devices": devices_copy,
         "session_terminated": False
     })
 
@@ -1580,6 +1631,7 @@ def start():
     if not u.get("station_verified") or u.get("terminated"):
         return jsonify({"status": "forbidden"}), 403
 
+    now = time.time()
     with state_lock:
         global_state["active_user_id"] = uid
         global_state["consecutive_zero_w_count"] = 0
@@ -1588,7 +1640,12 @@ def start():
     u["paused"] = False
     u["unplug_dialog_active"] = False
     u["stop_reason"] = None
-    
+    u["start_timestamp"] = now
+
+    curr_idx = u.get("current_device_idx", 0)
+    if 0 <= curr_idx < len(u.get("devices", [])):
+        u["devices"][curr_idx]["start_timestamp"] = now
+
     async_cloud_control(turn_on=True)
     return jsonify({"status": "ok"})
 
@@ -1598,8 +1655,21 @@ def stop():
     if not u.get("station_verified") or u.get("terminated"):
         return jsonify({"status": "forbidden"}), 403
 
+    now = time.time()
+    if u.get("active") and u.get("start_timestamp"):
+        u["accumulated_seconds"] += (now - u["start_timestamp"])
+    
     u["active"] = False
     u["paused"] = True
+    u["start_timestamp"] = None
+
+    curr_idx = u.get("current_device_idx", 0)
+    if 0 <= curr_idx < len(u.get("devices", [])):
+        dev = u["devices"][curr_idx]
+        if dev.get("start_timestamp"):
+            dev["duration_sec"] += (now - dev["start_timestamp"])
+            dev["start_timestamp"] = None
+
     async_cloud_control(turn_on=False)
     return jsonify({"status": "ok"})
 
@@ -1609,6 +1679,7 @@ def set_device():
     if not u.get("station_verified") or u.get("terminated"):
         return jsonify({"status": "forbidden"}), 403
 
+    now = time.time()
     data = request.get_json() or {}
     key = data.get("key", "phone")
     custom_name = data.get("name")
@@ -1617,15 +1688,20 @@ def set_device():
     display_name = custom_name if custom_name else prof["name"]
 
     curr_idx = u.get("current_device_idx", 0)
-    # Falls das aktuelle Gerät bereits geladen wurde (> 5s), neues Gerät anfügen
-    if 0 <= curr_idx < len(u["devices"]) and u["devices"][curr_idx].get("duration_sec", 0) > 5:
+    if 0 <= curr_idx < len(u["devices"]) and u["devices"][curr_idx].get("duration_sec", 0) > 3:
+        # Vorheriges Gerät abschließen
+        if u.get("active") and u["devices"][curr_idx].get("start_timestamp"):
+            u["devices"][curr_idx]["duration_sec"] += (now - u["devices"][curr_idx]["start_timestamp"])
+            u["devices"][curr_idx]["start_timestamp"] = None
+
         new_dev = {
             "id": len(u["devices"]) + 1,
             "key": key,
             "name": f"{prof['icon']} {display_name}",
             "icon": prof["icon"],
             "is_battery": prof["is_battery"],
-            "duration_sec": 0,
+            "start_timestamp": now if u.get("active") else None,
+            "duration_sec": 0.0,
             "wh": 0.0,
             "cost": 0.0,
             "peak_w": 0.0,
@@ -1636,12 +1712,13 @@ def set_device():
         u["devices"].append(new_dev)
         u["current_device_idx"] = len(u["devices"]) - 1
     else:
-        # Bestehendes Gerät überschreiben
         u["devices"][curr_idx]["key"] = key
         u["devices"][curr_idx]["name"] = f"{prof['icon']} {display_name}"
         u["devices"][curr_idx]["icon"] = prof["icon"]
         u["devices"][curr_idx]["is_battery"] = prof["is_battery"]
         u["devices"][curr_idx]["wh_to_100"] = prof["nominal_wh"] * 0.9
+        if u.get("active") and not u["devices"][curr_idx].get("start_timestamp"):
+            u["devices"][curr_idx]["start_timestamp"] = now
 
     u["battery_80_triggered"] = False
     u["battery_100_triggered"] = False
@@ -1657,11 +1734,7 @@ def device_action():
     action = data.get("action")
 
     if action == "continue":
-        u["unplug_dialog_active"] = False
-        u["paused"] = False
-        u["active"] = True
-        async_cloud_control(turn_on=True)
-        return jsonify({"status": "ok"})
+        return start()
 
     elif action == "finish":
         return logout()
@@ -1673,11 +1746,8 @@ def resume_beyond_80():
     u, uid = get_or_create_user_session()
     u["battery_80_protection_enabled"] = False
     u["battery_80_triggered"] = False
-    u["active"] = True
-    u["paused"] = False
     u["stop_reason"] = None
-    async_cloud_control(turn_on=True)
-    return jsonify({"status": "ok"})
+    return start()
 
 @app.route('/toggle_80_protection', methods=['POST'])
 def toggle_80_protection():
@@ -1689,9 +1759,20 @@ def toggle_80_protection():
 @app.route('/logout', methods=['POST', 'GET'])
 def logout():
     u, uid = get_or_create_user_session()
+    now = time.time()
+    
+    if u.get("active") and u.get("start_timestamp"):
+        u["accumulated_seconds"] += (now - u["start_timestamp"])
+        curr_idx = u.get("current_device_idx", 0)
+        if 0 <= curr_idx < len(u.get("devices", [])):
+            dev = u["devices"][curr_idx]
+            if dev.get("start_timestamp"):
+                dev["duration_sec"] += (now - dev["start_timestamp"])
+
     u["active"] = False
     u["paused"] = False
     u["terminated"] = True
+    u["start_timestamp"] = None
     async_cloud_control(turn_on=False)
 
     with state_lock:
@@ -1700,11 +1781,12 @@ def logout():
 
     invoice_id = f"RE-{time.strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}"
 
+    total_sec = u.get("accumulated_seconds", 0.0)
     report = {
         "invoice_id": invoice_id,
         "date": time.strftime('%d.%m.%Y %H:%M'),
-        "total_seconds": u.get("total_seconds", 0),
-        "time_formatted": format_time(u.get("total_seconds", 0)),
+        "total_seconds": total_sec,
+        "time_formatted": format_time(total_sec),
         "total_wh": u.get("total_wh", 0.0),
         "total_kwh": u.get("total_kwh", 0.0),
         "total_cost": u.get("total_cost", 0.0),
@@ -1712,7 +1794,6 @@ def logout():
     }
     u["last_report"] = report
 
-    # Statistik im Betreiber-Dashboard aktualisieren
     with state_lock:
         global_state["total_historical_sessions"] += 1
         global_state["total_historical_kwh"] += report["total_kwh"]
