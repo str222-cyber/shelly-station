@@ -538,12 +538,12 @@ class AssistantBot:
         action_payload = None
 
         # 1. AKTION: PAUSE
-        if any(kw in msg for kw in ["pause", "pausieren", "stoppen", "halt", "aus schalten", "ausschalten"]):
+        if any(kw in msg for kw in ["paus", "stopp", "halt", "aus schalten", "ausschalten", "steckdose aus"]):
             executed_action = "pause"
             bot_text = f"⏸️ Ich habe die Stromzufuhr für **{dev_name}** pausiert. Die Steckdose ist jetzt abgeschaltet (0.0 W). Du kannst jederzeit mit 'Fortsetzen' oder über den Button weiterladen!"
 
         # 2. AKTION: FORTSETZEN
-        elif any(kw in msg for kw in ["fortsetzen", "weiter", "start", "einschalten", "wieder an", "an schalten"]):
+        elif any(kw in msg for kw in ["fortsetz", "weiter", "start", "einschalten", "wieder an", "an schalten", "steckdose an", "lade"]):
             executed_action = "resume"
             bot_text = f"▶️ Ladevorgang für **{dev_name}** fortgesetzt! Das Relais wurde eingeschaltet und Strom fließt wieder."
 
