@@ -905,6 +905,15 @@ def accumulate_energy():
 # =====================================================================
 # KONTINUIERLICHER SERVER-SEITIGER HINTERGRUND-THREAD (24/7 DAEMON)
 # =====================================================================
+
+active_clients = {}
+
+def get_client_type():
+    ua = request.headers.get('User-Agent', '')
+    if any(k in ua.lower() for k in ['mobile', 'android', 'iphone', 'ipad']):
+        return "Smartphone / Tablet"
+    return "Laptop / PC-Browser"
+
 daemon_pid = None
 daemon_lock = threading.Lock()
 
@@ -961,6 +970,19 @@ def check_client_control():
 @app.before_request
 def check_worker_daemon():
     ensure_daemon_started()
+    try:
+        cid = get_client_id()
+        now = time.time()
+        active_clients[cid] = {
+            "last_seen": now,
+            "type": get_client_type(),
+            "ip": request.remote_addr
+        }
+        stale = [k for k, v in active_clients.items() if now - v["last_seen"] > 25.0]
+        for k in stale:
+            active_clients.pop(k, None)
+    except Exception:
+        pass
 
 @app.after_request
 def headers(r):
@@ -1126,14 +1148,27 @@ def get_status():
             )
 
         cid = get_client_id()
-        is_owner = (charge.get("owner_client_id") is None) or (charge.get("owner_client_id") == cid)
-        if charge.get("owner_client_id") is None and charge.get("active"):
-            charge["owner_client_id"] = cid
-            is_owner = True
+        owner = charge.get("owner_client_id")
+        
+        other_clients = {k: v for k, v in active_clients.items() if k != cid}
+        has_other_clients = len(other_clients) > 0
+        other_dev_type = list(other_clients.values())[0]["type"] if other_clients else "Anderes Gerät"
+
+        if owner is None:
+            if not has_other_clients:
+                charge["owner_client_id"] = cid
+                owner = cid
+                is_owner = True
+            else:
+                is_owner = False
+        else:
+            is_owner = (owner == cid)
 
         return jsonify({
             "is_owner": is_owner,
-            "has_owner": bool(charge.get("owner_client_id")),
+            "has_owner": owner is not None,
+            "has_other_clients": has_other_clients,
+            "other_device_type": other_dev_type,
             "battery_state": batt_state,
             "active": charge["active"],
             "paused": charge["paused"],
@@ -2060,6 +2095,30 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 .ein{width:100%;padding:11px;border:1px solid var(--border);border-radius:10px;font-size:13.5px;margin-bottom:8px}
 </style></head><body>
 
+<!-- MODAL: SICHERHEITS- & ZUGANGS-MODUS WAHL -->
+<div id="modalSecurityModeChooser" class="modal" style="display:none;z-index:99999">
+<div class="mbox" style="text-align:center;border:2px solid var(--blue);max-width:440px">
+  <div style="font-size:44px;margin-bottom:6px">🛡️📱</div>
+  <div style="font-size:18px;font-weight:800;margin-bottom:6px;color:#1e40af">Station bereits geöffnet</div>
+  <p style="font-size:13px;color:var(--muted);margin-bottom:18px;line-height:1.45">
+    Diese Ladestation ist aktuell auf einem anderen Gerät (<b id="secOtherDevType" style="color:var(--text)">Laptop / PC-Browser</b>) geöffnet.<br/>
+    <span style="font-size:12px;color:#059669;font-weight:700">Wie möchtest du diese Station nutzen?</span>
+  </p>
+  
+  <div style="display:flex;flex-direction:column;gap:10px">
+    <button class="btn bp" style="background:#059669;padding:13px;font-size:14px;font-weight:700" onclick="chooseSecurityMode('takeover')">
+      📲 Alleinige Steuerung auf dieses Gerät übertragen
+    </button>
+    <button class="btn bs" style="background:#eff6ff;color:#1e40af;border:1.5px solid #bfdbfe;padding:13px;font-size:14px;font-weight:700" onclick="chooseSecurityMode('spectator')">
+      👁️ Nur Lesemodus (Zuschauer / Live-Werte ansehen)
+    </button>
+    <button class="btn bs" style="background:#f8fafc;color:var(--text);border:1px solid #cbd5e1;padding:11px;font-size:13px" onclick="chooseSecurityMode('new_device')">
+      ➕ Eigenes Gerät anstecken & laden
+    </button>
+  </div>
+</div>
+</div>
+
 <!-- MODAL: STEUERUNG UEBERNEHMEN BESTAETIGEN -->
 <div id="modalConfirmTakeover" class="modal" style="display:none">
 <div class="mbox" style="text-align:center;border:2px solid #dc2626">
@@ -2667,6 +2726,21 @@ function executeTakeover(){
 window.showTakeoverPrompt = showTakeoverPrompt;
 window.executeTakeover = executeTakeover;
 
+function chooseSecurityMode(mode){
+  hideM('modalSecurityModeChooser');
+  sessionStorage.setItem('security_mode_chosen', mode);
+  if(mode === 'takeover'){
+    executeTakeover();
+  } else if(mode === 'spectator'){
+    poll();
+  } else if(mode === 'new_device'){
+    executeTakeover();
+    showM('devModal');
+  }
+}
+window.chooseSecurityMode = chooseSecurityMode;
+
+
 
 function startFreshSession(){
   lastActionLocalTime = Date.now();
@@ -3150,6 +3224,12 @@ function poll(){
     var idleSec = d.total_idle_seconds || 0.0;
 
     allRecordedDevices = d.devices || [];
+        // Prompte Sicherheitsabfrage bei zweitem Geraet
+    if(!sessionStorage.getItem('security_mode_chosen') && (d.has_other_clients || d.is_owner === false)){
+      var sdt = document.getElementById('secOtherDevType');
+      if(sdt && d.other_device_type) sdt.innerText = d.other_device_type;
+      showM('modalSecurityModeChooser');
+    }
     var specB = document.getElementById('spectatorBanner');
     if(specB){ specB.style.display = (d.is_owner === false) ? 'flex' : 'none'; }
     // QR-Join Erkennung bei neu gescanntem Geraet
