@@ -450,6 +450,76 @@ class DeviceAI:
             "current_w": round(cw, 2)
         }
 
+    @classmethod
+    def estimate_battery_state(cls, dev_key, current_w, peak_w, wh_loaded, nominal_wh, power_history=None):
+        if not nominal_wh or nominal_wh <= 0:
+            nominal_wh = 65.0
+
+        profile_typical_max_w = {
+            "phone": 18.0,
+            "laptop": 65.0,
+            "ebike": 180.0,
+            "ebike_fast": 350.0,
+            "battery_custom": 80.0
+        }.get(dev_key, 65.0)
+
+        ref_peak_w = max(peak_w, current_w, profile_typical_max_w * 0.7)
+        w_ratio = current_w / ref_peak_w if ref_peak_w > 0 else 0.0
+        energy_added_pct = (wh_loaded / nominal_wh) * 100.0 if nominal_wh > 0 else 0.0
+
+        if current_w < 0.2:
+            phase_key = "idle"
+            phase_name = "Standby / Kein Stromfluss"
+            phase_desc = "Kein messbarer Ladevorgang aktiv"
+            phase_badge = "⏸️ Standby"
+            soc_est = min(100.0, max(0.0, energy_added_pct))
+        elif w_ratio >= 0.65:
+            phase_key = "cc_bulk"
+            phase_name = "⚡ Hauptladung (CC-Phase / Volle Leistung)"
+            phase_desc = f"Akku nimmt maximale Ladeleistung ({current_w:.1f} W) auf (Schnellladebereich 15–75%)"
+            phase_badge = "⚡ CC-Hauptladung"
+            base_soc = 20.0
+            soc_est = min(75.0, base_soc + energy_added_pct * 0.75)
+        elif w_ratio >= 0.20:
+            phase_key = "cv_saturation"
+            phase_name = "🔋 Sättigungsphase (CV-Phase / Akku fast voll)"
+            phase_desc = f"Leistung sinkt auf {current_w:.1f} W ab, Zellenspannung erreicht Maximum (75–92%)"
+            phase_badge = "🔋 CV-Sättigung"
+            norm_fall = (0.65 - w_ratio) / 0.45
+            soc_est = min(93.0, max(75.0, 75.0 + norm_fall * 15.0 + energy_added_pct * 0.2))
+        elif w_ratio >= 0.04:
+            phase_key = "trickle"
+            phase_name = "✨ Abschluss & Balancing (Nahezu voll)"
+            phase_desc = f"Minimale Restleistung ({current_w:.1f} W) zum Ausgleichen der Akkuzellen (93–99%)"
+            phase_badge = "✨ 95-100% Balancing"
+            soc_est = min(99.0, max(93.0, 93.0 + energy_added_pct * 0.1))
+        else:
+            phase_key = "full"
+            phase_name = "🏁 Ladevorgang abgeschlossen (100% Voll)"
+            phase_desc = "Akku ist vollständig geladen"
+            phase_badge = "🏁 100% Voll"
+            soc_est = 100.0
+
+        soc_pct = int(round(min(100.0, max(5.0, soc_est))))
+        wh_left_100 = max(0.0, nominal_wh * (1.0 - soc_pct / 100.0))
+        wh_left_80 = max(0.0, nominal_wh * (0.80 - soc_pct / 100.0))
+        eta_min_100 = int(round((wh_left_100 / current_w) * 60)) if current_w > 0.5 else 0
+        eta_min_80 = int(round((wh_left_80 / current_w) * 60)) if current_w > 0.5 and soc_pct < 80 else 0
+
+        return {
+            "is_battery": True,
+            "soc_percent": soc_pct,
+            "phase_key": phase_key,
+            "phase_name": phase_name,
+            "phase_desc": phase_desc,
+            "phase_badge": phase_badge,
+            "wh_needed_100": round(wh_left_100, 1),
+            "wh_needed_80": round(wh_left_80, 1),
+            "eta_minutes_100": eta_min_100,
+            "eta_minutes_80": eta_min_80
+        }
+
+
 
 # =====================================================================
 # PERSISTENZ
@@ -989,7 +1059,22 @@ def get_status():
             live_watt = round(shelly["watt"], 3)
             live_amp  = round(shelly["amp"], 3)
 
+        # KI-Berechnung von Ladephase und SoC für das aktive Gerät
+        batt_state = None
+        is_batt = active_dev.get("is_battery", False) or active_dev.get("mode") == "battery"
+        if is_batt:
+            pw = max([float(w) for w in charge.get("power_history", [])] or [live_watt])
+            batt_state = DeviceAI.estimate_battery_state(
+                active_dev.get("key", "ebike"),
+                live_watt,
+                pw,
+                active_dev.get("wh", 0.0),
+                active_dev.get("nominal_wh", 500.0),
+                charge.get("power_history", [])
+            )
+
         return jsonify({
+            "battery_state": batt_state,
             "active": charge["active"],
             "paused": charge["paused"],
             "terminated": charge["terminated"],
@@ -2247,13 +2332,21 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
     </div>
   </div>
 
-  <!-- 2. AKKU-LADEMODUS PROGNOSE -->
+  <!-- 2. AKKU-LADEMODUS PROGNOSE & KI-LADEPHASEN ERKENNUNG -->
   <div id="panelBattery" class="prognosis-panel panel-battery" style="display:none">
-    <div class="prog-head">🔋 Akku-Ladefortschritt & Restbedarf bis 100%</div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+      <div class="prog-head" style="margin-bottom:0">🔋 Akku-Ladephase & Ladestand (SoC)</div>
+      <span id="battPhaseBadge" style="font-size:10px;font-weight:800;background:#d1fae5;color:#065f46;padding:2px 8px;border-radius:10px;border:1px solid #a7f3d0">⚡ CC-Hauptladung</span>
+    </div>
+    
+    <div id="battPhaseDesc" style="font-size:11px;color:#065f46;margin-bottom:8px;line-height:1.35">
+      Akku nimmt maximale Ladeleistung auf (Schnellladebereich 15–75%)
+    </div>
+
     <div class="soc-track"><div class="soc-bar" id="socBar" style="width:10%"></div></div>
     <div class="soc-labels">
-      <span>Ladestand: <b id="socPctText">10%</b></span>
-      <span id="socEtaText">~ -- Min</span>
+      <span>Geschätzter Ladestand: <b id="socPctText">--%</b></span>
+      <span id="socEtaText">Restzeit: ~ -- Min</span>
     </div>
     <div class="prog-grid2" style="margin-top:10px">
       <div class="prog-chip">
@@ -2659,11 +2752,29 @@ function updateWysiwygLook(dev, curW, curWh){
     var costNeededNetto = (whNeeded / 1000.0) * STROMPREIS_NETTO;
     var costNeededBrutto = costNeededNetto * vatFactor;
 
-    document.getElementById('socBar').style.width = socPct + '%';
-    document.getElementById('socPctText').innerText = socPct + '%';
-    document.getElementById('socEtaText').innerText = curW > 0.5 ? ('Restzeit: ~' + etaMin + ' Min') : 'Warte auf Strom...';
-    document.getElementById('battWhNeeded').innerText = whNeeded.toFixed(2) + ' Wh';
-    document.getElementById('battCostNeeded').innerText = '+' + costNeededBrutto.toFixed(4) + ' €';
+    if(window.lastStatusPayload && window.lastStatusPayload.battery_state){
+      var bs = window.lastStatusPayload.battery_state;
+      document.getElementById('battPhaseBadge').innerText = bs.phase_badge || '🔋 Akku';
+      document.getElementById('battPhaseDesc').innerText = bs.phase_desc || '';
+      document.getElementById('socBar').style.width = bs.soc_percent + '%';
+      document.getElementById('socPctText').innerText = bs.soc_percent + '%';
+      
+      var etaTxt = bs.eta_minutes_100 > 0 ? ('Restzeit: ~' + bs.eta_minutes_100 + ' Min') : (curW > 0.3 ? 'Fast voll (< 5 Min)' : 'Warte auf Strom...');
+      if(bs.soc_percent < 80 && bs.eta_minutes_80 > 0){
+        etaTxt += ' (bis 80%: ~' + bs.eta_minutes_80 + ' Min)';
+      }
+      document.getElementById('socEtaText').innerText = etaTxt;
+      document.getElementById('battWhNeeded').innerText = (bs.wh_needed_100 || 0).toFixed(1) + ' Wh';
+      var cNeededNetto = ((bs.wh_needed_100 || 0) / 1000.0) * STROMPREIS_NETTO;
+      var cNeededBrutto = cNeededNetto * vatFactor;
+      document.getElementById('battCostNeeded').innerText = '+' + cNeededBrutto.toFixed(4) + ' €';
+    } else {
+      document.getElementById('socBar').style.width = socPct + '%';
+      document.getElementById('socPctText').innerText = socPct + '%';
+      document.getElementById('socEtaText').innerText = curW > 0.5 ? ('Restzeit: ~' + etaMin + ' Min') : 'Warte auf Strom...';
+      document.getElementById('battWhNeeded').innerText = whNeeded.toFixed(2) + ' Wh';
+      document.getElementById('battCostNeeded').innerText = '+' + costNeededBrutto.toFixed(4) + ' €';
+    }
   } else {
     pBatt.style.display = 'none';
     pCont.style.display = 'block';
@@ -2841,6 +2952,7 @@ function renderDevicePills(devs, activeIdx){
 function poll(){
   if(done) return;
   fetch('/status', {cache: 'no-store'}).then(function(r){return r.json()}).then(function(d){
+    window.lastStatusPayload = d;
     if(d.session_terminated && d.report){
       showReceipt(d.report);
       return;
