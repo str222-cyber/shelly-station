@@ -140,14 +140,6 @@ global_state = {
     "last_watt": 0.0,
     "last_amp": 0.0,
     "last_volt": 230.0,
-    "smoothed_watt": 0.0,
-    "smoothed_amp": 0.0,
-    "last_valid_fetch_time": 0.0,
-    "last_shelly_error": None,
-    "transfer_requested": False,
-    "transfer_requester_id": None,
-    "history_w": deque(maxlen=60),
-    "consecutive_zero_w_count": 0,
     "total_historical_sessions": 0,
     "total_historical_kwh": 0.0,
     "total_historical_revenue": 0.0,
@@ -202,15 +194,14 @@ def async_cloud_control(turn_on=True):
         turn_str = "on" if turn_on else "off"
         logger.info(f"[SHELLY-RELAY] 🔌 Sende Relais-Schaltbefehl -> {turn_str.upper()} an Shelly Cloud ({DEVICE_ID})...")
 
-        # 1. Gen 1 / Legacy REST Endpunkt
+        # 1. REST Endpunkt
         try:
             payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID, "turn": turn_str, "channel": 0}
-            r1 = requests.post(f"{SHELLY_CLOUD_URL}/device/relay/control", data=payload, timeout=3.0)
-            logger.info(f"[SHELLY-RELAY] REST /device/relay/control -> HTTP {r1.status_code}")
+            requests.post(f"{SHELLY_CLOUD_URL}/device/relay/control", data=payload, timeout=3.0)
         except Exception as e:
             logger.warning(f"[SHELLY-RELAY] Fehler bei REST control: {e}")
 
-        # 2. Gen 2 / Gen 3 RPC Endpunkt (Switch.Set)
+        # 2. RPC Endpunkt (Switch.Set)
         try:
             rpc_payload = {
                 "auth_key": AUTH_KEY,
@@ -218,254 +209,108 @@ def async_cloud_control(turn_on=True):
                 "method": "Switch.Set",
                 "params": {"id": 0, "on": turn_on}
             }
-            r2 = requests.post(f"{SHELLY_CLOUD_URL}/device/rpc", json=rpc_payload, timeout=3.0)
-            logger.info(f"[SHELLY-RELAY] RPC /device/rpc (Switch.Set) -> HTTP {r2.status_code}: {r2.text[:100]}")
+            requests.post(f"{SHELLY_CLOUD_URL}/device/rpc", json=rpc_payload, timeout=3.0)
         except Exception as e:
             logger.warning(f"[SHELLY-RELAY] Fehler bei RPC Switch.Set: {e}")
             
     threading.Thread(target=_worker, daemon=True).start()
 
-# --- SHELLY TELEMETRIE-ABFRAGE & DETAILLIERTES DEBUGGING ---
-def update_shelly_telemetry_once():
-    try:
-        payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID}
-        t0 = time.time()
-        res_raw = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=5.0)
-        dur = time.time() - t0
-        
-        if res_raw.status_code != 200:
-            logger.warning(f"[SHELLY-CLOUD-API] ⚠️ HTTP {res_raw.status_code} ({dur:.2f}s): {res_raw.text[:150]}")
-            with state_lock:
-                global_state["last_shelly_error"] = f"HTTP {res_raw.status_code}"
-            return False, f"HTTP_{res_raw.status_code}"
-
-        res = res_raw.json()
-        
-        if res.get("isok"):
-            status = res.get("data", {}).get("device_status", {})
-            watt = 0.0
-            amp = 0.0
-            volt = 230.0
-            relay_out = False
-            detected_path = "none"
-
-            # 1. Gen 2 / Gen 3 RPC Struktur (Shelly Plus Plug S / Pro / Mini)
-            if "switch:0" in status:
-                sw = status["switch:0"]
-                watt = float(sw.get("apower", 0.0) or 0.0)
-                amp = float(sw.get("current", 0.0) or 0.0)
-                volt = float(sw.get("voltage", 230.0) or 230.0)
-                relay_out = bool(sw.get("output", False))
-                detected_path = "status['switch:0']"
-            # 2. Gen 1 Meters Struktur (Shelly Plug S Gen 1)
-            elif "meters" in status and len(status["meters"]) > 0:
-                m = status["meters"][0]
-                watt = float(m.get("power", 0.0) or 0.0)
-                amp = float(m.get("current", 0.0) or (watt / 230.0 if watt > 0 else 0.0))
-                volt = float(m.get("voltage", 230.0) or 230.0)
-                detected_path = "status['meters'][0]"
-            # 3. Gen 1 Relays Struktur
-            elif "relays" in status and len(status["relays"]) > 0:
-                r0 = status["relays"][0]
-                watt = float(r0.get("power", 0.0) or 0.0)
-                amp = watt / 230.0 if watt > 0 else 0.0
-                relay_out = bool(r0.get("ison", False))
-                detected_path = "status['relays'][0]"
-            # 4. Direkte Top-Level Felder
-            elif "apower" in status:
-                watt = float(status.get("apower", 0.0) or 0.0)
-                amp = float(status.get("current", 0.0) or 0.0)
-                volt = float(status.get("voltage", 230.0) or 230.0)
-                detected_path = "status['apower']"
-
-            with state_lock:
-                global_state["last_watt"] = max(0.0, watt)
-                global_state["last_amp"] = max(0.0, amp)
-                global_state["last_volt"] = volt if volt > 50 else 230.0
-                global_state["relay_on"] = relay_out
-                global_state["last_valid_fetch_time"] = time.time()
-                global_state["last_shelly_error"] = None
-                global_state["history_w"].append(watt)
-
-            logger.info(f"[SHELLY-CLOUD-API] ✅ Telemetrie OK ({detected_path}): P={watt:.2f} W | I={amp:.3f} A | U={volt:.1f} V | Relais={'EIN' if relay_out else 'AUS'}")
-            return True, None
-        else:
-            err_type = res.get("error") or "UNKNOWN_ERROR"
-            msg = res.get("data", {}).get("messages", ["Keine Detailnachricht"])
-            logger.warning(f"[SHELLY-CLOUD-API] ⚠️ API Fehler '{err_type}': {msg}")
-            with state_lock:
-                global_state["last_shelly_error"] = err_type
-            return False, err_type
-
-    except requests.exceptions.Timeout:
-        logger.warning("[SHELLY-CLOUD-API] ⏱️ Timeout bei Anfrage an Shelly Cloud")
-        return False, "TIMEOUT"
-    except requests.exceptions.ConnectionError as e:
-        logger.warning(f"[SHELLY-CLOUD-API] 🌐 Verbindungsfehler: {e}")
-        return False, "CONNECTION_ERROR"
-    except json.JSONDecodeError as e:
-        logger.error(f"[SHELLY-CLOUD-API] 📄 JSON-Dekodierfehler: {e}")
-        return False, "JSON_ERROR"
-    except Exception as e:
-        logger.error(f"[SHELLY-CLOUD-API] 💥 Unerwarteter Fehler: {e}", exc_info=True)
-        return False, str(e)
-
-# --- DAEMON THREAD 1: GETAKTETER SHELLY-POLLER (10.0s Intervall, 20s Backoff bei Rate Limit) ---
-def shelly_cloud_poller_loop():
-    logger.info("🚀 Shelly Cloud Poller Daemon gestartet (10.0s Takt).")
-    time.sleep(1.0)
-    while True:
-        try:
-            success, err = update_shelly_telemetry_once()
-            if success:
-                time.sleep(10.0)
-            elif err in ["TOO_MANY_REQUESTS", "HTTP_429"]:
-                logger.info("[SHELLY-POLLER] Rate-Limit aktiv. Warte 20 Sekunden zur Entlastung...")
-                time.sleep(20.0)
-            else:
-                time.sleep(10.0)
-        except Exception as e:
-            logger.error(f"[SHELLY-POLLER] Fehler in Poller-Schleife: {e}")
-            time.sleep(10.0)
-
-# --- DAEMON THREAD 2: AUTONOMER MESS-WORKER (Delta-Zeit, Smoothing & Wh-Akkumulation im 1.0s Takt) ---
-def background_metering_worker():
-    logger.info("🚀 Autonomer Hintergrund-Mess-Worker läuft im 1-Sekunden-Takt...")
+# --- EXAKTER BACKGROUND METER WORKER NACH USER-MUSTER ---
+def background_meter_worker():
+    logger.info("🚀 Autonomer Hintergrund-Mess-Worker erfolgreich gestartet!")
     last_loop = time.time()
-    tick_counter = 0
-
     while True:
+        now = time.time()
+        # Delta-Zeit (dt) ermitteln: Vergangene Zeit seit dem letzten Schleifendurchlauf
+        dt = max(1.0, min(5.0, now - last_loop))
+        last_loop = now
+
         try:
-            # 4. Fester Takt: Sauberes 1-Sekunden-Schlafen
-            time.sleep(1.0)
-            now = time.time()
-
-            # 2. Delta-Zeit-Integration: Exakte Zeitmessung seit letztem Durchlauf (begrenzt auf 1.0 bis 5.0s)
-            dt = max(1.0, min(5.0, now - last_loop))
-            last_loop = now
-            tick_counter += 1
-
-            with state_lock:
-                raw_w = global_state["last_watt"]
-                raw_a = global_state["last_amp"]
-
-                # 3. Glättung der Leistung (Smoothing via gleitendem Durchschnitt)
-                if global_state["smoothed_watt"] <= 0.0:
-                    global_state["smoothed_watt"] = raw_w
-                else:
-                    global_state["smoothed_watt"] = (global_state["smoothed_watt"] * 0.8) + (raw_w * 0.2)
-
-                if global_state["smoothed_amp"] <= 0.0:
-                    global_state["smoothed_amp"] = raw_a
-                else:
-                    global_state["smoothed_amp"] = (global_state["smoothed_amp"] * 0.8) + (raw_a * 0.2)
-
-                watt = global_state["smoothed_watt"]
-                amp = global_state["smoothed_amp"]
-
-                # Aktive Session finden
-                active_uid = global_state["active_user_id"]
-                if not active_uid or active_uid not in user_sessions:
-                    for uid_cand, sess_cand in user_sessions.items():
-                        if sess_cand.get("active") and not sess_cand.get("terminated"):
-                            active_uid = uid_cand
-                            global_state["active_user_id"] = uid_cand
-                            break
-
-                if not active_uid or active_uid not in user_sessions:
+            active_uid = global_state.get("active_user_id")
+            
+            for uid, u in user_sessions.items():
+                if not u.get("active", False) and not u.get("detection_mode", False): 
                     continue
+                
+                watt, amp, volt = 0.0, 0.0, 230.0
+                try:
+                    res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data={"auth_key": AUTH_KEY, "id": DEVICE_ID}, timeout=2.0).json()
+                    if res.get("isok"):
+                        status = res.get("data", {}).get("device_status", {})
+                        if "switch:0" in status:
+                            watt = float(status["switch:0"].get("apower", 0.0) or 0.0)
+                            amp = float(status["switch:0"].get("current", 0.0) or 0.0)
+                            volt = float(status["switch:0"].get("voltage", 230.0) or 230.0)
+                        elif "meters" in status and len(status["meters"]) > 0:
+                            watt = float(status["meters"][0].get("power", 0.0) or 0.0)
+                            amp = float(status["meters"][0].get("current", 0.0)) if "current" in status["meters"][0] else (watt / 230.0 if watt > 0 else 0.0)
+                            volt = float(status["meters"][0].get("voltage", 230.0)) if "voltage" in status["meters"][0] else 230.0
+                except:
+                    watt, amp, volt = u.get("current_watt", 0.0), u.get("current_ampere", 0.0), u.get("current_voltage", 230.0)
 
-                u = user_sessions[active_uid]
-                if not u.get("active") or u.get("terminated") or u.get("paused"):
-                    continue
+                # 1. Sofortige Rohwerte speichern (für Ampere, Volt, Leistung)
+                u["current_watt"], u["current_ampere"], u["current_voltage"] = watt, amp, volt
+                
+                # 2. Leistungs-Glättung (verhindert wildes Springen der Anzeige im Frontend)
+                u["smoothed_watt"] = watt if u.get("smoothed_watt") is None else (u["smoothed_watt"] * 0.8) + (watt * 0.2)
+                
+                if uid == active_uid: 
+                    global_state["last_watt"], global_state["last_amp"], global_state["last_volt"] = watt, amp, volt
 
-                # 2. Energie-Akkumulation über Delta-Zeit: total_kwh += (watt * dt) / 3600000.0
-                kwh_increment = (raw_w * dt) / 3600000.0
-                wh_increment = (raw_w * dt) / 3600.0
+                # 3. Wenn aktiv: Laufzeit und Energie (Wh / Kosten) flüssig hochzählen
+                if u.get("active", False):
+                    u["total_seconds"] = u.get("total_seconds", 0.0) + dt
+                    u["accumulated_seconds"] = u["total_seconds"]
+                    
+                    # Die magische Formel: Leistung (Watt) multipliziert mit vergangener Zeit (dt in Sekunden) 
+                    # umgerechnet in Kilowattstunden (kWh)
+                    if watt > 0.05: 
+                        u["total_kwh"] = u.get("total_kwh", 0.0) + (watt * dt) / 3600000.0
+                    
+                    u["total_wh"] = u.get("total_kwh", 0.0) * 1000.0
+                    u["total_cost"] = u.get("total_kwh", 0.0) * STROMPREIS_PER_KWH
 
-                u["accumulated_seconds"] += dt
-                u["total_wh"] += wh_increment
-                u["total_kwh"] += kwh_increment
-                u["total_cost"] = u["total_kwh"] * STROMPREIS_PER_KWH
+                    # Aktuelles Einzelgerät aktualisieren
+                    curr_idx = u.get("current_device_idx", 0)
+                    if 0 <= curr_idx < len(u.get("devices", [])):
+                        dev = u["devices"][curr_idx]
+                        dev["duration_sec"] = dev.get("duration_sec", 0.0) + dt
+                        if watt > 0.05:
+                            dev["wh"] = dev.get("wh", 0.0) + (watt * dt) / 3600.0
+                        dev["cost"] = (dev.get("wh", 0.0) / 1000.0) * STROMPREIS_PER_KWH
+                        dev["peak_w"] = max(dev.get("peak_w", 0.0), watt)
 
-                # Aktuelles Einzelgerät aktualisieren
-                curr_idx = u.get("current_device_idx", 0)
-                if 0 <= curr_idx < len(u.get("devices", [])):
-                    dev = u["devices"][curr_idx]
-                    dev["duration_sec"] += dt
-                    dev["wh"] += wh_increment
-                    dev["cost"] = (dev["wh"] / 1000.0) * STROMPREIS_PER_KWH
-                    dev["peak_w"] = max(dev.get("peak_w", 0.0), raw_w)
+                        prof = DEVICE_PROFILES.get(dev["key"], DEVICE_PROFILES["custom"])
+                        if prof["is_battery"]:
+                            peak_w = max(dev["peak_w"], prof["typical_w"] * 0.7)
+                            nom_wh = prof["nominal_wh"] or 20.0
+                            energy_soc = (dev["wh"] / nom_wh) * 100.0
 
-                    prof = DEVICE_PROFILES.get(dev["key"], DEVICE_PROFILES["custom"])
+                            if watt > peak_w * prof["cv_ratio"]:
+                                dev["stage"] = "Bulk / Schnellladung (CC)"
+                                dev["soc_pct"] = round(min(75.0, max(15.0, 15.0 + energy_soc * 0.6)), 1)
+                            elif watt > prof["trickle_w"]:
+                                dev["stage"] = "Sättigung / CV (Absorption)"
+                                ratio_in_cv = max(0.0, min(1.0, 1.0 - (watt / (peak_w * prof["cv_ratio"] or 1.0))))
+                                dev["soc_pct"] = round(min(98.0, max(75.0, 75.0 + ratio_in_cv * 23.0)), 1)
+                            elif dev["duration_sec"] > 45 and dev["wh"] > 0.5:
+                                dev["stage"] = "Erhaltungsladung / Voll (Trickle)"
+                                dev["soc_pct"] = 100.0
+                            else:
+                                dev["stage"] = "Bereit / Lädt..." if watt > 0.1 else "Standby"
+                                dev["soc_pct"] = round(min(75.0, max(10.0, 10.0 + energy_soc)), 1)
 
-                    # AI-Ladestufen & SoC Berechnung
-                    if prof["is_battery"]:
-                        peak_w = max(dev["peak_w"], prof["typical_w"] * 0.7)
-                        nom_wh = prof["nominal_wh"] or 20.0
-                        energy_soc = (dev["wh"] / nom_wh) * 100.0
-                        
-                        if watt > peak_w * prof["cv_ratio"]:
-                            stage_name = "Bulk / Schnellladung (CC)"
-                            soc = min(75.0, max(15.0, 15.0 + energy_soc * 0.6))
-                        elif watt > prof["trickle_w"]:
-                            stage_name = "Sättigung / CV (Absorption)"
-                            ratio_in_cv = max(0.0, min(1.0, 1.0 - (watt / (peak_w * prof["cv_ratio"] or 1.0))))
-                            soc = min(98.0, max(75.0, 75.0 + ratio_in_cv * 23.0))
-                        elif dev["duration_sec"] > 45 and dev["wh"] > 0.5:
-                            stage_name = "Erhaltungsladung / Voll (Trickle)"
-                            soc = 100.0
+                            dev["wh_to_100"] = max(0.0, round(nom_wh * (1.0 - (dev["soc_pct"] / 100.0)), 2))
                         else:
-                            stage_name = "Bereit / Lädt..." if watt > 0.1 else "Standby"
-                            soc = min(75.0, max(10.0, 10.0 + energy_soc))
+                            dev["stage"] = "Dauerbetrieb"
+                            dev["soc_pct"] = 100.0
+                            dev["wh_to_100"] = 0.0
 
-                        dev["stage"] = stage_name
-                        dev["soc_pct"] = round(min(100.0, soc), 1)
-                        dev["wh_to_100"] = max(0.0, round(nom_wh * (1.0 - (dev["soc_pct"] / 100.0)), 2))
+        except: 
+            pass
+        time.sleep(1.0) # Fester 1-Sekunden-Takt für den Loop
 
-                        # Automatischer 80% Lade-Stopp (nur nach echtem Ladevorgang)
-                        if u.get("battery_80_protection_enabled") and not u.get("battery_80_triggered") and dev["duration_sec"] > 30 and dev["wh"] >= (nom_wh * 0.65) and dev["soc_pct"] >= 80.0:
-                            u["battery_80_triggered"] = True
-                            u["active"] = False
-                            u["paused"] = True
-                            u["stop_reason"] = "battery_80_protection"
-                            logger.info("[METERING-WORKER] 🛡️ 80% Batterieschutz ausgelöst! Schalte Relais ab.")
-                            async_cloud_control(turn_on=False)
-
-                        # Automatischer 100% Lade-Stopp (nur nach echtem Ladevorgang)
-                        if not u.get("battery_100_triggered") and dev["duration_sec"] > 45 and dev["wh"] > 0.5 and (dev["soc_pct"] >= 99.5 or watt <= prof["trickle_w"]):
-                            u["battery_100_triggered"] = True
-                            u["active"] = False
-                            u["paused"] = True
-                            u["stop_reason"] = "battery_100_full"
-                            logger.info("[METERING-WORKER] ✅ 100% Voll-Ladung erreicht! Schalte Relais ab.")
-                            async_cloud_control(turn_on=False)
-                    else:
-                        dev["stage"] = "Dauerbetrieb"
-                        dev["soc_pct"] = 100.0
-                        dev["wh_to_100"] = 0.0
-
-                # Unplug-Erkennung nach 90s ohne Last
-                if raw_w < 0.3 and u.get("active") and not u.get("paused"):
-                    global_state["consecutive_zero_w_count"] += 1
-                    if global_state["consecutive_zero_w_count"] >= 60 and u["accumulated_seconds"] > 90:
-                        u["unplug_dialog_active"] = True
-                        u["active"] = False
-                        u["paused"] = True
-                        u["stop_reason"] = "unplugged"
-                        logger.info("[METERING-WORKER] 🔌 Kein Stromfluss über 60s erkannt. Pausiere Station.")
-                        async_cloud_control(turn_on=False)
-                else:
-                    global_state["consecutive_zero_w_count"] = 0
-
-                # Periodischer Log alle 5 Sekunden
-                if tick_counter % 5 == 0:
-                    logger.info(f"[METER-WORKER] ⏱️ {active_uid[:8]} | Zeit={u['accumulated_seconds']:.1f}s | P={watt:.2f}W (Roh:{raw_w:.2f}W) | Wh={u['total_wh']:.4f}Wh | Betrag={u['total_cost']:.5f}€")
-
-        except Exception as e:
-            logger.error(f"[METERING-WORKER] 💥 Fehler in Metering-Engine: {e}", exc_info=True)
-
-# 1. ENSURE_WORKER: AUTONOMER DAEMON-THREAD INITIALISIERUNG
+# --- ENSURE_WORKER INITIALISIERUNG ---
 worker_started = False
 worker_start_lock = threading.Lock()
 
@@ -474,11 +319,9 @@ def ensure_worker():
     with worker_start_lock:
         if not worker_started:
             worker_started = True
-            t1 = threading.Thread(target=shelly_cloud_poller_loop, daemon=True, name="ShellyPoller")
-            t2 = threading.Thread(target=background_metering_worker, daemon=True, name="BackgroundMeterWorker")
-            t1.start()
-            t2.start()
-            logger.info("🚀 Autonome Daemon-Worker (ShellyPoller + BackgroundMeterWorker) dauerhaft gestartet!")
+            t = threading.Thread(target=background_meter_worker, daemon=True, name="BackgroundMeterWorker")
+            t.start()
+            logger.info("🚀 Autonomer Daemon-Worker background_meter_worker dauerhaft gestartet!")
 
 ensure_worker()
 
@@ -651,10 +494,15 @@ def get_or_create_user_session():
                 "terminated": False,
                 "station_verified": session.get("station_verified", False),
                 "start_timestamp": None,
+                "total_seconds": 0.0,
                 "accumulated_seconds": 0.0,
                 "total_wh": 0.0,
                 "total_kwh": 0.0,
                 "total_cost": 0.0,
+                "current_watt": 0.0,
+                "current_ampere": 0.0,
+                "current_voltage": 230.0,
+                "smoothed_watt": 0.0,
                 "battery_80_protection_enabled": True,
                 "battery_80_triggered": False,
                 "battery_100_triggered": False,
@@ -1724,32 +1572,34 @@ def get_status():
         })
 
     with state_lock:
-        w = global_state["smoothed_watt"] if global_state["smoothed_watt"] > 0 else global_state["last_watt"]
-        a = global_state["smoothed_amp"] if global_state["smoothed_amp"] > 0 else global_state["last_amp"]
-        v = global_state["last_volt"]
-        relay = global_state["relay_on"]
+        w = u.get("smoothed_watt") if u.get("smoothed_watt") is not None else u.get("current_watt", global_state.get("last_watt", 0.0))
+        a = u.get("current_ampere", global_state.get("last_amp", 0.0))
+        v = u.get("current_voltage", global_state.get("last_volt", 230.0))
+        relay = global_state.get("relay_on", False)
 
     curr_idx = u.get("current_device_idx", 0)
-    devices_copy = []
-    for idx, d in enumerate(u.get("devices", [])):
-        devices_copy.append(dict(d))
-
+    devices_copy = [dict(d) for d in u.get("devices", [])]
     current_device = devices_copy[curr_idx] if 0 <= curr_idx < len(devices_copy) else None
+
+    sec = u.get("total_seconds", u.get("accumulated_seconds", 0.0))
+    kwh = u.get("total_kwh", 0.0)
+    wh = u.get("total_wh", kwh * 1000.0)
+    cost = u.get("total_cost", kwh * STROMPREIS_PER_KWH)
 
     # Schneller, nicht-blockierender O(1) Memory-Zugriff
     return jsonify({
         "user_id": uid,
-        "active_user_id": global_state["active_user_id"],
+        "active_user_id": global_state.get("active_user_id"),
         "active": u.get("active", False),
         "paused": u.get("paused", False),
         "watt": round(w, 3),
         "current_ampere": round(a, 3),
         "voltage": round(v, 1),
         "relay_on": relay,
-        "elapsed_seconds": round(u.get("accumulated_seconds", 0.0), 1),
-        "wh": round(u.get("total_wh", 0.0), 4),
-        "kwh": round(u.get("total_kwh", 0.0), 6),
-        "cost": round(u.get("total_cost", 0.0), 5),
+        "elapsed_seconds": round(sec, 1),
+        "wh": round(wh, 4),
+        "kwh": round(kwh, 6),
+        "cost": round(cost, 5),
         "battery_80_protection_enabled": u.get("battery_80_protection_enabled", True),
         "battery_80_triggered": u.get("battery_80_triggered", False),
         "battery_100_triggered": u.get("battery_100_triggered", False),
@@ -1770,7 +1620,7 @@ def start():
     now = time.time()
     with state_lock:
         global_state["active_user_id"] = uid
-        global_state["consecutive_zero_w_count"] = 0
+        global_state["relay_on"] = True
 
     u["active"] = True
     u["paused"] = False
@@ -1893,12 +1743,12 @@ def logout():
     async_cloud_control(turn_on=False)
 
     with state_lock:
-        if global_state["active_user_id"] == uid:
+        if global_state.get("active_user_id") == uid:
             global_state["active_user_id"] = None
 
     invoice_id = f"RE-{time.strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}"
 
-    total_sec = u.get("accumulated_seconds", 0.0)
+    total_sec = u.get("total_seconds", u.get("accumulated_seconds", 0.0))
     report = {
         "invoice_id": invoice_id,
         "date": time.strftime('%d.%m.%Y %H:%M'),
@@ -2004,11 +1854,11 @@ def admin_dashboard():
         today_wh = sum(r.get("total_wh", 0.0) for r in today_records)
         today_sessions_count = len(today_records)
 
-        live_w = global_state["smoothed_watt"] if global_state["smoothed_watt"] > 0 else global_state["last_watt"]
-        live_a = global_state["smoothed_amp"] if global_state["smoothed_amp"] > 0 else global_state["last_amp"]
-        live_v = global_state["last_volt"]
-        relay = global_state["relay_on"]
-        active_u = global_state["active_user_id"]
+        live_w = global_state.get("last_watt", 0.0)
+        live_a = global_state.get("last_amp", 0.0)
+        live_v = global_state.get("last_volt", 230.0)
+        relay = global_state.get("relay_on", False)
+        active_u = global_state.get("active_user_id")
         is_live_active = bool(active_u and user_sessions.get(active_u, {}).get("active"))
 
     return render_template_string(
@@ -2042,7 +1892,7 @@ def admin_override():
     elif action == "force_off":
         async_cloud_control(turn_on=False)
         with state_lock:
-            if global_state["active_user_id"] and global_state["active_user_id"] in user_sessions:
+            if global_state.get("active_user_id") and global_state.get("active_user_id") in user_sessions:
                 user_sessions[global_state["active_user_id"]]["active"] = False
         return jsonify({"status": "ok", "message": "Notabschaltung ausgeführt (Relais AUS)"})
     return jsonify({"status": "error", "message": "Unbekannte Aktion"}), 400
