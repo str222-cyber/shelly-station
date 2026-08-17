@@ -792,12 +792,12 @@ def accumulate_energy():
 # =====================================================================
 # KONTINUIERLICHER SERVER-SEITIGER HINTERGRUND-THREAD (24/7 DAEMON)
 # =====================================================================
-daemon_started = False
+daemon_pid = None
 daemon_lock = threading.Lock()
 
 def background_energy_daemon():
     """Zählt auch bei Screensaver, Schlafmodus oder ausgeschaltetem Handy-Display 100% akkurat weiter!"""
-    logger.info("⚡ Master Background Energy Daemon in Gunicorn Worker gestartet.")
+    logger.info(f"⚡ Master Background Energy Daemon läuft aktiv in PID {os.getpid()}!")
     while True:
         try:
             poll_shelly()
@@ -808,15 +808,15 @@ def background_energy_daemon():
         time.sleep(1.2)
 
 def ensure_daemon_started():
-    global daemon_started
-    if not daemon_started:
+    global daemon_pid
+    curr_pid = os.getpid()
+    if daemon_pid != curr_pid:
         with daemon_lock:
-            if not daemon_started:
-                daemon_started = True
+            if daemon_pid != curr_pid:
+                daemon_pid = curr_pid
                 t = threading.Thread(target=background_energy_daemon, daemon=True)
                 t.start()
-
-ensure_daemon_started()
+                logger.info(f"🚀 Master Energy Daemon gestartet in PID {curr_pid}!")
 
 
 def fmt_time(s):
