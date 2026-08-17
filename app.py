@@ -386,21 +386,24 @@ def background_metering_loop():
                         
                         if watt > peak_w * prof["cv_ratio"]:
                             stage_name = "Bulk / Schnellladung (CC)"
-                            soc = min(75.0, max(5.0, energy_soc))
+                            soc = min(75.0, max(15.0, 15.0 + energy_soc * 0.6))
                         elif watt > prof["trickle_w"]:
                             stage_name = "Sättigung / CV (Absorption)"
                             ratio_in_cv = max(0.0, min(1.0, 1.0 - (watt / (peak_w * prof["cv_ratio"] or 1.0))))
                             soc = min(98.0, max(75.0, 75.0 + ratio_in_cv * 23.0))
-                        else:
+                        elif dev["duration_sec"] > 45 and dev["wh"] > 0.5:
                             stage_name = "Erhaltungsladung / Voll (Trickle)"
                             soc = 100.0
+                        else:
+                            stage_name = "Bereit / Lädt..." if watt > 0.1 else "Standby"
+                            soc = min(75.0, max(10.0, 10.0 + energy_soc))
 
                         dev["stage"] = stage_name
                         dev["soc_pct"] = round(min(100.0, soc), 1)
                         dev["wh_to_100"] = max(0.0, round(nom_wh * (1.0 - (dev["soc_pct"] / 100.0)), 2))
 
-                        # 3. Automatischer 80% Lade-Stopp
-                        if u.get("battery_80_protection_enabled") and not u.get("battery_80_triggered") and dev["soc_pct"] >= 80.0:
+                        # 3. Automatischer 80% Lade-Stopp (nur nach echtem Ladevorgang)
+                        if u.get("battery_80_protection_enabled") and not u.get("battery_80_triggered") and dev["duration_sec"] > 30 and dev["wh"] >= (nom_wh * 0.65) and dev["soc_pct"] >= 80.0:
                             u["battery_80_triggered"] = True
                             u["active"] = False
                             u["paused"] = True
@@ -408,8 +411,8 @@ def background_metering_loop():
                             logger.info("[METERING-WORKER] 🛡️ 80% Batterieschutz ausgelöst! Schalte Relais ab.")
                             async_cloud_control(turn_on=False)
 
-                        # 4. Automatischer 100% Lade-Stopp
-                        if not u.get("battery_100_triggered") and (dev["soc_pct"] >= 99.5 or (dev["duration_sec"] > 45 and watt <= prof["trickle_w"])):
+                        # 4. Automatischer 100% Lade-Stopp (nur nach echtem Ladevorgang)
+                        if not u.get("battery_100_triggered") and dev["duration_sec"] > 45 and dev["wh"] > 0.5 and (dev["soc_pct"] >= 99.5 or watt <= prof["trickle_w"]):
                             u["battery_100_triggered"] = True
                             u["active"] = False
                             u["paused"] = True
