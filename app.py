@@ -410,47 +410,28 @@ class DeviceAI:
             }
 
         # =====================================================================
-        # 2. EXPERTENSYSTEM HEURISTIK (WENN NOCH KEIN PASSENDES MUSTER)
+        # 2. EXPERTENSYSTEM HEURISTIK (PRAXISERPROBTE LADESTATION-MUSTER)
         # =====================================================================
-        if cv < 0.18 and trend_ratio > 0.88:
-            confidence = min(95, 45 + n * 6)
-            if pw < 20:
-                s_key = "lamp"
-                reason = f"Gleichmäßige Last ({aw:.1f} W) typisch für Beleuchtung"
-            elif pw < 80:
-                s_key = "tv"
-                reason = f"Konstante mittlere Last ({aw:.1f} W) typisch für Monitor/TV"
-            elif pw < 250:
-                s_key = "appliance_s"
-                reason = f"Dauerhafte mittlere Leistung ({aw:.1f} W)"
-            else:
-                s_key = "appliance"
-                reason = f"Hohe Dauerlast ({aw:.1f} W)"
-        elif trend_ratio < 0.88 or (pw < 120 and cw < pw * 0.75 and n >= 6):
-            confidence = min(92, 40 + n * 6)
-            if pw < 25:
-                s_key = "phone"
-                reason = f"Ladekurve bis {pw:.1f} W typisch für Smartphone/Tablet (auch im Standby aktiv)"
-            elif pw < 100:
-                s_key = "laptop"
-                reason = f"Ladekurve bis {pw:.1f} W typisch für Laptop (auch bei geschlossenem Display)"
-            elif pw < 350:
-                s_key = "ebike"
-                reason = f"Starke Ladeleistung ({pw:.1f} W) typisch für E-Bike"
-            else:
-                s_key = "ebike_fast"
-                reason = f"Sehr hohe Ladeleistung ({pw:.1f} W)"
+        confidence = min(96, 75 + n * 4)
+        if pw < 0.5:
+            s_key = "lamp"
+            reason = "Kein messbarer Stromfluss"
+            confidence = 10
+        elif pw < 35.0:
+            s_key = "phone"
+            reason = f"Ladeleistung (Ø {aw:.1f} W / Peak {pw:.1f} W) typisch für Smartphone, Tablet oder Akku"
+        elif pw < 105.0:
+            s_key = "laptop"
+            reason = f"Ladeleistung (Ø {aw:.1f} W / Peak {pw:.1f} W) typisch für Laptop / Ultrabook"
+        elif pw < 340.0:
+            s_key = "ebike"
+            reason = f"Starke Ladeleistung (Ø {aw:.1f} W / Peak {pw:.1f} W) typisch für E-Bike / Pedelec"
+        elif pw < 1200.0:
+            s_key = "ebike_fast"
+            reason = f"Sehr hohe Schnelllade-Leistung (Ø {aw:.1f} W / Peak {pw:.1f} W) für Großakku"
         else:
-            confidence = 30
-            if pw < 30:
-                s_key = "lamp"
-                reason = f"Aktuelle Leistung {aw:.1f} W"
-            elif pw < 100:
-                s_key = "tv"
-                reason = f"Aktuelle Leistung {aw:.1f} W"
-            else:
-                s_key = "appliance"
-                reason = f"Aktuelle Leistung {aw:.1f} W"
+            s_key = "appliance"
+            reason = f"Hohe Dauerlast ({aw:.1f} W) für Großgerät"
 
         prof = DEVICE_PROFILES.get(s_key, DEVICE_PROFILES["lamp"])
         return {
@@ -640,17 +621,46 @@ def accumulate_energy():
             charge["last_stable_w"] = w
             charge["stable_samples_count"] = 1
             
-            if charge.get("target_is_new", True) and len(charge["devices"]) > 0 and charge["devices"][-1].get("wh", 0) > 0.05:
-                next_num = len(charge["devices"]) + 1
-                new_dev = new_device_entry(next_num, "lamp")
+            curr_idx = charge.get("current_device_idx", 0)
+            devs = charge.get("devices", [])
+            prev_d = devs[curr_idx] if (0 <= curr_idx < len(devs)) else None
+            
+            # Hat das vorherige Gerät bereits Energie geladen (> 0.04 Wh)?
+            if prev_d and prev_d.get("wh", 0) > 0.04:
+                next_num = len(devs) + 1
+                charge["power_history"] = [(now, w)]
+                ai = DeviceAI.classify(charge["power_history"])
+                s_key = ai.get("suggested_key", "phone")
+                prof = DEVICE_PROFILES.get(s_key, DEVICE_PROFILES["phone"])
+                
+                new_dev = new_device_entry(next_num, s_key)
+                new_dev["raw_name"] = prof["name"]
+                new_dev["name"] = f"Gerät {next_num}: {prof['name']}"
+                new_dev["icon"] = prof["icon"]
+                new_dev["mode"] = prof["mode"]
+                new_dev["is_battery"] = prof["is_battery"]
+                new_dev["nominal_wh"] = prof["nominal_wh"]
+                new_dev["user_confirmed"] = False
+                
                 charge["devices"].append(new_dev)
                 charge["current_device_idx"] = len(charge["devices"]) - 1
-                logger.info(f"⚡ Neues Gerät #{next_num} gestartet ({w:.1f} W). Schonfrist aktiv bis +12s.")
+                charge["ai_result"] = ai
+                logger.info(f"⚡ Neues Gerät #{next_num} ({new_dev['name']}) gestartet ({w:.1f} W). Schonfrist aktiv bis +12s.")
             else:
-                reused_idx = charge.get("current_device_idx", 0)
-                if 0 <= reused_idx < len(charge["devices"]):
-                    cur_d = charge["devices"][reused_idx]
-                    logger.info(f"⚡ Gerät ({cur_d['name']}) läuft aktiv ({w:.1f} W).")
+                charge["power_history"] = [(now, w)]
+                ai = DeviceAI.classify(charge["power_history"])
+                s_key = ai.get("suggested_key", "phone")
+                prof = DEVICE_PROFILES.get(s_key, DEVICE_PROFILES["phone"])
+                if prev_d and not prev_d.get("user_confirmed", False):
+                    prev_d["key"] = s_key
+                    prev_d["raw_name"] = prof["name"]
+                    prev_d["name"] = f"Gerät {prev_d['num']}: {prof['name']}"
+                    prev_d["icon"] = prof["icon"]
+                    prev_d["mode"] = prof["mode"]
+                    prev_d["is_battery"] = prof["is_battery"]
+                    prev_d["nominal_wh"] = prof["nominal_wh"]
+                charge["ai_result"] = ai
+                logger.info(f"⚡ Gerät ({prev_d['name'] if prev_d else '1'}) aktiv erkannt ({w:.1f} W).")
 
     # =====================================================================
     # 2. STABILER STROMFLUSS-AUFBAU (Schonfrist & Standby-Berücksichtigung)
@@ -669,13 +679,13 @@ def accumulate_energy():
     # =====================================================================
     if charge["active"] and not charge["paused"] and charge["had_flowing"] and now > charge["unplug_cooldown_until"]:
         if not is_flowing and (a < 0.015 and w < 0.25):
-            charge["active"] = False
-            charge["paused"] = True
-            charge["unplug_modal"] = "ASK_UNPLUG"
+            charge["waiting_for_new_plug"] = True
             charge["had_flowing"] = False
-            charge["unplug_cooldown_until"] = now + 8.0
-            relay_control(False)
-            logger.info("🔌 Ampere auf 0.0 A abgefallen -> Ladevorgang pausiert, Relais AUS, Modal ASK_UNPLUG geöffnet!")
+            charge["flow_continuous_seconds"] = 0.0
+            charge["unplug_cooldown_until"] = now + 6.0
+            charge["last_stable_w"] = 0.0
+            charge["stable_samples_count"] = 0
+            logger.info("🔌 Kabel abgezogen (0.0 A) -> Warte auf nächstes Gerät oder Fortsetzung...")
 
     # =====================================================================
     # 4. ERKENNUNG: DRASTISCHER LASTWECHSEL / STATUSÄNDERUNG (Gerätewechsel?)
@@ -1153,12 +1163,25 @@ def power_shift_action():
 
         if action == "new_device":
             next_num = len(charge["devices"]) + 1
-            new_dev = new_device_entry(next_num, "lamp")
+            w = shelly["watt"]
+            charge["power_history"] = [(now, w)] if w > 0.1 else []
+            ai = DeviceAI.classify(charge["power_history"])
+            s_key = ai.get("suggested_key", "phone")
+            prof = DEVICE_PROFILES.get(s_key, DEVICE_PROFILES["phone"])
+
+            new_dev = new_device_entry(next_num, s_key)
+            new_dev["raw_name"] = prof["name"]
+            new_dev["name"] = f"Gerät {next_num}: {prof['name']}"
+            new_dev["icon"] = prof["icon"]
+            new_dev["mode"] = prof["mode"]
+            new_dev["is_battery"] = prof["is_battery"]
+            new_dev["nominal_wh"] = prof["nominal_wh"]
+            new_dev["user_confirmed"] = False
+
             charge["devices"].append(new_dev)
             charge["current_device_idx"] = len(charge["devices"]) - 1
-            charge["power_history"] = []
-            charge["ai_result"] = None
-            logger.info(f"Lastwechsel: Neues Gerät #{next_num} durch Lastsprung angelegt.")
+            charge["ai_result"] = ai
+            logger.info(f"Lastwechsel: Neues separates Gerät #{next_num} ({new_dev['name']}) angelegt ({w:.1f} W).")
             return jsonify({"status": "ok", "device": new_dev})
 
         elif action == "same_device":
@@ -1171,6 +1194,62 @@ def power_shift_action():
                 logger.info(f"Lastwechsel: Gleiches Gerät bestätigt ({cur_d['name']}). Dynamik gelernt.")
             return jsonify({"status": "ok", "state": "same_device_confirmed"})
 
+    return jsonify({"status": "error"}), 400
+
+@app.route('/add_new_device', methods=['POST'])
+def add_new_device():
+    with lock:
+        now = time.time()
+        next_num = len(charge["devices"]) + 1
+        w = shelly["watt"]
+        charge["power_history"] = [(now, w)] if w > 0.1 else []
+        ai = DeviceAI.classify(charge["power_history"])
+        s_key = ai.get("suggested_key", "phone")
+        prof = DEVICE_PROFILES.get(s_key, DEVICE_PROFILES["phone"])
+        
+        new_dev = new_device_entry(next_num, s_key)
+        new_dev["raw_name"] = prof["name"]
+        new_dev["name"] = f"Gerät {next_num}: {prof['name']}"
+        new_dev["icon"] = prof["icon"]
+        new_dev["mode"] = prof["mode"]
+        new_dev["is_battery"] = prof["is_battery"]
+        new_dev["nominal_wh"] = prof["nominal_wh"]
+        new_dev["user_confirmed"] = False
+        
+        charge["devices"].append(new_dev)
+        charge["current_device_idx"] = len(charge["devices"]) - 1
+        charge["ai_result"] = ai
+        logger.info(f"➕ Neues Gerät #{next_num} ({new_dev['name']}) manuell hinzugefügt.")
+        return jsonify({"status": "ok", "device": new_dev})
+
+@app.route('/merge_device', methods=['POST'])
+def merge_device():
+    data = request.get_json() or {}
+    target_idx = data.get("target_idx", 0)
+    with lock:
+        curr_idx = charge["current_device_idx"]
+        devs = charge["devices"]
+        if curr_idx > 0 and 0 <= target_idx < len(devs) and target_idx != curr_idx:
+            cur_d = devs.pop(curr_idx)
+            tgt_d = devs[target_idx]
+            tgt_d["wh"] = tgt_d.get("wh", 0.0) + cur_d.get("wh", 0.0)
+            tgt_d["flow_duration_sec"] = tgt_d.get("flow_duration_sec", 0.0) + cur_d.get("flow_duration_sec", 0.0)
+            tgt_d["idle_duration_sec"] = tgt_d.get("idle_duration_sec", 0.0) + cur_d.get("idle_duration_sec", 0.0)
+            tgt_d["duration_sec"] = tgt_d["flow_duration_sec"] + tgt_d["idle_duration_sec"]
+            if tgt_d["flow_duration_sec"] > 0:
+                tgt_d["avg_flow_w"] = (tgt_d["wh"] * 3600.0) / tgt_d["flow_duration_sec"]
+            
+            c_info = COUNTRY_VAT_RATES.get(charge["selected_country"], COUNTRY_VAT_RATES["DE"])
+            vat_rate = c_info["rate"]
+            tgt_d["cost_netto"] = (tgt_d["wh"] / 1000.0) * STROMPREIS_PER_KWH
+            tgt_d["vat_amount"] = tgt_d["cost_netto"] * (vat_rate / 100.0)
+            tgt_d["cost_brutto"] = tgt_d["cost_netto"] + tgt_d["vat_amount"]
+            tgt_d["cost"] = tgt_d["cost_brutto"]
+            
+            charge["current_device_idx"] = target_idx
+            charge["power_history"] = [(time.time(), shelly["watt"])] if shelly["watt"] > 0.1 else []
+            logger.info(f"🔁 Gerät {cur_d['name']} in Gerät {tgt_d['name']} zusammengeführt!")
+            return jsonify({"status": "ok"})
     return jsonify({"status": "error"}), 400
 
 # =====================================================================
@@ -2496,18 +2575,44 @@ function showReceipt(rp){
 
 function renderDevicePills(devs, activeIdx){
   var c = document.getElementById('devPillsContainer');
-  if(!devs || devs.length <= 1){
-    c.style.display = 'none';
-    return;
-  }
+  if(!c) return;
   c.style.display = 'flex';
   c.innerHTML = '';
-  devs.forEach(function(d, idx){
+  (devs || []).forEach(function(d, idx){
     var sp = document.createElement('span');
     sp.className = 'dev-pill' + (idx === activeIdx ? ' active' : '');
-    sp.innerText = (d.icon || '🔌') + ' ' + (d.name || ('Gerät ' + (idx+1))) + ' (' + (d.wh || 0).toFixed(2) + ' Wh)';
+    sp.innerHTML = (d.icon || '🔌') + ' <b>' + (d.raw_name || d.name || ('Gerät ' + (idx+1))) + '</b> <span style="opacity:0.8">(' + (d.wh || 0).toFixed(2) + ' Wh)</span>';
     c.appendChild(sp);
   });
+  
+  var addBtn = document.createElement('span');
+  addBtn.className = 'dev-pill';
+  addBtn.style.cursor = 'pointer';
+  addBtn.style.background = '#eff6ff';
+  addBtn.style.color = '#1e40af';
+  addBtn.style.borderColor = '#93c5fd';
+  addBtn.innerHTML = '➕ <b>Neues Gerät</b>';
+  addBtn.onclick = function(){
+    post('/add_new_device').then(function(){ poll(); });
+  };
+  c.appendChild(addBtn);
+
+  if(activeIdx > 0){
+    var mergeBtn = document.createElement('span');
+    mergeBtn.className = 'dev-pill';
+    mergeBtn.style.cursor = 'pointer';
+    mergeBtn.style.background = '#fef3c7';
+    mergeBtn.style.color = '#92400e';
+    mergeBtn.style.borderColor = '#fcd34d';
+    mergeBtn.innerHTML = '🔁 <b>Zu Gerät 1</b>';
+    mergeBtn.title = 'Aktuelles Gerät mit Gerät 1 zusammenführen';
+    mergeBtn.onclick = function(){
+      if(confirm('Möchtest du dieses Gerät mit Gerät 1 zusammenführen?')){
+        post('/merge_device', { target_idx: 0 }).then(function(){ poll(); });
+      }
+    };
+    c.appendChild(mergeBtn);
+  }
 }
 
 function poll(){
