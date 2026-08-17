@@ -163,6 +163,7 @@ def save_sub_session(u, uid):
     u["analysis_samples"] = []
     u["recent_samples"] = []
     u["session_peak_watt"] = 0.0
+    u["manually_selected"] = False
     u["battery_full_triggered"] = False
     u["eighty_percent_triggered"] = False
     u["device_key"] = "phone"
@@ -220,22 +221,23 @@ def background_meter_worker():
                     if watt > 0.05: u["total_kwh"] += (watt * dt) / 3600000.0
 
                     # --- KONTINUIERLICHE KI-HINTERGRUNDÜBERWACHUNG ---
-                    # Prüft permanent, ob sich das Lastprofil geändert hat (z.B. Umschaltung Akku vs Dauerbetrieb)
                     prof = DEVICE_PROFILES.get(u.get("device_key"), {})
                     if len(u["recent_samples"]) >= 10:
                         avg_recent = sum(u["recent_samples"]) / len(u["recent_samples"])
                         peak_recent = max(u["recent_samples"])
                         
-                        # KI-Vorschlag im State hinterlegen, falls ein Disput zwischen Akku und Dauerbetrieb vorliegt
-                        if not prof.get("is_battery", False) and peak_user_hint := (peak_w := peak_recent) > 3.0 and peak_w < 80.0 and len(u["recent_samples"]) > 30:
-                            # Wenn ein als Dauerbetrieb gewähltes Gerät schwankt wie ein Akku
+                        peak_w = peak_recent
+                        is_not_battery = not prof.get("is_battery", False)
+                        has_enough_samples = len(u["recent_samples"]) > 30
+                        
+                        if is_not_battery and (peak_w > 3.0 and peak_w < 80.0) and has_enough_samples:
                             variance = math.sqrt(sum((x - avg_recent) ** 2 for x in u["recent_samples"]) / len(u["recent_samples"]))
                             if variance > 0.5:
-                                u["ai_suggestion"] = "phone" # KI schlägt Akku-Modus vor
+                                u["ai_suggestion"] = "phone"
                         elif prof.get("is_battery", False) and avg_recent > 200.0:
                             u["ai_suggestion"] = "appliance"
 
-                    # Dynamische SOC Nachkalibrierung im Hintergrund für Akkus
+                    # Dynamische SOC Nachkalibrierung für Akkus
                     if prof.get("is_battery", False):
                         est_soc = estimate_current_soc(u["device_key"], u["recent_samples"])
                         cap = prof.get("capacity_wh", 20.0)
@@ -243,14 +245,13 @@ def background_meter_worker():
                         if est_soc > current_calc_soc + 5.0: 
                             u["estimated_soc_0"] = est_soc - (((u.get("total_kwh", 0.0) * 1000.0) / max(1,cap)) * 100.0)
 
-                    # --- STABILE AUSSTECK-ERKENNUNG FÜR DAUERBETRIEB & AKKUS ---
-                    # Nur wenn der Strom ECHTE 60 Sekunden lang < 0.05W ist, schaltet eine Lampe/Gerät ab!
+                    # --- STABILE AUSSTECK-ERKENNUNG ---
                     if watt > 0.05: 
                         u["had_power_draw"], u["zero_power_counter"] = True, 0.0
                     else:
                         if u.get("had_power_draw", False):
                             u["zero_power_counter"] += dt
-                            if u["zero_power_counter"] >= 60.0: # Erhöht auf sichere 60s für Dauerläufer
+                            if u["zero_power_counter"] >= 60.0: 
                                 u["active"], u["had_power_draw"] = False, False
                                 save_sub_session(u, uid)
                                 u["detection_mode"] = True 
@@ -491,7 +492,7 @@ HTML_PAGE = """
         </div>
     </div>
 
-    <!-- AI VORSCHLAG MODAL (Kontinuierliche Überwachung) -->
+    <!-- AI VORSCHLAG MODAL -->
     <div id="aiSuggestionModal" class="modal-overlay">
         <div class="modal-box" style="border: 2px solid var(--accent-primary);">
             <div style="font-size: 40px; margin-bottom: 6px;">🤖💡</div>
@@ -809,7 +810,6 @@ HTML_PAGE = """
                     document.getElementById('deviceSelectionModal').style.display = 'flex';
                 }
 
-                // AI KONTINUIERLICHER VORSCHLAG POPUP
                 if (data.ai_suggestion && document.getElementById('aiSuggestionModal').style.display !== 'flex') {
                     pendingAiSuggestionKey = data.ai_suggestion.key;
                     document.getElementById('aiSuggestionText').innerText = data.ai_suggestion.text;
@@ -1109,7 +1109,6 @@ def status():
 
     cart_items = [{"name": x["device_name"], "cost": x["cost"]} for x in u.get("completed_sub_sessions", [])]
     
-    # AI Vorschlag für Frontend aufbereiten
     ai_suggestion_payload = None
     if u.get("ai_suggestion"):
         sug_key = u["ai_suggestion"]
