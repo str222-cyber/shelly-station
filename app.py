@@ -8,10 +8,16 @@ import os
 import json
 import smtplib
 import io
+import sys
+import logging
 from collections import deque
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
+
+# Logging konfigurieren
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+logger = logging.getLogger("SmartPowerHub")
 
 # Versuche WeasyPrint zu laden, sonst ReportLab Fallback
 WEASYPRINT_AVAILABLE = False
@@ -135,6 +141,7 @@ global_state = {
     "last_amp": 0.0,
     "last_volt": 230.0,
     "last_valid_fetch_time": 0.0,
+    "last_shelly_error": None,
     "transfer_requested": False,
     "transfer_requester_id": None,
     "history_w": deque(maxlen=60),
@@ -165,8 +172,9 @@ def load_history():
                 for k, v in saved_dev_stats.items():
                     if k in global_state["device_type_stats"]:
                         global_state["device_type_stats"][k] = v
+                logger.info(f"Historie geladen: {len(session_history_records)} Datensätze.")
         except Exception as e:
-            print(f"Fehler beim Laden der Historie: {e}")
+            logger.error(f"Fehler beim Laden der Historie: {e}")
 
 def save_history():
     try:
@@ -179,40 +187,57 @@ def save_history():
                 "records": session_history_records[-200:]
             }, f, indent=2, ensure_ascii=False)
     except Exception as e:
-        print(f"Fehler beim Speichern der Historie: {e}")
+        logger.error(f"Fehler beim Speichern der Historie: {e}")
 
 load_history()
 
-# --- SHELLY CLOUD HARDWARE-STEUERUNG ---
+# --- SHELLY CLOUD HARDWARE-STEUERUNG (RELAIS ON/OFF) ---
 def async_cloud_control(turn_on=True):
     def _worker():
         with state_lock:
             global_state["relay_on"] = turn_on
         
         turn_str = "on" if turn_on else "off"
-        payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID, "turn": turn_str, "channel": 0}
-        try:
-            requests.post(f"{SHELLY_CLOUD_URL}/device/relay/control", data=payload, timeout=2.5)
-        except Exception:
-            pass
+        logger.info(f"[SHELLY-RELAY] 🔌 Sende Relais-Schaltbefehl -> {turn_str.upper()} an Shelly Cloud ({DEVICE_ID})...")
 
-        rpc_payload = {
-            "auth_key": AUTH_KEY,
-            "id": DEVICE_ID,
-            "method": "Switch.Set",
-            "params": {"id": 0, "on": turn_on}
-        }
+        # 1. Gen 1 / Legacy REST Endpunkt
         try:
-            requests.post(f"{SHELLY_CLOUD_URL}/device/rpc", json=rpc_payload, timeout=2.5)
-        except Exception:
-            pass
+            payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID, "turn": turn_str, "channel": 0}
+            r1 = requests.post(f"{SHELLY_CLOUD_URL}/device/relay/control", data=payload, timeout=3.0)
+            logger.info(f"[SHELLY-RELAY] REST /device/relay/control -> HTTP {r1.status_code}")
+        except Exception as e:
+            logger.warning(f"[SHELLY-RELAY] Fehler bei REST control: {e}")
+
+        # 2. Gen 2 / Gen 3 RPC Endpunkt (Switch.Set)
+        try:
+            rpc_payload = {
+                "auth_key": AUTH_KEY,
+                "id": DEVICE_ID,
+                "method": "Switch.Set",
+                "params": {"id": 0, "on": turn_on}
+            }
+            r2 = requests.post(f"{SHELLY_CLOUD_URL}/device/rpc", json=rpc_payload, timeout=3.0)
+            logger.info(f"[SHELLY-RELAY] RPC /device/rpc (Switch.Set) -> HTTP {r2.status_code}: {r2.text[:100]}")
+        except Exception as e:
+            logger.warning(f"[SHELLY-RELAY] Fehler bei RPC Switch.Set: {e}")
             
     threading.Thread(target=_worker, daemon=True).start()
 
+# --- SHELLY TELEMETRIE-ABFRAGE & DETAILLIERTES DEBUGGING ---
 def update_shelly_telemetry_once():
     try:
         payload = {"auth_key": AUTH_KEY, "id": DEVICE_ID}
-        res = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=5.0).json()
+        t0 = time.time()
+        res_raw = requests.post(f"{SHELLY_CLOUD_URL}/device/status", data=payload, timeout=5.0)
+        dur = time.time() - t0
+        
+        if res_raw.status_code != 200:
+            logger.warning(f"[SHELLY-CLOUD-API] ⚠️ HTTP {res_raw.status_code} ({dur:.2f}s): {res_raw.text[:150]}")
+            with state_lock:
+                global_state["last_shelly_error"] = f"HTTP {res_raw.status_code}"
+            return False, f"HTTP_{res_raw.status_code}"
+
+        res = res_raw.json()
         
         if res.get("isok"):
             status = res.get("data", {}).get("device_status", {})
@@ -220,23 +245,36 @@ def update_shelly_telemetry_once():
             amp = 0.0
             volt = 230.0
             relay_out = False
+            detected_path = "none"
 
+            # 1. Gen 2 / Gen 3 RPC Struktur (Shelly Plus Plug S / Pro / Mini)
             if "switch:0" in status:
                 sw = status["switch:0"]
                 watt = float(sw.get("apower", 0.0) or 0.0)
                 amp = float(sw.get("current", 0.0) or 0.0)
                 volt = float(sw.get("voltage", 230.0) or 230.0)
                 relay_out = bool(sw.get("output", False))
+                detected_path = "status['switch:0']"
+            # 2. Gen 1 Meters Struktur (Shelly Plug S Gen 1)
             elif "meters" in status and len(status["meters"]) > 0:
                 m = status["meters"][0]
                 watt = float(m.get("power", 0.0) or 0.0)
                 amp = float(m.get("current", 0.0) or (watt / 230.0 if watt > 0 else 0.0))
                 volt = float(m.get("voltage", 230.0) or 230.0)
+                detected_path = "status['meters'][0]"
+            # 3. Gen 1 Relays Struktur
             elif "relays" in status and len(status["relays"]) > 0:
                 r0 = status["relays"][0]
                 watt = float(r0.get("power", 0.0) or 0.0)
                 amp = watt / 230.0 if watt > 0 else 0.0
                 relay_out = bool(r0.get("ison", False))
+                detected_path = "status['relays'][0]"
+            # 4. Direkte Top-Level Felder
+            elif "apower" in status:
+                watt = float(status.get("apower", 0.0) or 0.0)
+                amp = float(status.get("current", 0.0) or 0.0)
+                volt = float(status.get("voltage", 230.0) or 230.0)
+                detected_path = "status['apower']"
 
             with state_lock:
                 global_state["last_watt"] = max(0.0, watt)
@@ -244,43 +282,76 @@ def update_shelly_telemetry_once():
                 global_state["last_volt"] = volt if volt > 50 else 230.0
                 global_state["relay_on"] = relay_out
                 global_state["last_valid_fetch_time"] = time.time()
+                global_state["last_shelly_error"] = None
                 global_state["history_w"].append(watt)
+
+            logger.info(f"[SHELLY-CLOUD-API] ✅ Telemetrie OK ({detected_path}): P={watt:.2f} W | I={amp:.3f} A | U={volt:.1f} V | Relais={'EIN' if relay_out else 'AUS'}")
             return True, None
         else:
-            err = res.get("error") or "UNKNOWN"
-            return False, err
+            err_type = res.get("error") or "UNKNOWN_ERROR"
+            msg = res.get("data", {}).get("messages", ["Keine Detailnachricht"])
+            logger.warning(f"[SHELLY-CLOUD-API] ⚠️ API Fehler '{err_type}': {msg}")
+            with state_lock:
+                global_state["last_shelly_error"] = err_type
+            return False, err_type
+
+    except requests.exceptions.Timeout:
+        logger.warning("[SHELLY-CLOUD-API] ⏱️ Timeout bei Anfrage an Shelly Cloud")
+        return False, "TIMEOUT"
+    except requests.exceptions.ConnectionError as e:
+        logger.warning(f"[SHELLY-CLOUD-API] 🌐 Verbindungsfehler: {e}")
+        return False, "CONNECTION_ERROR"
+    except json.JSONDecodeError as e:
+        logger.error(f"[SHELLY-CLOUD-API] 📄 JSON-Dekodierfehler: {e}")
+        return False, "JSON_ERROR"
     except Exception as e:
+        logger.error(f"[SHELLY-CLOUD-API] 💥 Unerwarteter Fehler: {e}", exc_info=True)
         return False, str(e)
 
-# --- THREAD 1: ZENTRALER GETAKTETER SHELLY-POLLER (7.5s Intervall = 100% Rate-Limit konform) ---
+# --- THREAD 1: GETAKTETER SHELLY-POLLER (8.0s Intervall, 15s Backoff bei Rate Limit) ---
 def shelly_cloud_poller_loop():
+    logger.info("🚀 Shelly Cloud Poller Loop gestartet.")
     time.sleep(1.0)
     while True:
         try:
             success, err = update_shelly_telemetry_once()
             if success:
-                time.sleep(7.5)
-            elif err == "TOO_MANY_REQUESTS":
-                time.sleep(10.0)
+                time.sleep(8.0)
+            elif err in ["TOO_MANY_REQUESTS", "HTTP_429"]:
+                logger.info("[SHELLY-POLLER] Rate-Limit aktiv. Warte 15 Sekunden zur Entlastung...")
+                time.sleep(15.0)
             else:
                 time.sleep(8.0)
-        except Exception:
-            time.sleep(7.5)
+        except Exception as e:
+            logger.error(f"[SHELLY-POLLER] Fehler in Poller-Schleife: {e}")
+            time.sleep(8.0)
 
-# --- THREAD 2: AUTARKER ENERGIE- & AI-METERING ENGINE (1s Intervall) ---
+# --- THREAD 2: AUTARKER ENERGIE- & AI-METERING ENGINE (1s Intervall, Standby-Immun) ---
 def background_metering_loop():
+    logger.info("🚀 Autarke Hintergrund-Metering-Engine gestartet.")
     last_loop_time = time.time()
+    tick_counter = 0
+
     while True:
         try:
             time.sleep(1.0)
             now = time.time()
             dt = max(0.1, min(3.0, now - last_loop_time))
             last_loop_time = now
+            tick_counter += 1
 
             with state_lock:
                 active_uid = global_state["active_user_id"]
                 watt = global_state["last_watt"]
                 amp = global_state["last_amp"]
+
+                # Automatische Session-Bindung: Falls active_uid nicht gesetzt, suche aktive Session
+                if not active_uid or active_uid not in user_sessions:
+                    for uid_cand, sess_cand in user_sessions.items():
+                        if sess_cand.get("active") and not sess_cand.get("terminated"):
+                            active_uid = uid_cand
+                            global_state["active_user_id"] = uid_cand
+                            break
 
                 if not active_uid or active_uid not in user_sessions:
                     continue
@@ -289,7 +360,7 @@ def background_metering_loop():
                 if not u.get("active") or u.get("terminated") or u.get("paused"):
                     continue
 
-                # 1. Energie-Integration (sekundengenau)
+                # 1. Kontinuierliche Energie-Integration (sekundengenau)
                 wh_increment = (watt * dt) / 3600.0
                 u["accumulated_seconds"] += dt
                 u["total_wh"] += wh_increment
@@ -334,6 +405,7 @@ def background_metering_loop():
                             u["active"] = False
                             u["paused"] = True
                             u["stop_reason"] = "battery_80_protection"
+                            logger.info("[METERING-WORKER] 🛡️ 80% Batterieschutz ausgelöst! Schalte Relais ab.")
                             async_cloud_control(turn_on=False)
 
                         # 4. Automatischer 100% Lade-Stopp
@@ -342,26 +414,33 @@ def background_metering_loop():
                             u["active"] = False
                             u["paused"] = True
                             u["stop_reason"] = "battery_100_full"
+                            logger.info("[METERING-WORKER] ✅ 100% Voll-Ladung erreicht! Schalte Relais ab.")
                             async_cloud_control(turn_on=False)
                     else:
                         dev["stage"] = "Dauerbetrieb"
                         dev["soc_pct"] = 100.0
                         dev["wh_to_100"] = 0.0
 
-                # 5. Erkennung: Gerät ausgesteckt
+                # 5. Erkennung: Gerät ausgesteckt (Verbrauch unter 0.3W für mehrere Zyklen)
                 if watt < 0.3 and u.get("active") and not u.get("paused"):
                     global_state["consecutive_zero_w_count"] += 1
-                    if global_state["consecutive_zero_w_count"] >= 10 and u["accumulated_seconds"] > 25:
+                    if global_state["consecutive_zero_w_count"] >= 15 and u["accumulated_seconds"] > 25:
                         u["unplug_dialog_active"] = True
                         u["active"] = False
                         u["paused"] = True
                         u["stop_reason"] = "unplugged"
+                        logger.info("[METERING-WORKER] 🔌 Kein Stromfluss erkannt. Pausiere Station.")
                         async_cloud_control(turn_on=False)
                 else:
                     global_state["consecutive_zero_w_count"] = 0
 
+                # Periodischer Debug-Log alle 5 Sekunden
+                if tick_counter % 5 == 0:
+                    curr_dev_name = u["devices"][curr_idx]["name"] if u.get("devices") else "Unbekannt"
+                    logger.info(f"[METERING-WORKER] ⏱️ Session={active_uid[:8]} | Zeit={u['accumulated_seconds']:.1f}s | P={watt:.2f}W | Wh={u['total_wh']:.4f}Wh | Betrag={u['total_cost']:.5f}€ | Gerät={curr_dev_name}")
+
         except Exception as e:
-            print(f"Metering Engine Fehler: {e}")
+            logger.error(f"[METERING-WORKER] 💥 Fehler in Metering-Engine: {e}", exc_info=True)
 
 # SICHERES STARTEN DER HINTERGRUND-THREADS IM WORKER-PROZESS
 threads_started = False
@@ -376,6 +455,7 @@ def ensure_background_workers():
             t2 = threading.Thread(target=background_metering_loop, daemon=True, name="MeteringEngine")
             t1.start()
             t2.start()
+            logger.info("🚀 Hintergrund-Worker erfolgreich initialisiert und gestartet!")
 
 ensure_background_workers()
 
@@ -467,7 +547,7 @@ def generate_pdf_invoice(report_data):
             pdf_buf.seek(0)
             return pdf_buf
         except Exception as e:
-            print(f"WeasyPrint Fehler, wechsle zu ReportLab: {e}")
+            logger.warning(f"WeasyPrint Fehler, wechsle zu ReportLab: {e}")
 
     # Fallback auf ReportLab
     pdf_buf = io.BytesIO()
@@ -1331,18 +1411,20 @@ MAIN_PAGE_HTML = """
                 }
 
                 // Netz & Energie
-                let currentW = data.watt || 0.0;
-                let currentA = data.current_ampere || 0.0;
-                let currentV = data.voltage || 230.0;
+                let currentW = (data.watt !== undefined) ? data.watt : 0.0;
+                let currentA = (data.current_ampere !== undefined) ? data.current_ampere : 0.0;
+                let currentV = (data.voltage !== undefined) ? data.voltage : 230.0;
+                let currentWh = (data.wh !== undefined) ? data.wh : 0.0;
+                let currentCost = (data.cost !== undefined) ? data.cost : 0.0;
 
                 document.getElementById('volt').innerText = currentV.toFixed(1);
                 document.getElementById('amp').innerText = currentA.toFixed(3);
                 document.getElementById('milliAmp').innerText = (currentA * 1000.0).toFixed(0);
                 document.getElementById('watt').innerText = currentW.toFixed(3);
-                document.getElementById('wh').innerText = data.wh.toFixed(4);
-                document.getElementById('mwh').innerText = (data.wh * 1000.0).toFixed(1);
-                document.getElementById('cost').innerText = data.cost.toFixed(5);
-                document.getElementById('microCost').innerText = (data.cost * 100.0).toFixed(3);
+                document.getElementById('wh').innerText = currentWh.toFixed(4);
+                document.getElementById('mwh').innerText = (currentWh * 1000.0).toFixed(1);
+                document.getElementById('cost').innerText = currentCost.toFixed(5);
+                document.getElementById('microCost').innerText = (currentCost * 100.0).toFixed(3);
 
                 // Aktuelles Gerät & AI
                 if (data.current_device) {
@@ -1596,7 +1678,9 @@ def scan_token(token):
     if token == PHYSICAL_STATION_TOKEN:
         session["station_verified"] = True
         u["station_verified"] = True
+        logger.info(f"✅ User {uid[:8]} erfolgreich über physischen Token {token} verifiziert.")
         return redirect(url_for('index'))
+    logger.warning(f"❌ Abgewiesener Scan-Versuch mit Token: {token}")
     return "❌ Ungültiger Station-Token. Zugriff verweigert.", 403
 
 @app.route('/status')
@@ -1612,25 +1696,19 @@ def get_status():
             "report": u.get("last_report")
         })
 
-    now = time.time()
-    
-    # Präzise Zeitberechnung
-    live_elapsed = u.get("accumulated_seconds", 0.0)
-    if u.get("active") and u.get("start_timestamp"):
-        live_elapsed = u.get("accumulated_seconds", 0.0) + (now - u["start_timestamp"])
-
     with state_lock:
         w = global_state["last_watt"]
         a = global_state["last_amp"]
         v = global_state["last_volt"]
         relay = global_state["relay_on"]
 
+    now = time.time()
+    live_elapsed = u.get("accumulated_seconds", 0.0)
+
     curr_idx = u.get("current_device_idx", 0)
     devices_copy = []
     for idx, d in enumerate(u.get("devices", [])):
         dev_dur = d.get("duration_sec", 0.0)
-        if u.get("active") and idx == curr_idx and d.get("start_timestamp"):
-            dev_dur += (now - d["start_timestamp"])
         d_dict = dict(d)
         d_dict["duration_sec"] = dev_dur
         devices_copy.append(d_dict)
@@ -1680,6 +1758,7 @@ def start():
     if 0 <= curr_idx < len(u.get("devices", [])):
         u["devices"][curr_idx]["start_timestamp"] = now
 
+    logger.info(f"▶️ User {uid[:8]} startet Ladevorgang (Gerät: {u['devices'][curr_idx]['name']})")
     async_cloud_control(turn_on=True)
     return jsonify({"status": "ok"})
 
@@ -1689,21 +1768,15 @@ def stop():
     if not u.get("station_verified") or u.get("terminated"):
         return jsonify({"status": "forbidden"}), 403
 
-    now = time.time()
-    if u.get("active") and u.get("start_timestamp"):
-        u["accumulated_seconds"] += (now - u["start_timestamp"])
-    
     u["active"] = False
     u["paused"] = True
     u["start_timestamp"] = None
 
     curr_idx = u.get("current_device_idx", 0)
     if 0 <= curr_idx < len(u.get("devices", [])):
-        dev = u["devices"][curr_idx]
-        if dev.get("start_timestamp"):
-            dev["duration_sec"] += (now - dev["start_timestamp"])
-            dev["start_timestamp"] = None
+        u["devices"][curr_idx]["start_timestamp"] = None
 
+    logger.info(f"⏸️ User {uid[:8]} pausiert Ladevorgang.")
     async_cloud_control(turn_on=False)
     return jsonify({"status": "ok"})
 
@@ -1723,10 +1796,6 @@ def set_device():
 
     curr_idx = u.get("current_device_idx", 0)
     if 0 <= curr_idx < len(u["devices"]) and u["devices"][curr_idx].get("duration_sec", 0) > 3:
-        if u.get("active") and u["devices"][curr_idx].get("start_timestamp"):
-            u["devices"][curr_idx]["duration_sec"] += (now - u["devices"][curr_idx]["start_timestamp"])
-            u["devices"][curr_idx]["start_timestamp"] = None
-
         new_dev = {
             "id": len(u["devices"]) + 1,
             "key": key,
@@ -1750,11 +1819,10 @@ def set_device():
         u["devices"][curr_idx]["icon"] = prof["icon"]
         u["devices"][curr_idx]["is_battery"] = prof["is_battery"]
         u["devices"][curr_idx]["wh_to_100"] = prof["nominal_wh"] * 0.9
-        if u.get("active") and not u["devices"][curr_idx].get("start_timestamp"):
-            u["devices"][curr_idx]["start_timestamp"] = now
 
     u["battery_80_triggered"] = False
     u["battery_100_triggered"] = False
+    logger.info(f"📱 User {uid[:8]} wählt Gerät: {prof['icon']} {display_name}")
     return jsonify({"status": "ok", "current_device": u["devices"][u["current_device_idx"]]})
 
 @app.route('/device_action', methods=['POST'])
@@ -1768,7 +1836,6 @@ def device_action():
 
     if action == "continue":
         return start()
-
     elif action == "finish":
         return logout()
 
@@ -1780,6 +1847,7 @@ def resume_beyond_80():
     u["battery_80_protection_enabled"] = False
     u["battery_80_triggered"] = False
     u["stop_reason"] = None
+    logger.info(f"⚡ User {uid[:8]} übersteuert 80% Batterieschutz und lädt weiter auf 100%.")
     return start()
 
 @app.route('/toggle_80_protection', methods=['POST'])
@@ -1787,20 +1855,12 @@ def toggle_80_protection():
     u, uid = get_or_create_user_session()
     data = request.get_json() or {}
     u["battery_80_protection_enabled"] = bool(data.get("enabled", True))
+    logger.info(f"🛡️ 80% Schutzmodus = {u['battery_80_protection_enabled']}")
     return jsonify({"status": "ok", "enabled": u["battery_80_protection_enabled"]})
 
 @app.route('/logout', methods=['POST', 'GET'])
 def logout():
     u, uid = get_or_create_user_session()
-    now = time.time()
-    
-    if u.get("active") and u.get("start_timestamp"):
-        u["accumulated_seconds"] += (now - u["start_timestamp"])
-        curr_idx = u.get("current_device_idx", 0)
-        if 0 <= curr_idx < len(u.get("devices", [])):
-            dev = u["devices"][curr_idx]
-            if dev.get("start_timestamp"):
-                dev["duration_sec"] += (now - dev["start_timestamp"])
 
     u["active"] = False
     u["paused"] = False
@@ -1842,6 +1902,7 @@ def logout():
         session_history_records.append(report)
         save_history()
 
+    logger.info(f"🧾 Session beendet: {invoice_id} | Dauer: {format_time(total_sec)} | Wh: {report['total_wh']:.3f} | Betrag: {report['total_cost']:.5f} €")
     return jsonify(report)
 
 @app.route('/download_invoice')
