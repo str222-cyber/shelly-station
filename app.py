@@ -1063,7 +1063,8 @@ def get_status():
         batt_state = None
         is_batt = active_dev.get("is_battery", False) or active_dev.get("mode") == "battery"
         if is_batt:
-            pw = max([float(w) for w in charge.get("power_history", [])] or [live_watt])
+            hist_watts = [float(item[1]) if isinstance(item, (tuple, list)) else float(item) for item in charge.get("power_history", [])]
+            pw = max(hist_watts or [live_watt])
             batt_state = DeviceAI.estimate_battery_state(
                 active_dev.get("key", "ebike"),
                 live_watt,
