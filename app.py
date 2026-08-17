@@ -598,24 +598,26 @@ def accumulate_energy():
     w = shelly["watt"]
     a = shelly["amp"]
     
-    # Echter Stromfluss (> 0.25 W oder > 0.018 A)
-    is_flowing = (a >= 0.018 or w >= 0.25)
+    # Echter Stromfluss (> 0.05 W oder > 0.005 A)
+    is_flowing = (a >= 0.005 or w >= 0.05)
     charge["is_flowing"] = is_flowing
 
     # =====================================================================
     # 1. ERKENNUNG: GERAET EINGESTECKT / WIEDERANLAUF
     # =====================================================================
-    if is_flowing and not charge["paused"] and not charge["terminated"]:
+    if is_flowing and not charge["terminated"]:
         if charge["session_start_time"] is None:
             charge["session_start_time"] = now
             charge["active"] = True
+            charge["paused"] = False
             charge["last_wh_time"] = now
 
-        if charge["waiting_for_new_plug"] or not charge["active"]:
+        if charge["waiting_for_new_plug"] or not charge["active"] or charge["paused"]:
             charge["waiting_for_new_plug"] = False
             charge["active"] = True
+            charge["paused"] = False
             charge["last_wh_time"] = now
-            charge["unplug_cooldown_until"] = now + 12.0
+            charge["unplug_cooldown_until"] = now + 15.0
             charge["flow_continuous_seconds"] = 0.0
             charge["had_flowing"] = False
             charge["last_stable_w"] = w
@@ -793,12 +795,14 @@ def accumulate_energy():
                             logger.info(f"🔋 100% Akku voll geladen ({cur_wh:.2f} Wh / {nom_wh} Wh) -> Relais AUS, Modal BATTERY_100!")
 
             else:
-                charge["total_idle_seconds"] += dt
-                idx = charge["current_device_idx"]
-                devs = charge["devices"]
-                if 0 <= idx < len(devs):
-                    d = devs[idx]
-                    d["idle_duration_sec"] = d.get("idle_duration_sec", 0.0) + dt
+                # Standby / Pause-Zeit nur buchen, wenn Session läuft und (Relais aus ODER Cooldown abgelaufen)
+                if charge["session_start_time"] and (charge["paused"] or not charge["relay_on"] or now > charge.get("unplug_cooldown_until", 0)):
+                    charge["total_idle_seconds"] += dt
+                    idx = charge["current_device_idx"]
+                    devs = charge["devices"]
+                    if 0 <= idx < len(devs):
+                        d = devs[idx]
+                        d["idle_duration_sec"] = d.get("idle_duration_sec", 0.0) + dt
 
     charge["last_wh_time"] = now
 
@@ -2170,8 +2174,8 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 </div>
 
 <div class="btns">
-  <button class="btn bp" onclick="doStart()">▶️ Start / Fortsetzen</button>
-  <button class="btn bs" onclick="doStop()">⏸️ Pause</button>
+  <button class="btn bp" id="btnStart" onclick="doStart()" style="background:#059669">▶️ Fortsetzen & Laden</button>
+  <button class="btn bs" id="btnPause" onclick="doStop()">⏸️ Pause einlegen</button>
   <button class="btn bd" onclick="devAct('finish')">🧾 Beenden & Quittung</button>
 </div>
 </div>
@@ -2747,15 +2751,39 @@ function poll(){
       updateTimerDisplay();
     }
 
-    if(d.active){
+    var bStart = document.getElementById('btnStart');
+    var bPause = document.getElementById('btnPause');
+
+    if(d.active && !d.paused){
       document.getElementById('sPill').className = 'pill pill-on';
       document.getElementById('sTxt').innerText = 'Aktiv';
+      if(bStart) bStart.style.display = 'none';
+      if(bPause){
+        bPause.style.display = 'block';
+        bPause.style.background = '#f1f5f9';
+        bPause.style.color = '#0f172a';
+        bPause.innerHTML = '⏸️ Pause einlegen';
+      }
     } else if(d.paused){
       document.getElementById('sPill').className = 'pill pill-p';
       document.getElementById('sTxt').innerText = 'Pause';
+      if(bStart){
+        bStart.style.display = 'block';
+        bStart.style.background = '#059669';
+        bStart.style.color = '#ffffff';
+        bStart.innerHTML = '▶️ Fortsetzen & Laden';
+      }
+      if(bPause) bPause.style.display = 'none';
     } else {
       document.getElementById('sPill').className = 'pill pill-off';
       document.getElementById('sTxt').innerText = 'Bereit';
+      if(bStart){
+        bStart.style.display = 'block';
+        bStart.style.background = '#0f172a';
+        bStart.style.color = '#ffffff';
+        bStart.innerHTML = '▶️ Starten';
+      }
+      if(bPause) bPause.style.display = 'none';
     }
 
     // Modal Status Management
