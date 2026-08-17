@@ -548,12 +548,8 @@ def relay_control(turn_on):
         try:
             http_requests.post(f"{SHELLY_CLOUD_URL}/device/relay/control",
                                data={"auth_key": AUTH_KEY, "id": DEVICE_ID, "turn": s, "channel": 0}, timeout=4)
-        except: pass
-        try:
-            http_requests.post(f"{SHELLY_CLOUD_URL}/device/rpc",
-                               json={"auth_key": AUTH_KEY, "id": DEVICE_ID,
-                                     "method": "Switch.Set", "params": {"id": 0, "on": turn_on}}, timeout=4)
-        except: pass
+        except Exception as e:
+            logger.error(f"Relay control error: {e}")
         charge["relay_on"] = turn_on
         logger.info(f"Relay -> {'EIN' if turn_on else 'AUS'}")
     threading.Thread(target=_do, daemon=True).start()
@@ -621,27 +617,33 @@ def accumulate_energy():
     # =====================================================================
     # 1. ERKENNUNG: GERAET EINGESTECKT / WIEDERANLAUF
     # =====================================================================
-    if (charge["waiting_for_new_plug"] or not charge["active"]) and is_flowing and not charge["paused"] and not charge["terminated"]:
-        charge["waiting_for_new_plug"] = False
-        charge["active"] = True
-        charge["last_wh_time"] = now
-        charge["unplug_cooldown_until"] = now + 10.0
-        charge["flow_continuous_seconds"] = 0.0
-        charge["had_flowing"] = False
-        charge["last_stable_w"] = w
-        charge["stable_samples_count"] = 1
-        
-        if charge.get("target_is_new", True) and len(charge["devices"]) > 0 and charge["devices"][-1].get("wh", 0) > 0.05:
-            next_num = len(charge["devices"]) + 1
-            new_dev = new_device_entry(next_num, "lamp")
-            charge["devices"].append(new_dev)
-            charge["current_device_idx"] = len(charge["devices"]) - 1
-            logger.info(f"⚡ Neues Gerät #{next_num} gestartet ({w:.1f} W). Schonfrist aktiv bis +10s.")
-        else:
-            reused_idx = charge.get("current_device_idx", 0)
-            if 0 <= reused_idx < len(charge["devices"]):
-                cur_d = charge["devices"][reused_idx]
-                logger.info(f"⚡ Gerät ({cur_d['name']}) läuft aktiv ({w:.1f} W).")
+    if is_flowing and not charge["paused"] and not charge["terminated"]:
+        if charge["session_start_time"] is None:
+            charge["session_start_time"] = now
+            charge["active"] = True
+            charge["last_wh_time"] = now
+
+        if charge["waiting_for_new_plug"] or not charge["active"]:
+            charge["waiting_for_new_plug"] = False
+            charge["active"] = True
+            charge["last_wh_time"] = now
+            charge["unplug_cooldown_until"] = now + 12.0
+            charge["flow_continuous_seconds"] = 0.0
+            charge["had_flowing"] = False
+            charge["last_stable_w"] = w
+            charge["stable_samples_count"] = 1
+            
+            if charge.get("target_is_new", True) and len(charge["devices"]) > 0 and charge["devices"][-1].get("wh", 0) > 0.05:
+                next_num = len(charge["devices"]) + 1
+                new_dev = new_device_entry(next_num, "lamp")
+                charge["devices"].append(new_dev)
+                charge["current_device_idx"] = len(charge["devices"]) - 1
+                logger.info(f"⚡ Neues Gerät #{next_num} gestartet ({w:.1f} W). Schonfrist aktiv bis +12s.")
+            else:
+                reused_idx = charge.get("current_device_idx", 0)
+                if 0 <= reused_idx < len(charge["devices"]):
+                    cur_d = charge["devices"][reused_idx]
+                    logger.info(f"⚡ Gerät ({cur_d['name']}) läuft aktiv ({w:.1f} W).")
 
     # =====================================================================
     # 2. STABILER STROMFLUSS-AUFBAU (Schonfrist & Standby-Berücksichtigung)
