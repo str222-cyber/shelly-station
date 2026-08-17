@@ -605,17 +605,15 @@ def accumulate_energy():
     # =====================================================================
     # 1. ERKENNUNG: GERAET EINGESTECKT / WIEDERANLAUF
     # =====================================================================
-    if is_flowing and not charge["terminated"]:
+    if is_flowing and not charge["paused"] and not charge["terminated"]:
         if charge["session_start_time"] is None:
             charge["session_start_time"] = now
             charge["active"] = True
-            charge["paused"] = False
             charge["last_wh_time"] = now
 
-        if charge["waiting_for_new_plug"] or not charge["active"] or charge["paused"]:
+        if charge["waiting_for_new_plug"] or not charge["active"]:
             charge["waiting_for_new_plug"] = False
             charge["active"] = True
-            charge["paused"] = False
             charge["last_wh_time"] = now
             charge["unplug_cooldown_until"] = now + 15.0
             charge["flow_continuous_seconds"] = 0.0
