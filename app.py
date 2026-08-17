@@ -792,8 +792,12 @@ def accumulate_energy():
 # =====================================================================
 # KONTINUIERLICHER SERVER-SEITIGER HINTERGRUND-THREAD (24/7 DAEMON)
 # =====================================================================
+daemon_started = False
+daemon_lock = threading.Lock()
+
 def background_energy_daemon():
     """Zählt auch bei Screensaver, Schlafmodus oder ausgeschaltetem Handy-Display 100% akkurat weiter!"""
+    logger.info("⚡ Master Background Energy Daemon in Gunicorn Worker gestartet.")
     while True:
         try:
             poll_shelly()
@@ -803,8 +807,16 @@ def background_energy_daemon():
             logger.error(f"Energy daemon error: {e}")
         time.sleep(1.2)
 
-daemon_thread = threading.Thread(target=background_energy_daemon, daemon=True)
-daemon_thread.start()
+def ensure_daemon_started():
+    global daemon_started
+    if not daemon_started:
+        with daemon_lock:
+            if not daemon_started:
+                daemon_started = True
+                t = threading.Thread(target=background_energy_daemon, daemon=True)
+                t.start()
+
+ensure_daemon_started()
 
 
 def fmt_time(s):
@@ -815,6 +827,10 @@ def fmt_time(s):
 # =====================================================================
 # ROUTES
 # =====================================================================
+@app.before_request
+def check_worker_daemon():
+    ensure_daemon_started()
+
 @app.after_request
 def headers(r):
     r.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
