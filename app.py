@@ -552,6 +552,13 @@ def relay_control(turn_on):
             logger.error(f"Relay control error: {e}")
         charge["relay_on"] = turn_on
         logger.info(f"Relay -> {'EIN' if turn_on else 'AUS'}")
+        if turn_on:
+            # Nach Einschalten sofort nach 0.7s frischen Poll machen, damit Strom sofort erkannt wird
+            time.sleep(0.7)
+            shelly["poll_time"] = 0.0
+            poll_shelly()
+            with lock:
+                accumulate_energy()
     threading.Thread(target=_do, daemon=True).start()
 
 
@@ -2142,7 +2149,11 @@ function doStart(){
   startContinuousTimer();
   document.getElementById('sPill').className = 'pill pill-on';
   document.getElementById('sTxt').innerText = 'Aktiv';
-  post('/start').then(function(){ poll(); });
+  post('/start').then(function(){
+    setTimeout(poll, 600);
+    setTimeout(poll, 1400);
+    setTimeout(poll, 2200);
+  });
 }
 
 function doStop(){
