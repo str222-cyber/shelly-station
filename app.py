@@ -178,11 +178,14 @@ charge = {
     "relay_on": False,
     "selected_country": "DE",  # Standard: Deutschland (19% MwSt.)
     
-    # Intelligente Stecker- & Gerätewechsel-State-Machine:
-    # "IDLE" (Normal) | "SWAP_PENDING" (Altes Gerät steckt noch, zählt weiter) | "WAITING_FOR_PLUG" (Altes Gerät weg, warte auf Einstecken)
-    "swap_state": "IDLE",
-    "unplug_detected": False,
-    "last_zero_amp_time": None,
+    # --- PRÄZISE PHYSIKALISCHE STECKER-ERKENNUNG (Debounced State Machine) ---
+    # plug_state: "CONNECTED" | "UNPLUG_PENDING" | "UNPLUGGED"
+    "plug_state": "CONNECTED",
+    "zero_current_start": None,     # Timestamp, wann Strom auf 0 fiel
+    "replug_prompt": False,         # True, wenn nach echtem Unplug wieder Strom fließt -> Frage an Nutzer
+    "replug_watt": 0.0,
+    "replug_amp": 0.0,
+    "is_flowing": False,
     
     "accumulated_seconds": 0.0,
     "last_start_time": None,
@@ -410,12 +413,14 @@ def get_elapsed():
     return charge["accumulated_seconds"]
 
 
-def new_device_entry(idx, key="lamp"):
+def new_device_entry(num, key="lamp"):
+    """Erstellt einen sauberen Geräteeintrag mit korrekter Nummerierung (Gerät 1, Gerät 2, etc.)"""
     prof = DEVICE_PROFILES.get(key, DEVICE_PROFILES["lamp"])
     return {
-        "id": idx,
+        "num": num,
         "key": prof["key"],
-        "name": f"Gerät #{idx}: {prof['name']}" if idx > 1 else prof["name"],
+        "name": f"Gerät {num}: {prof['name']}",
+        "raw_name": prof["name"],
         "icon": prof["icon"],
         "mode": prof["mode"],
         "is_battery": prof["is_battery"],
@@ -443,51 +448,39 @@ def accumulate_energy():
 
     w = shelly["watt"]
     a = shelly["amp"]
-    is_flowing = (a > 0.025 or w > 0.4)
-    charge["unplug_detected"] = (not is_flowing)
+    
+    # Echte Stromfluss-Erkennung
+    is_flowing = (a >= 0.025 or w >= 0.3)
+    charge["is_flowing"] = is_flowing
 
     # =====================================================================
-    # INTELLIGENTE STECKER- & WECHSEL-LOGIK (Smart Swap State Machine)
+    # PRÄZISE PHYSIKALISCHE STECKER-ERKENNUNG (4-Sekunden Entprellung)
     # =====================================================================
-    if charge["swap_state"] == "SWAP_PENDING":
-        # Fall 1: Nutzer hat 'Gerät wechseln' geklickt, altes Gerät zieht aber noch Strom
-        # -> Strom wird solange sauber auf dem alten Gerät weitergezählt bis Stecker gezogen wird!
-        if not is_flowing:
-            charge["swap_state"] = "WAITING_FOR_PLUG"
-            logger.info("⚡ Altes Gerät abgesteckt -> Wechsle in WAITING_FOR_PLUG (Warte auf neues Gerät)")
-
-    elif charge["swap_state"] == "WAITING_FOR_PLUG":
-        # Fall 2: Altes Gerät ist abgesteckt, Relais bleibt aktiv -> Sobald Strom fließt, startet Gerät #N
-        if is_flowing:
-            idx = len(charge["devices"]) + 1
-            charge["devices"].append(new_device_entry(idx, "lamp"))
-            charge["current_device_idx"] = len(charge["devices"]) - 1
-            charge["power_history"] = []
-            charge["ai_result"] = None
-            charge["ai_tick"] = 0
-            charge["swap_state"] = "IDLE"
-            logger.info(f"⚡ Neues Gerät eingesteckt! Gerät #{idx} automatisch aktiviert.")
-
-    elif charge["swap_state"] == "IDLE":
-        # Fall 3: Automatische Erkennung eines Gerätewechsels im laufenden Betrieb
-        # Wenn der Stecker für mehr als 4 Sekunden gezogen war (>4s Nullstrom) und jetzt ein neues Gerät ansteckt:
-        if not is_flowing:
-            if charge["last_zero_amp_time"] is None:
-                charge["last_zero_amp_time"] = now
+    if not is_flowing:
+        # Kein Strom
+        if charge["zero_current_start"] is None:
+            charge["zero_current_start"] = now
+            charge["plug_state"] = "UNPLUG_PENDING"
         else:
-            if charge["last_zero_amp_time"] is not None:
-                zero_dur = now - charge["last_zero_amp_time"]
-                # Wenn das vorherige Gerät bereits nennenswerte Energie hatte (> 0.05 Wh) und Strom > 4s weg war:
-                cur_d = charge["devices"][charge["current_device_idx"]] if charge["devices"] else None
-                if zero_dur > 4.0 and cur_d and cur_d.get("wh", 0) > 0.05:
-                    idx = len(charge["devices"]) + 1
-                    charge["devices"].append(new_device_entry(idx, "lamp"))
-                    charge["current_device_idx"] = len(charge["devices"]) - 1
-                    charge["power_history"] = []
-                    charge["ai_result"] = None
-                    charge["ai_tick"] = 0
-                    logger.info(f"⚡ Automatischer Gerätewechsel nach {zero_dur:.1f}s Steckerpause -> Gerät #{idx} angelegt.")
-                charge["last_zero_amp_time"] = None
+            zero_duration = now - charge["zero_current_start"]
+            # Erst wenn mindestens 4.0 Sekunden durchgehend 0 Strom fließt: Echter Steckerabzug!
+            if zero_duration >= 4.0 and charge["plug_state"] != "UNPLUGGED":
+                charge["plug_state"] = "UNPLUGGED"
+                logger.info(f"🔌 Stecker physisch abgezogen (Nullstrom seit {zero_duration:.1f}s)")
+    else:
+        # Strom fließt
+        if charge["plug_state"] == "UNPLUGGED":
+            # NACH einem verifizierten Unplug fließt jetzt wieder Strom -> Replug erkannt!
+            # Frage Nutzer, ob selbes oder neues Gerät!
+            charge["replug_prompt"] = True
+            charge["replug_watt"] = round(w, 1)
+            charge["replug_amp"] = round(a, 3)
+            charge["plug_state"] = "CONNECTED"
+            logger.info(f"⚡ Stecker wieder eingesteckt ({w:.1f} W / {a:.3f} A) -> Replug Dialog aktiv")
+        
+        charge["zero_current_start"] = None
+        if charge["plug_state"] == "UNPLUG_PENDING":
+            charge["plug_state"] = "CONNECTED"
 
     # =====================================================================
     # ENERGIE- & KOSTEN-AKKUMULATION
@@ -535,8 +528,8 @@ def accumulate_energy():
             if not cur_dev.get("user_confirmed", False) and ai.get("suggested_key") in DEVICE_PROFILES:
                 s_prof = DEVICE_PROFILES[ai["suggested_key"]]
                 cur_dev["key"] = s_prof["key"]
-                base_nm = s_prof["name"]
-                cur_dev["name"] = f"Gerät #{idx+1}: {base_nm}" if idx > 0 else base_nm
+                cur_dev["raw_name"] = s_prof["name"]
+                cur_dev["name"] = f"Gerät {cur_dev['num']}: {s_prof['name']}"
                 cur_dev["icon"] = s_prof["icon"]
                 cur_dev["mode"] = s_prof["mode"]
                 cur_dev["is_battery"] = s_prof["is_battery"]
@@ -574,9 +567,9 @@ def scan(token):
             charge["last_report"] = None
             charge["active"] = False
             charge["paused"] = False
-            charge["swap_state"] = "IDLE"
-            charge["unplug_detected"] = False
-            charge["last_zero_amp_time"] = None
+            charge["plug_state"] = "CONNECTED"
+            charge["zero_current_start"] = None
+            charge["replug_prompt"] = False
             charge["accumulated_seconds"] = 0.0
             charge["last_start_time"] = None
             charge["last_wh_time"] = None
@@ -601,9 +594,9 @@ def reset_session():
         charge["last_report"] = None
         charge["active"] = False
         charge["paused"] = False
-        charge["swap_state"] = "IDLE"
-        charge["unplug_detected"] = False
-        charge["last_zero_amp_time"] = None
+        charge["plug_state"] = "CONNECTED"
+        charge["zero_current_start"] = None
+        charge["replug_prompt"] = False
         charge["accumulated_seconds"] = 0.0
         charge["last_start_time"] = None
         charge["last_wh_time"] = None
@@ -653,9 +646,12 @@ def get_status():
             "wh": round(charge["total_wh"], 4),
             "kwh": round(charge["total_kwh"], 6),
             
-            # Stecker- & Wechsel-Status
-            "swap_state": charge["swap_state"],
-            "unplug_detected": charge["unplug_detected"],
+            # Stecker-Zustand
+            "plug_state": charge["plug_state"],
+            "replug_prompt": charge["replug_prompt"],
+            "replug_watt": charge["replug_watt"],
+            "replug_amp": charge["replug_amp"],
+            "is_flowing": charge["is_flowing"],
             
             # Mehrwertsteuer & Beträge
             "country": c_info,
@@ -724,42 +720,30 @@ def stop_charge():
     logger.info(f">>> PAUSE (t_acc={charge['accumulated_seconds']:.1f}s) <<<")
     return jsonify({"status": "ok"})
 
-# --- SMART SWAP ENDPOINTS ---
-@app.route('/request_swap', methods=['POST'])
-def request_swap():
-    """Benutzer leitet Gerätewechsel ein.
-    Wenn altes Gerät noch Strom zieht: SWAP_PENDING (Strom zählt weiter auf altem Gerät).
-    Wenn bereits kein Strom fließt: WAITING_FOR_PLUG."""
-    with lock:
-        is_flowing = (shelly["amp"] > 0.025 or shelly["watt"] > 0.4)
-        if is_flowing:
-            charge["swap_state"] = "SWAP_PENDING"
-            logger.info("Gerätewechsel eingeleitet: Altes Gerät zieht noch Strom -> SWAP_PENDING")
-        else:
-            charge["swap_state"] = "WAITING_FOR_PLUG"
-            logger.info("Gerätewechsel eingeleitet: Kein Strom -> WAITING_FOR_PLUG")
-        return jsonify({"status": "ok", "swap_state": charge["swap_state"]})
+# --- REPLUG ENTSCHEIDUNG (Dasselbe vs. Neues Gerät) ---
+@app.route('/handle_replug', methods=['POST'])
+def handle_replug():
+    data = request.get_json() or {}
+    action = data.get("action")  # "same" oder "new"
+    key = data.get("key", "lamp")
 
-@app.route('/cancel_swap', methods=['POST'])
-def cancel_swap():
     with lock:
-        charge["swap_state"] = "IDLE"
-        logger.info("Gerätewechsel abgebrochen -> IDLE")
-        return jsonify({"status": "ok"})
-
-@app.route('/force_new_device', methods=['POST'])
-def force_new_device():
-    """Erzwingt sofortiges Anlegen eines neuen Geräts."""
-    with lock:
-        idx = len(charge["devices"]) + 1
-        charge["devices"].append(new_device_entry(idx, "lamp"))
-        charge["current_device_idx"] = len(charge["devices"]) - 1
-        charge["power_history"] = []
-        charge["ai_result"] = None
-        charge["ai_tick"] = 0
-        charge["swap_state"] = "IDLE"
-        logger.info(f"Manuelles Anlegen erzwungen: Gerät #{idx} gestartet.")
-    return jsonify({"status": "ok", "current_device_idx": charge["current_device_idx"]})
+        charge["replug_prompt"] = False
+        if action == "same":
+            logger.info(f"Replug: Benutzer setzt bisheriges Gerät ({charge['devices'][charge['current_device_idx']]['name']}) fort.")
+            return jsonify({"status": "ok", "action": "same"})
+        elif action == "new":
+            next_num = len(charge["devices"]) + 1
+            new_dev = new_device_entry(next_num, key)
+            new_dev["user_confirmed"] = True
+            charge["devices"].append(new_dev)
+            charge["current_device_idx"] = len(charge["devices"]) - 1
+            charge["power_history"] = []
+            charge["ai_result"] = None
+            charge["ai_tick"] = 0
+            logger.info(f"Replug: Neues Gerät #{next_num} angelegt ({new_dev['name']}).")
+            return jsonify({"status": "ok", "action": "new", "device": new_dev})
+    return jsonify({"status": "error"}), 400
 
 @app.route('/set_country', methods=['POST'])
 def set_country():
@@ -793,14 +777,14 @@ def set_device():
             if key in DEVICE_PROFILES:
                 prof = DEVICE_PROFILES[key]
                 dev["key"] = prof["key"]
-                base_nm = prof["name"]
-                dev["name"] = f"Gerät #{idx+1}: {base_nm}" if idx > 0 else base_nm
+                dev["raw_name"] = prof["name"]
+                dev["name"] = f"Gerät {dev['num']}: {prof['name']}"
                 dev["icon"] = prof["icon"]
                 dev["mode"] = prof["mode"]
                 dev["is_battery"] = prof["is_battery"]
                 dev["nominal_wh"] = prof["nominal_wh"]
                 dev["user_confirmed"] = confirmed
-                logger.info(f"Gerät #{idx+1} konfiguriert: {dev['name']} ({dev['mode']}) | Bestätigt: {confirmed}")
+                logger.info(f"Gerät {dev['num']} konfiguriert: {dev['name']} ({dev['mode']}) | Bestätigt: {confirmed}")
                 return jsonify({"status": "ok", "device": dev})
     return jsonify({"status": "error", "message": "Gerät nicht gefunden"}), 400
 
@@ -814,7 +798,7 @@ def logout():
         charge["active"] = False
         charge["paused"] = False
         charge["terminated"] = True
-        charge["swap_state"] = "IDLE"
+        charge["replug_prompt"] = False
         charge["last_start_time"] = None
         charge["last_wh_time"] = None
 
@@ -927,6 +911,7 @@ def generate_pdf(report):
         story.append(t)
         story.append(Spacer(1, 14))
 
+        # Summenblock mit MwSt.-Ausweisung
         sum_tbl = [
             ["Nettobetrag (Zwischensumme):", f"{netto:.5f} €"],
             [f"zzgl. {vat_name} ({vat_rate:.1f}% für {c_name}):", f"+ {vat_amt:.5f} €"],
@@ -984,8 +969,8 @@ def debug():
         "shelly": dict(shelly),
         "charge_active": charge["active"],
         "charge_paused": charge["paused"],
-        "swap_state": charge["swap_state"],
-        "unplug_detected": charge["unplug_detected"],
+        "plug_state": charge["plug_state"],
+        "replug_prompt": charge["replug_prompt"],
         "country": c_info,
         "accumulated_seconds": charge["accumulated_seconds"],
         "elapsed_calculated": round(elapsed, 1),
@@ -1044,7 +1029,7 @@ LOCK_HTML = """<!DOCTYPE html>
 *{box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:0;padding:0}
 body{background:#090d16;color:#f8fafc;display:flex;justify-content:center;align-items:center;min-height:100vh;padding:16px}
 .card{background:#111827;border-radius:24px;padding:32px 24px;border:1px solid #1f2937;text-align:center;max-width:440px;width:100%;box-shadow:0 25px 50px -12px rgba(0,0,0,.5)}
-h1{font-size:22px;font-weight:800;margin:16px 0 8px}
+h1{font-size:22px;font-weight:800;margin-16px 0 8px}
 p{font-size:13.5px;color:#94a3b8;line-height:1.5;margin-bottom:20px}
 .tbox{background:#0f172a;border:1px dashed #3b82f6;border-radius:14px;padding:14px;margin-bottom:20px;text-align:left}
 .tlbl{font-size:11px;text-transform:uppercase;color:#60a5fa;font-weight:700;margin-bottom:4px}
@@ -1093,14 +1078,10 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 .pill-p .dot{background:#d97706}
 .pill-off .dot{background:#94a3b8}
 
-/* SMART WECHSEL- & STECKER-BANNER */
-.swap-banner{border-radius:16px;padding:12px 14px;margin-bottom:12px;text-align:left;animation:fadein .2s ease-out}
-.swap-pending{background:#fffbeb;border:1.5px solid #fde68a;color:#92400e}
-.swap-waiting{background:#eff6ff;border:1.5px solid #bfdbfe;color:#1e40af;box-shadow:0 0 12px rgba(37,99,235,.15)}
-.swap-title{font-size:12.5px;font-weight:800;display:flex;align-items:center;gap:6px;margin-bottom:4px}
-.swap-text{font-size:11px;line-height:1.4;margin-bottom:8px}
-.swap-btns{display:flex;gap:6px}
-.swap-btn-sm{padding:6px 10px;font-size:11.5px;font-weight:700;border-radius:8px;border:none;cursor:pointer}
+/* GERÄTE-TABS ANZEIGE (Gerät 1, Gerät 2...) */
+.dev-pills{display:flex;gap:6px;overflow-x:auto;padding-bottom:8px;margin-bottom:10px;scrollbar-width:none}
+.dev-pill{font-size:11px;font-weight:700;padding:4px 10px;border-radius:20px;background:#f1f5f9;color:var(--muted);white-space:nowrap;border:1px solid var(--border)}
+.dev-pill.active{background:#eff6ff;color:var(--blue);border-color:#bfdbfe}
 
 /* KI-VORSCHLAG & GERAETE-AUSWAHL */
 .ai-box{background:#f8fafc;border:1.5px solid var(--border);border-radius:18px;padding:14px;margin-bottom:12px;text-align:left;transition:border-color .2s}
@@ -1183,6 +1164,26 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 .ein{width:100%;padding:11px;border:1px solid var(--border);border-radius:10px;font-size:13.5px;margin-bottom:8px}
 </style></head><body>
 
+<!-- MODAL: UMSTECKEN ERKANNT (AUTOMATISCHER DIALOG) -->
+<div id="replugModal" class="modal">
+<div class="mbox" style="text-align:center;border:2px solid var(--blue)">
+  <div style="font-size:42px;margin-bottom:6px">🔌⚡</div>
+  <div style="font-size:17px;font-weight:800;margin-bottom:4px">Umstecken erkannt!</div>
+  <div style="font-size:12.5px;color:var(--muted);margin-bottom:16px">
+    Strom fließt wieder (<b id="replugWattDisplay" style="color:var(--blue)">0.0 W</b>).<br/>
+    Welches Gerät wurde angeschlossen?
+  </div>
+  
+  <button class="btn bp" style="background:var(--green);margin-bottom:8px" onclick="handleReplugChoice('same')">
+    ▶️ Dasselbe Gerät fortsetzen (<span id="curDevNameModal">Gerät 1</span>)
+  </button>
+  
+  <button class="btn bp" style="background:var(--blue);margin-bottom:8px" onclick="handleReplugChoice('new_picker')">
+    ➕ Neues Gerät erfassen (<span id="nextDevNameModal">Gerät 2</span>)
+  </button>
+</div>
+</div>
+
 <!-- MODAL: LAND & MWST WAHLEN -->
 <div id="countryModal" class="modal">
 <div class="mbox">
@@ -1237,7 +1238,7 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 </div>
 </div>
 
-<!-- MODAL: GERAET WAHLEN -->
+<!-- MODAL: GERAET / PROFIL WAHLEN -->
 <div id="devModal" class="modal">
 <div class="mbox">
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
@@ -1302,31 +1303,11 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 <div class="badges">
   <span class="pill pill-g">🔒 Verifiziert</span>
   <span class="pill pill-off" id="sPill"><span class="dot"></span><span id="sTxt">Bereit</span></span>
-  <span class="pill pill-warn" id="unplugPill" style="display:none">⚠️ Stecker abgezogen (0.0 A)</span>
+  <span class="pill pill-warn" id="unplugPill" style="display:none">⚠️ Stecker gezogen (0.0 A)</span>
 </div>
 
-<!-- DYNAMISCHES GERÄTEWECHSEL-BANNER (State Machine) -->
-<div id="swapBannerBox" style="display:none">
-  <!-- 1. SWAP_PENDING: Altes Gerät zieht noch Strom -->
-  <div id="swapPendingBanner" class="swap-banner swap-pending" style="display:none">
-    <div class="swap-title">🔄 Gerätewechsel aktiv – Altes Gerät abstecken</div>
-    <div class="swap-text">Das bisherige Gerät zieht aktuell noch Strom (<b id="swapCurWatt">0.0</b> W / <b id="swapCurAmp">0.00</b> A). Die Energie wird bis zum Abstecken weiter auf diesem Gerät gezählt.</div>
-    <div class="swap-btns">
-      <button class="swap-btn-sm" style="background:#d97706;color:#fff" onclick="forceNewDevice()">Sofort neues Gerät starten</button>
-      <button class="swap-btn-sm" style="background:#ffffff;border:1px solid #cbd5e1" onclick="cancelSwap()">Abbrechen</button>
-    </div>
-  </div>
-
-  <!-- 2. WAITING_FOR_PLUG: Altes Gerät entfernt, warte auf Einstecken des neuen Geräts -->
-  <div id="swapWaitingBanner" class="swap-banner swap-waiting" style="display:none">
-    <div class="swap-title">🔌 Altes Gerät abgesteckt ✓ – Neues Gerät einstecken</div>
-    <div class="swap-text">Stecke jetzt das neue Gerät ein. Sobald Strom fließt, erkennt die Station das neue Gerät automatisch per Ampere-Messung!</div>
-    <div class="swap-btns">
-      <button class="swap-btn-sm" style="background:#2563eb;color:#fff" onclick="showM('devModal')">Gerät manuell wählen</button>
-      <button class="swap-btn-sm" style="background:#fee2e2;color:#dc2626" onclick="devAct('finish')">Sitzung abschließen</button>
-    </div>
-  </div>
-</div>
+<!-- GERÄTE-TABS DER AKTUELLEN SITZUNG -->
+<div class="dev-pills" id="devPillsContainer"></div>
 
 <!-- KI-VORSCHLAG & GERAETE-LEISTE -->
 <div class="ai-box" id="aiBox">
@@ -1337,7 +1318,7 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
   <div class="ai-main">
     <div class="ai-ico" id="aiIco">💡</div>
     <div>
-      <div class="ai-title" id="aiTitle">Lampe / Beleuchtung</div>
+      <div class="ai-title" id="aiTitle">Gerät 1: Lampe / Beleuchtung</div>
       <span class="ai-mode-badge badge-cont" id="aiModeBadge">Dauerbetrieb</span>
     </div>
   </div>
@@ -1412,9 +1393,8 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 </div>
 
 <div class="btns">
-  <button class="btn bp" id="btnMainStart" onclick="doStart()">▶️ Start / Fortsetzen</button>
+  <button class="btn bp" onclick="doStart()">▶️ Start / Fortsetzen</button>
   <button class="btn bs" onclick="doStop()">⏸️ Pause</button>
-  <button class="btn bs" style="background:#eff6ff;color:var(--blue);border-color:#bfdbfe" onclick="initiateSwap()">🔄 Gerät wechseln (Smart Swap)</button>
   <button class="btn bd" onclick="devAct('finish')">🧾 Beenden & Quittung</button>
 </div>
 </div>
@@ -1465,8 +1445,9 @@ var localTimerInterval = null;
 
 var STROMPREIS_NETTO = 0.35;
 var currentCountry = { code: 'DE', name: 'Deutschland', flag: '🇩🇪', vat_name: 'MwSt.', rate: 19.0 };
-var currentDevice = { mode: 'continuous', is_battery: false, nominal_wh: 0, user_confirmed: false };
+var currentDevice = { num: 1, name: 'Gerät 1: Lampe / Beleuchtung', mode: 'continuous', is_battery: false, nominal_wh: 0, user_confirmed: false };
 var latestAiSuggestion = null;
+var isReplugModalOpen = false;
 
 function fs(s){
   s = Math.floor(Math.max(0, s));
@@ -1532,7 +1513,6 @@ function startFreshSession(){
 
 function doStart(){
   if(done) return;
-  // Sofortige Reaktion ohne Millisekunden-Ruckeln
   isChargingActive = true;
   startLocalTimer();
   document.getElementById('sPill').className = 'pill pill-on';
@@ -1549,25 +1529,6 @@ function doStop(){
   post('/stop').then(function(){ poll(); });
 }
 
-// SMART GERÄTEWECHSEL
-function initiateSwap(){
-  post('/request_swap').then(function(r){
-    poll();
-  });
-}
-
-function cancelSwap(){
-  post('/cancel_swap').then(function(){
-    poll();
-  });
-}
-
-function forceNewDevice(){
-  post('/force_new_device').then(function(){
-    poll();
-  });
-}
-
 function devAct(a){
   if(a === 'continue'){
     doStart();
@@ -1575,6 +1536,20 @@ function devAct(a){
     isChargingActive = false;
     stopLocalTimer();
     post('/logout').then(function(r){ showReceipt(r); });
+  }
+}
+
+// AUTOMATISCHE UMSTECK-BEHANDLUNG
+function handleReplugChoice(choice){
+  hideM('replugModal');
+  isReplugModalOpen = false;
+  if(choice === 'same'){
+    post('/handle_replug', { action: 'same' }).then(function(){ poll(); });
+  } else if(choice === 'new_picker'){
+    // Öffne direkt die Geräteprofil-Auswahl
+    showM('devModal');
+    // Setze vorab den Wechselbefehl ab
+    post('/handle_replug', { action: 'new', key: 'lamp' }).then(function(){ poll(); });
   }
 }
 
@@ -1640,7 +1615,7 @@ function updateWysiwygLook(dev, curW, curWh){
   var aiModeBadge = document.getElementById('aiModeBadge');
 
   aiIco.innerText = dev.icon || '🔌';
-  aiTitle.innerText = dev.name || 'Gerät';
+  aiTitle.innerText = dev.name || ('Gerät ' + (dev.num || 1));
 
   if(isBatt){
     aiModeBadge.className = 'ai-mode-badge badge-batt';
@@ -1723,7 +1698,7 @@ function showReceipt(rp){
     var dNetto = d.cost_netto || (d.wh / 1000.0) * STROMPREIS_NETTO;
     var dBrutto = d.cost_brutto || d.cost || (dNetto * (1 + vatRate/100));
     var tr = document.createElement('tr');
-    tr.innerHTML = '<td><b>' + (d.icon || '🔌') + ' ' + (d.name || 'Gerät') + '</b><br><span style="font-size:10px;color:#64748b">' + m + '</span></td><td style="text-align:center">' + fs(d.duration_sec || 0) + '</td><td style="text-align:right">' + (d.wh || 0).toFixed(3) + '</td><td style="text-align:right">' + dNetto.toFixed(4) + ' €</td><td style="text-align:right"><b>' + dBrutto.toFixed(4) + ' €</b></td>';
+    tr.innerHTML = '<td><b>' + (d.icon || '🔌') + ' ' + (d.name || ('Gerät ' + (idx+1))) + '</b><br><span style="font-size:10px;color:#64748b">' + m + '</span></td><td style="text-align:center">' + fs(d.duration_sec || 0) + '</td><td style="text-align:right">' + (d.wh || 0).toFixed(3) + '</td><td style="text-align:right">' + dNetto.toFixed(4) + ' €</td><td style="text-align:right"><b>' + dBrutto.toFixed(4) + ' €</b></td>';
     tb.appendChild(tr);
   });
 
@@ -1733,6 +1708,22 @@ function showReceipt(rp){
   document.getElementById('rCost').innerText = brutto.toFixed(5) + ' €';
   document.getElementById('rWh').innerText = (rp.total_wh || 0).toFixed(4);
   document.getElementById('rKwh').innerText = (rp.total_kwh || 0).toFixed(6);
+}
+
+function renderDevicePills(devs, activeIdx){
+  var c = document.getElementById('devPillsContainer');
+  if(!devs || devs.length <= 1){
+    c.style.display = 'none';
+    return;
+  }
+  c.style.display = 'flex';
+  c.innerHTML = '';
+  devs.forEach(function(d, idx){
+    var sp = document.createElement('span');
+    sp.className = 'dev-pill' + (idx === activeIdx ? ' active' : '');
+    sp.innerText = (d.icon || '🔌') + ' ' + (d.name || ('Gerät ' + (idx+1))) + ' (' + (d.wh || 0).toFixed(2) + ' Wh)';
+    c.appendChild(sp);
+  });
 }
 
 function poll(){
@@ -1778,34 +1769,26 @@ function poll(){
       }
     }
 
-    // Stecker-Abzug Warnung
+    // Stecker gezogen Indikator
     var unplugPill = document.getElementById('unplugPill');
-    if(d.unplug_detected && d.active && d.swap_state === 'IDLE'){
+    if(!d.is_flowing && d.active && d.plug_state === 'UNPLUGGED'){
       unplugPill.style.display = 'inline-flex';
     } else {
       unplugPill.style.display = 'none';
     }
 
-    // SMART SWAP BANNER
-    var swapBox = document.getElementById('swapBannerBox');
-    var pBanner = document.getElementById('swapPendingBanner');
-    var wBanner = document.getElementById('swapWaitingBanner');
-    
-    if(d.swap_state === 'SWAP_PENDING'){
-      swapBox.style.display = 'block';
-      pBanner.style.display = 'block';
-      wBanner.style.display = 'none';
-      document.getElementById('swapCurWatt').innerText = curW.toFixed(1);
-      document.getElementById('swapCurAmp').innerText = curA.toFixed(3);
-    } else if(d.swap_state === 'WAITING_FOR_PLUG'){
-      swapBox.style.display = 'block';
-      pBanner.style.display = 'none';
-      wBanner.style.display = 'block';
-    } else {
-      swapBox.style.display = 'none';
-      pBanner.style.display = 'none';
-      wBanner.style.display = 'none';
+    // AUTOMATISCHES UMSTECK-DIALOGFENSTER
+    if(d.replug_prompt && !isReplugModalOpen){
+      isReplugModalOpen = true;
+      document.getElementById('replugWattDisplay').innerText = (d.replug_watt || curW).toFixed(1) + ' W';
+      var curDevNum = (d.active_device && d.active_device.num) ? d.active_device.num : 1;
+      document.getElementById('curDevNameModal').innerText = 'Gerät ' + curDevNum;
+      document.getElementById('nextDevNameModal').innerText = 'Gerät ' + (curDevNum + 1);
+      showM('replugModal');
     }
+
+    // Geräte-Tabs
+    renderDevicePills(d.devices, d.current_device_idx);
 
     // Messwerte
     document.getElementById('volt').innerText = (d.voltage || 230).toFixed(1);
@@ -1827,7 +1810,7 @@ function poll(){
 
     document.getElementById('wSub').innerText = (curW > 0.1) ? 'Strom fließt' : 'Kein Strom';
 
-    // KI & Gerät
+    // KI & Aktives Gerät
     if(d.active_device){
       currentDevice = d.active_device;
     }
@@ -1862,58 +1845,6 @@ function sendEm(){
 setInterval(poll, 1000);
 poll();
 </script></body></html>"""
-
-
-ADMIN_HTML = """<!DOCTYPE html>
-<html lang="de"><head><meta charset="utf-8"><title>Admin</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<style>
-*{box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:0;padding:0}
-body{background:#090d16;color:#f8fafc;padding:24px 16px}
-.wrap{max-width:1020px;margin:auto}
-.hdr{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #1e293b;padding-bottom:16px;margin-bottom:24px}
-.brand{font-size:22px;font-weight:800}
-.badge{background:#1e3a8a;color:#93c5fd;font-size:11.5px;font-weight:700;padding:4px 10px;border-radius:8px}
-.g4{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-bottom:24px}
-.kpi{background:#111827;border:1px solid #1e293b;border-radius:18px;padding:18px}
-.kpi-l{font-size:11.5px;text-transform:uppercase;font-weight:700;color:#94a3b8}
-.kpi-v{font-size:26px;font-weight:800;color:#fff;margin-top:6px}
-.kpi-s{font-size:11.5px;color:#94a3b8;margin-top:4px}
-.sec{background:#111827;border:1px solid #1e293b;border-radius:18px;padding:20px;margin-bottom:24px}
-.sec-t{font-size:16px;font-weight:700;color:#fff;margin-bottom:14px;display:flex;justify-content:space-between}
-.lb{background:#1f2937;border-radius:14px;padding:14px;display:flex;flex-wrap:wrap;gap:20px}
-.li .ll{font-size:10.5px;text-transform:uppercase;color:#94a3b8;font-weight:700}
-.li .lv{font-size:18px;font-weight:800;color:#fff;margin-top:2px}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th{background:#1f2937;color:#94a3b8;padding:10px;text-align:left;font-size:11px;text-transform:uppercase}
-td{padding:10px;border-bottom:1px solid #1e293b}
-.btn{padding:9px 14px;font-size:12.5px;font-weight:700;border-radius:10px;border:none;cursor:pointer}
-.bon{background:#10b981;color:#fff}
-.boff{background:#ef4444;color:#fff}
-</style></head><body>
-<div class="wrap">
-<div class="hdr"><div><div class="brand">⚡ Admin Dashboard</div><div style="font-size:12px;color:#94a3b8;margin-top:4px">Station: <code>{{ physical_token }}</code></div></div><span class="badge">Admin</span></div>
-<div class="g4">
-<div class="kpi"><div class="kpi-l">Umsatz Heute (Brutto)</div><div class="kpi-v" style="color:#10b981">{{ "%.5f"|format(today_revenue) }} €</div><div class="kpi-s">Gesamt: {{ "%.5f"|format(total_revenue) }} €</div></div>
-<div class="kpi"><div class="kpi-l">Energie Heute</div><div class="kpi-v" style="color:#3b82f6">{{ "%.2f"|format(today_wh) }} Wh</div><div class="kpi-s">Gesamt: {{ "%.4f"|format(total_kwh) }} kWh</div></div>
-<div class="kpi"><div class="kpi-l">Sitzungen</div><div class="kpi-v">{{ today_sessions }}</div><div class="kpi-s">Gesamt: {{ total_sessions }}</div></div>
-<div class="kpi"><div class="kpi-l">Live Status</div><div class="kpi-v" style="color:{% if live_active %}#10b981{% else %}#94a3b8{% endif %}">{% if live_active %}AKTIV{% else %}BEREIT{% endif %}</div><div class="kpi-s">Relais: {% if relay_on %}EIN{% else %}AUS{% endif %}</div></div>
-</div>
-<div class="sec">
-<div class="sec-t"><span>Telemetrie</span><div style="display:flex;gap:8px"><button class="btn bon" onclick="ovr('force_on')">EIN</button><button class="btn boff" onclick="ovr('force_off')">AUS</button></div></div>
-<div class="lb">
-<div class="li"><div class="ll">Watt</div><div class="lv" style="color:#3b82f6">{{ "%.3f"|format(live_watt) }} W</div></div>
-<div class="li"><div class="ll">Ampere</div><div class="lv">{{ "%.3f"|format(live_amp) }} A</div></div>
-<div class="li"><div class="ll">Volt</div><div class="lv">{{ "%.1f"|format(live_volt) }} V</div></div>
-<div class="li"><div class="ll">API</div><div class="lv" style="color:{% if last_poll_ok %}#10b981{% else %}#ef4444{% endif %}">{% if last_poll_ok %}OK{% else %}?{% endif %}</div></div>
-</div></div>
-<div class="sec">
-<div class="sec-t">Sitzungen</div>
-<table><thead><tr><th>Beleg</th><th>Datum</th><th>Gerät & Land</th><th>Dauer</th><th>Wh</th><th>Brutto (€)</th></tr></thead>
-<tbody>{% for r in history_records|reverse %}<tr><td><code>{{ r.invoice_id }}</code></td><td>{{ r.date }}</td><td>{% for d in r.devices %}{{ d.icon|default('🔌') }} {{ d.name|default('?') }} ({{ 'Akku' if d.is_battery else 'Dauerbetrieb' }})<br>{% endfor %}<span style="font-size:10.5px;color:#94a3b8">{{ r.country_flag|default('🇩🇪') }} {{ r.country_name|default('DE') }} ({{ r.vat_rate|default(19.0) }}% {{ r.vat_name|default('MwSt') }})</span></td><td>{{ r.time_formatted }}</td><td>{{ "%.3f"|format(r.total_wh) }}</td><td><b style="color:#10b981">{{ "%.5f"|format(r.total_cost_brutto|default(r.total_cost|default(0))) }} €</b></td></tr>{% else %}<tr><td colspan="6" style="text-align:center;color:#94a3b8">Keine.</td></tr>{% endfor %}</tbody></table>
-</div></div>
-<script>function ovr(a){fetch('/admin_api/override',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:a})}).then(function(r){return r.json()}).then(function(d){alert(d.message||'OK');location.reload()})}</script>
-</body></html>"""
 
 
 if __name__ == '__main__':
