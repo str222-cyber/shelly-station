@@ -214,14 +214,104 @@ charge = {
 history_records = []
 history_stats = {"sessions": 0, "kwh": 0.0, "revenue_brutto": 0.0}
 HISTORY_FILE = "station_history.json"
+AI_LEARNED_FILE = "ai_learned_models.json"
 
 
 # =====================================================================
-# KI-GERAETEERKENNUNG & VORSCHLAEGE
+# SELBSTLERNENDE KI-GERAETEERKENNUNG & FINGERPRINTING
 # =====================================================================
 class DeviceAI:
-    @staticmethod
-    def classify(power_history):
+    learned_models = {}
+
+    @classmethod
+    def load_learned(cls):
+        if os.path.exists(AI_LEARNED_FILE):
+            try:
+                with open(AI_LEARNED_FILE, "r", encoding="utf-8") as f:
+                    cls.learned_models = json.load(f)
+                    logger.info(f"🧠 [KI-Modell] {len(cls.learned_models)} gelernte Fingerprints geladen.")
+            except Exception as e:
+                logger.error(f"Fehler beim Laden der gelernten KI-Muster: {e}")
+
+    @classmethod
+    def save_learned(cls):
+        try:
+            with open(AI_LEARNED_FILE, "w", encoding="utf-8") as f:
+                json.dump(cls.learned_models, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"Fehler beim Speichern der gelernten KI-Muster: {e}")
+
+    @classmethod
+    def learn_from_feedback(cls, key, power_history, current_w=0.0):
+        """Lernt kontinuierlich von Benutzer-Bestätigungen und Geräte-Verhaltensmustern"""
+        if not key or key not in DEVICE_PROFILES:
+            return
+        
+        valid_watts = [w for _, w in power_history if w > 0.1] if power_history else []
+        if not valid_watts and current_w > 0.1:
+            valid_watts = [current_w]
+        
+        if not valid_watts:
+            return
+
+        pw = max(valid_watts)
+        aw = sum(valid_watts) / len(valid_watts)
+        n = len(valid_watts)
+
+        if n >= 4:
+            fh = sum(valid_watts[:n//2]) / max(1, n//2)
+            sh = sum(valid_watts[n//2:]) / max(1, n - n//2)
+            trend_ratio = sh / fh if fh > 0 else 1.0
+            variance = sum((w - aw)**2 for w in valid_watts) / n
+            cv = (variance**0.5) / aw if aw > 0 else 0
+        else:
+            trend_ratio = 1.0
+            cv = 0.0
+
+        sample = {
+            "avg_w": round(aw, 2),
+            "peak_w": round(pw, 2),
+            "cv": round(cv, 3),
+            "trend": round(trend_ratio, 3),
+            "samples_count": n,
+            "ts": time.time()
+        }
+
+        if key not in cls.learned_models:
+            cls.learned_models[key] = {
+                "name": DEVICE_PROFILES[key]["name"],
+                "confirmations": 0,
+                "samples": [],
+                "centroid": {}
+            }
+
+        m = cls.learned_models[key]
+        m["confirmations"] += 1
+        m["samples"].append(sample)
+        if len(m["samples"]) > 60:
+            m["samples"] = m["samples"][-60:]
+
+        # Berechne neuen Zentroiden (Mittelwert des Gerätemodells)
+        s_list = m["samples"]
+        c_aw = sum(s["avg_w"] for s in s_list) / len(s_list)
+        c_pw = sum(s["peak_w"] for s in s_list) / len(s_list)
+        c_cv = sum(s["cv"] for s in s_list) / len(s_list)
+        c_tr = sum(s["trend"] for s in s_list) / len(s_list)
+
+        m["centroid"] = {
+            "avg_w": round(c_aw, 2),
+            "peak_w": round(c_pw, 2),
+            "cv": round(c_cv, 3),
+            "trend": round(c_tr, 3)
+        }
+
+        cls.save_learned()
+        logger.info(f"🧠 [KI-Lernen] Profil für '{key}' aktualisiert! Bestätigungen={m['confirmations']}, Zentroid: Ø {c_aw:.1f} W (Peak {c_pw:.1f} W)")
+
+    @classmethod
+    def classify(cls, power_history):
+        total_learned = sum(m.get("confirmations", 0) for m in cls.learned_models.values())
+
         if len(power_history) < 2:
             return {
                 "suggested_key": "lamp",
@@ -231,6 +321,8 @@ class DeviceAI:
                 "is_battery": False,
                 "confidence": 0,
                 "reason": "Sammle Leistungsdaten...",
+                "learned_match": False,
+                "total_learned_confirmations": total_learned,
                 "peak_w": 0.0, "avg_w": 0.0, "current_w": 0.0
             }
 
@@ -247,6 +339,8 @@ class DeviceAI:
                 "is_battery": False,
                 "confidence": 0,
                 "reason": "Stecker abgezogen oder Gerät im Standby",
+                "learned_match": False,
+                "total_learned_confirmations": total_learned,
                 "peak_w": 0.0, "avg_w": 0.0, "current_w": cw
             }
 
@@ -265,7 +359,53 @@ class DeviceAI:
             trend_ratio = 1.0
             cv = 0.0
 
-        # Klassifizierung
+        # =====================================================================
+        # 1. ADAPTIVES MUSTER-MATCHING (K-NEAREST GELERNTES MODELL)
+        # =====================================================================
+        best_learned_key = None
+        best_sim = 0.0
+
+        for l_key, l_data in cls.learned_models.items():
+            if l_data.get("confirmations", 0) > 0 and "centroid" in l_data and l_data["centroid"]:
+                cent = l_data["centroid"]
+                d_aw = abs(aw - cent["avg_w"]) / max(5.0, cent["avg_w"])
+                d_pw = abs(pw - cent["peak_w"]) / max(5.0, cent["peak_w"])
+                d_cv = abs(cv - cent["cv"]) / 0.25
+                d_tr = abs(trend_ratio - cent["trend"]) / 0.35
+
+                dist = ( (d_aw**2)*2.5 + (d_pw**2)*1.5 + (d_cv**2)*0.8 + (d_tr**2)*0.8 ) ** 0.5
+                sim = max(0.0, 1.0 - (dist / 2.3))
+
+                if sim > best_sim:
+                    best_sim = sim
+                    best_learned_key = l_key
+
+        # Wenn eine gelernte Nutzersignatur stark übereinstimmt (> 68%):
+        if best_learned_key and best_sim >= 0.68:
+            l_info = cls.learned_models[best_learned_key]
+            prof = DEVICE_PROFILES.get(best_learned_key, DEVICE_PROFILES["lamp"])
+            conf = min(99, int(76 + best_sim * 20 + min(4, l_info['confirmations']) * 1))
+            reason = f"🎯 Aus deinen Bestätigungen gelernt: {int(best_sim*100)}% Übereinstimmung mit bisherigem '{prof['name']}' (Ø {l_info['centroid']['avg_w']:.1f} W)"
+            return {
+                "suggested_key": best_learned_key,
+                "name": prof["name"],
+                "icon": prof["icon"],
+                "mode": prof["mode"],
+                "is_battery": prof["is_battery"],
+                "nominal_wh": prof["nominal_wh"],
+                "confidence": conf,
+                "reason": reason,
+                "learned_match": True,
+                "learned_count": l_info['confirmations'],
+                "total_learned_confirmations": total_learned,
+                "peak_w": round(pw, 2),
+                "avg_w": round(aw, 2),
+                "current_w": round(cw, 2)
+            }
+
+        # =====================================================================
+        # 2. EXPERTENSYSTEM HEURISTIK (WENN NOCH KEIN PASSENDES MUSTER)
+        # =====================================================================
         if cv < 0.18 and trend_ratio > 0.88:
             confidence = min(95, 45 + n * 6)
             if pw < 20:
@@ -316,6 +456,8 @@ class DeviceAI:
             "nominal_wh": prof["nominal_wh"],
             "confidence": confidence,
             "reason": reason,
+            "learned_match": False,
+            "total_learned_confirmations": total_learned,
             "peak_w": round(pw, 2),
             "avg_w": round(aw, 2),
             "current_w": round(cw, 2)
@@ -345,6 +487,7 @@ def save_history():
         logger.error(f"Save: {e}")
 
 load_history()
+DeviceAI.load_learned()
 
 
 # =====================================================================
@@ -479,7 +622,7 @@ def accumulate_energy():
         charge["active"] = True
         charge["paused"] = False
         charge["last_wh_time"] = now
-        charge["unplug_cooldown_until"] = now + 10.0  # 10 Sekunden Schonfrist nach dem Einstecken!
+        charge["unplug_cooldown_until"] = now + 10.0
         charge["flow_continuous_seconds"] = 0.0
         charge["had_flowing"] = False
         
@@ -505,7 +648,6 @@ def accumulate_energy():
         dt = min(15.0, max(0.0, now - last))
         if is_flowing and charge["active"]:
             charge["flow_continuous_seconds"] += dt
-            # Erst wenn mindestens 3 Sekunden stabiler Stromfluss da war UND Schonfrist vorbei ist:
             if charge["flow_continuous_seconds"] >= 3.0 and now > charge["unplug_cooldown_until"]:
                 charge["had_flowing"] = True
         else:
@@ -586,7 +728,6 @@ def accumulate_energy():
                             logger.info(f"🔋 100% Akku voll geladen ({cur_wh:.2f} Wh / {nom_wh} Wh) -> Relais AUS, Modal BATTERY_100!")
 
             else:
-                # Pausenzeit erfassen (wenn kein Strom fließt oder pausiert ist)
                 charge["total_idle_seconds"] += dt
                 idx = charge["current_device_idx"]
                 devs = charge["devices"]
@@ -763,6 +904,7 @@ def get_status():
             "cost": round(brutto, 5),
             
             "ai_result": charge["ai_result"] or {},
+            "learned_profiles_count": len(DeviceAI.learned_models),
             "active_device": active_dev,
             "devices": devices,
             "current_device_idx": curr_idx,
@@ -958,6 +1100,11 @@ def set_device():
                 dev["is_battery"] = prof["is_battery"]
                 dev["nominal_wh"] = prof["nominal_wh"]
                 dev["user_confirmed"] = confirmed
+
+                # 🧠 KI-LERNEN: Lerne Fingerprint aus den aktuellen Leistungsdaten
+                if confirmed:
+                    DeviceAI.learn_from_feedback(key, charge.get("power_history", []), shelly["watt"])
+
                 logger.info(f"Gerät {dev['num']} konfiguriert: {dev['name']} ({dev['mode']}) | Bestätigt: {confirmed}")
                 return jsonify({"status": "ok", "device": dev})
     return jsonify({"status": "error", "message": "Gerät nicht gefunden"}), 400
@@ -976,6 +1123,11 @@ def logout():
         elapsed = get_session_elapsed()
         charge["total_session_seconds"] = elapsed
         charge["last_wh_time"] = None
+
+        # 🧠 KI-LERNEN: Trainiere alle in dieser Sitzung bestätigten Geräte
+        for d in charge.get("devices", []):
+            if d.get("wh", 0) > 0.05 and d.get("key") in DEVICE_PROFILES:
+                DeviceAI.learn_from_feedback(d["key"], charge.get("power_history", []), d.get("avg_flow_w", 0))
 
         invoice_id = f"RE-{time.strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}"
 
@@ -1166,6 +1318,7 @@ def debug():
         "cost_brutto": charge["total_cost_brutto"],
         "devices": charge["devices"],
         "ai_result": charge["ai_result"],
+        "ai_learned_models": DeviceAI.learned_models,
         "server_time": time.time()
     })
 
@@ -1288,12 +1441,14 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 .time-chip-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
 .time-chip-val{font-weight:800;font-family:ui-monospace,monospace;color:var(--text)}
 
-/* KI-VORSCHLAG & GERAETE-AUSWAHL */
+/* KI-VORSCHLAG & GERAETE-LEISTE */
 .ai-box{background:#f8fafc;border:1.5px solid var(--border);border-radius:18px;padding:14px;margin-bottom:12px;text-align:left;transition:border-color .2s}
 .ai-box.confirmed{border-color:#bbf7d0;background:#f0fdf4}
+.ai-box.learned{border-color:#bfdbfe;background:#f0f7ff}
 .ai-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
 .ai-tag{font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.5px;padding:3px 8px;border-radius:6px;background:#eff6ff;color:var(--blue)}
 .ai-box.confirmed .ai-tag{background:#dcfce7;color:#15803d}
+.ai-box.learned .ai-tag{background:#dbeafe;color:#1e40af}
 .ai-conf{font-size:11px;color:var(--muted);font-weight:600}
 
 .ai-main{display:flex;align-items:center;gap:10px;margin-bottom:8px}
@@ -1615,7 +1770,7 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
   </div>
   <div class="ai-reason" id="aiReason">Analyse des Stromflusses läuft...</div>
   <div class="ai-actions">
-    <button class="btn-confirm" id="btnConfirm" onclick="confirmSuggestion()">✅ Bestätigen</button>
+    <button class="btn-confirm" id="btnConfirm" onclick="confirmSuggestion()">✅ Bestätigen & KI trainieren</button>
     <button class="btn-change" onclick="showM('devModal')">✏️ Ändern</button>
   </div>
 </div>
@@ -1956,10 +2111,16 @@ function updateWysiwygLook(dev, curW, curWh){
     aiModeBadge.innerText = '🔌 Dauerbetrieb';
   }
 
+  var isLearned = latestAiSuggestion && latestAiSuggestion.learned_match;
+
   if(dev.user_confirmed){
     aiBox.className = 'ai-box confirmed';
-    aiTag.innerText = '✓ Bestätigt';
+    aiTag.innerText = '✓ Bestätigt & Gelernt';
     btnConf.style.display = 'none';
+  } else if(isLearned){
+    aiBox.className = 'ai-box learned';
+    aiTag.innerText = '🎯 Aus Muster gelernt (' + (latestAiSuggestion.confidence || 90) + '%)';
+    btnConf.style.display = 'inline-block';
   } else {
     aiBox.className = 'ai-box';
     aiTag.innerText = '⚡ KI-Vorschlag';
@@ -2260,7 +2421,13 @@ function poll(){
 
     latestAiSuggestion = d.ai_result || {};
     var conf = latestAiSuggestion.confidence || 0;
-    document.getElementById('aiConf').innerText = conf > 0 ? ('Sicherheit: ' + conf + '%') : 'Sammle Daten...';
+    var learnedCount = d.learned_profiles_count || 0;
+    
+    if(latestAiSuggestion.learned_match){
+      document.getElementById('aiConf').innerText = '🎯 Gelernt (' + conf + '% Match)';
+    } else {
+      document.getElementById('aiConf').innerText = conf > 0 ? ('Sicherheit: ' + conf + '%') : 'Sammle Daten...';
+    }
     document.getElementById('aiReason').innerText = latestAiSuggestion.reason || 'Analyse des Stromflusses...';
 
     updateWysiwygLook(currentDevice, curW, curWh);
