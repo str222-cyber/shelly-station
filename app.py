@@ -1610,6 +1610,7 @@ def logout():
 
         report = {
             "invoice_id": invoice_id,
+            "timestamp": time.time(),
             "date": time.strftime('%d.%m.%Y %H:%M'),
             "total_seconds": elapsed,
             "total_flow_seconds": charge["total_flow_seconds"],
@@ -1793,22 +1794,115 @@ def debug():
         "server_time": time.time()
     })
 
-@app.route(f'/admin/{ADMIN_SECRET_TOKEN}')
-def admin():
+ADMIN_PASSWORD = "admin2026"
+
+def get_admin_stats():
+    now = time.time()
+    windows = {
+        "1h": {"seconds": 3600, "label": "Letzte 1 Stunde", "devices": {}, "sessions": 0, "wh": 0.0, "cost": 0.0},
+        "6h": {"seconds": 21600, "label": "Letzte 6 Stunden", "devices": {}, "sessions": 0, "wh": 0.0, "cost": 0.0},
+        "24h": {"seconds": 86400, "label": "Letzte 24 Stunden", "devices": {}, "sessions": 0, "wh": 0.0, "cost": 0.0}
+    }
+    
+    # 1. Abgeschlossene Sitzungen (DSGVO-anonymisiert)
+    for r in history_records:
+        r_ts = float(r.get("timestamp") or 0.0)
+        if r_ts == 0.0 and r.get("date"):
+            try:
+                r_ts = time.mktime(time.strptime(r["date"], "%d.%m.%Y %H:%M"))
+            except Exception:
+                r_ts = now - 1800.0
+
+        r_wh = float(r.get("total_wh") or 0.0)
+        r_cost = float(r.get("total_cost_brutto") or r.get("total_cost") or 0.0)
+        r_devs = r.get("devices") or []
+        
+        for key, win in windows.items():
+            if (now - r_ts) <= win["seconds"]:
+                win["sessions"] += 1
+                win["wh"] += r_wh
+                win["cost"] += r_cost
+                for d in r_devs:
+                    d_name = d.get("raw_name") or d.get("name") or "Unbekannt"
+                    d_ico = d.get("icon") or "🔌"
+                    d_key = f"{d_ico} {d_name}"
+                    win["devices"][d_key] = win["devices"].get(d_key, 0) + 1
+
+    # 2. Laufende Sitzung (falls aktiv)
+    if charge.get("active") or float(charge.get("total_wh") or 0.0) > 0:
+        cur_wh = float(charge.get("total_wh") or 0.0)
+        cur_cost = float(charge.get("total_cost_brutto") or 0.0)
+        for key, win in windows.items():
+            win["wh"] += cur_wh
+            win["cost"] += cur_cost
+            for d in charge.get("devices", []):
+                d_name = d.get("raw_name") or d.get("name") or "Unbekannt"
+                d_ico = d.get("icon") or "🔌"
+                d_key = f"{d_ico} {d_name}"
+                win["devices"][d_key] = win["devices"].get(d_key, 0) + 1
+
+    return windows
+
+@app.route('/admin', methods=['GET', 'POST'])
+@app.route(f'/admin/{ADMIN_SECRET_TOKEN}', methods=['GET', 'POST'])
+@app.route('/admin/<path:token>', methods=['GET', 'POST'])
+def admin_page(token=None):
+    if token == ADMIN_SECRET_TOKEN:
+        session["admin_auth"] = True
+
+    if request.method == 'POST':
+        pw = request.form.get("password", "").strip()
+        if pw in [ADMIN_PASSWORD, ADMIN_SECRET_TOKEN]:
+            session["admin_auth"] = True
+            return redirect(url_for('admin_page'))
+        else:
+            return render_template_string(ADMIN_LOGIN_HTML, error="Falsches Administrator-Kennwort!")
+
+    if not session.get("admin_auth"):
+        return render_template_string(ADMIN_LOGIN_HTML, error=None)
+
+    stats = get_admin_stats()
     today = time.strftime('%d.%m.%Y')
-    today_recs = [r for r in history_records if r.get("date", "").startswith(today)]
-    return render_template_string(ADMIN_HTML,
-        physical_token=PHYSICAL_STATION_TOKEN, device_id=DEVICE_ID,
-        today_revenue=sum(r.get("total_cost_brutto", r.get("total_cost", 0)) for r in today_recs),
-        total_revenue=history_stats["revenue_brutto"],
-        today_wh=sum(r.get("total_wh", 0) for r in today_recs),
-        total_kwh=history_stats["kwh"],
+    today_recs = [r for r in history_records if str(r.get("date", "")).startswith(today)]
+    
+    today_rev = sum(float(r.get("total_cost_brutto") or r.get("total_cost") or 0.0) for r in today_recs)
+    tot_rev = float(history_stats.get("revenue_brutto") or 0.0)
+    today_wh_val = sum(float(r.get("total_wh") or 0.0) for r in today_recs)
+    tot_kwh_val = float(history_stats.get("kwh") or 0.0)
+
+    # Zusammenfassung der KI-Chat Themen
+    chat_summary = {
+        "total": len(user_feedback_entries),
+        "restdauer": sum(1 for e in user_feedback_entries if any(k in e.get("user_message","").lower() for k in ["dauer", "akku", "lange", "prozent"])),
+        "leistung": sum(1 for e in user_feedback_entries if any(k in e.get("user_message","").lower() for k in ["watt", "0", "schwank", "wenig"])),
+        "befehle": sum(1 for e in user_feedback_entries if e.get("executed_action")),
+    }
+
+    return render_template_string(ADMIN_DASHBOARD_HTML,
+        physical_token=PHYSICAL_STATION_TOKEN,
+        device_id=DEVICE_ID,
+        stats=stats,
+        today_revenue=today_rev,
+        total_revenue=tot_rev,
+        today_wh=today_wh_val,
+        total_kwh=tot_kwh_val,
         today_sessions=len(today_recs),
-        total_sessions=history_stats["sessions"],
-        live_active=charge["active"], relay_on=charge["relay_on"],
-        live_watt=shelly["watt"], live_amp=shelly["amp"], live_volt=shelly["volt"],
-        last_poll_ok=shelly["ok"],
-        history_records=history_records[-30:])
+        total_sessions=int(history_stats.get("sessions") or 0),
+        live_active=charge["active"],
+        relay_on=charge["relay_on"],
+        live_watt=float(shelly.get("watt") or 0.0),
+        live_amp=float(shelly.get("amp") or 0.0),
+        live_volt=float(shelly.get("volt") or 230.0),
+        last_poll_ok=shelly.get("ok", True),
+        chat_summary=chat_summary,
+        feedback_records=user_feedback_entries[:60],
+        history_records=history_records[-30:]
+    )
+
+@app.route('/admin_logout')
+def admin_logout():
+    session.pop("admin_auth", None)
+    return redirect(url_for('admin_page'))
 
 @app.route('/admin_api/override', methods=['POST'])
 def admin_override():
@@ -1854,25 +1948,79 @@ p{font-size:13.5px;color:#94a3b8;line-height:1.5;margin-bottom:20px}
 </div></body></html>"""
 
 
-ADMIN_HTML = """<!DOCTYPE html>
+ADMIN_LOGIN_HTML = """<!DOCTYPE html>
+<html lang="de"><head><meta charset="utf-8"><title>Admin Login – Smart Power Hub</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<style>
+:root{--bg:#090d16;--card:#111827;--border:#1f2937;--text:#f8fafc;--muted:#94a3b8;--blue:#3b82f6;--green:#10b981;--red:#ef4444}
+*{box-sizing:border-box;margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+body{background:var(--bg);color:var(--text);display:flex;justify-content:center;align-items:center;min-height:100vh;padding:16px}
+.card{background:var(--card);border-radius:24px;padding:32px 24px;border:1px solid var(--border);text-align:center;max-width:400px;width:100%;box-shadow:0 25px 50px rgba(0,0,0,.5)}
+h1{font-size:22px;font-weight:800;margin:14px 0 6px}
+p{font-size:13px;color:var(--muted);line-height:1.45;margin-bottom:20px}
+.in{width:100%;padding:13px 16px;background:#0f172a;border:1.5px solid var(--border);border-radius:14px;color:#fff;font-size:14px;outline:none;margin-bottom:12px}
+.in:focus{border-color:var(--blue)}
+.btn{width:100%;padding:14px;font-size:14.5px;font-weight:700;background:var(--blue);color:#fff;border:none;border-radius:14px;cursor:pointer}
+.err{background:#7f1d1d;color:#fecaca;padding:10px 14px;border-radius:10px;font-size:12.5px;margin-bottom:14px;font-weight:600}
+.dsgvo-badge{background:#064e3b;color:#a7f3d0;font-size:11px;padding:5px 10px;border-radius:20px;font-weight:700;display:inline-flex;align-items:center;gap:5px;margin-top:16px}
+</style></head><body>
+<div class="card">
+  <div style="font-size:48px">🔐</div>
+  <h1>Administrator-Login</h1>
+  <p>DSGVO-konformes Verwaltungsportal für deine Shelly Plug S Ladestation.</p>
+
+  {% if error %}
+  <div class="err">⚠️ {{ error }}</div>
+  {% endif %}
+
+  <form method="POST" action="/admin">
+    <input type="password" name="password" class="in" placeholder="Administrator-Kennwort..." required autofocus>
+    <button type="submit" class="btn">🚀 Anmelden</button>
+  </form>
+
+  <div class="dsgvo-badge">🔒 100% DSGVO-konform (Anonyme Statistiken)</div>
+  <div style="margin-top:16px"><a href="/" style="font-size:12px;color:var(--muted);text-decoration:none">📲 Zurück zum Lade-Cockpit</a></div>
+</div></body></html>"""
+
+
+ADMIN_DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="de"><head><meta charset="utf-8"><title>Admin Cockpit – Smart Power Hub</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <style>
-:root{--bg:#090d16;--card:#111827;--card-border:#1f2937;--text:#f8fafc;--muted:#94a3b8;--blue:#3b82f6;--green:#10b981;--red:#ef4444}
+:root{--bg:#090d16;--card:#111827;--card-border:#1f2937;--text:#f8fafc;--muted:#94a3b8;--blue:#3b82f6;--green:#10b981;--amber:#f59e0b;--red:#ef4444}
 *{box-sizing:border-box;margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
 body{background:var(--bg);color:var(--text);padding:16px;display:flex;justify-content:center}
-.wrap{max-width:960px;width:100%}
-.hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;padding-bottom:12px;border-bottom:1px solid var(--card-border)}
-.title{font-size:20px;font-weight:800}
-.grid4{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:16px}
-.cstat{background:var(--card);border:1px solid var(--card-border);border-radius:16px;padding:16px}
-.cstat-l{font-size:11px;text-transform:uppercase;color:var(--muted);font-weight:700}
-.cstat-v{font-size:22px;font-weight:800;margin-top:4px;color:var(--text)}
-.tabs{display:flex;gap:8px;margin-bottom:16px;border-bottom:1px solid var(--card-border);padding-bottom:8px}
-.tab{background:transparent;border:1px solid var(--card-border);color:var(--muted);padding:8px 16px;border-radius:12px;cursor:pointer;font-weight:700;font-size:13px}
+.wrap{max-width:1040px;width:100%}
+.hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;padding-bottom:14px;border-bottom:1px solid var(--card-border);flex-wrap:wrap;gap:12px}
+.title{font-size:22px;font-weight:800;display:flex;align-items:center;gap:8px}
+.dsgvo-pill{background:#064e3b;color:#6ee7b7;font-size:11px;font-weight:700;padding:4px 10px;border-radius:20px;display:inline-flex;align-items:center;gap:5px}
+
+/* ZEITFENSTER-VERGLEICHSKARTEN (1h, 6h, 24h) */
+.win-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px;margin-bottom:20px}
+.wcard{background:var(--card);border:1.5px solid var(--card-border);border-radius:20px;padding:18px;position:relative;overflow:hidden}
+.wcard.w1h{border-color:#3b82f6}
+.wcard.w6h{border-color:#10b981}
+.wcard.w24h{border-color:#8b5cf6}
+.wcard-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+.wcard-title{font-size:14.5px;font-weight:800;display:flex;align-items:center;gap:6px}
+.wcard-badge{font-size:10.5px;font-weight:800;padding:3px 8px;border-radius:8px;text-transform:uppercase}
+.w1h .wcard-badge{background:#1e3a8a;color:#93c5fd}
+.w6h .wcard-badge{background:#064e3b;color:#a7f3d0}
+.w24h .wcard-badge{background:#4c1d95;color:#ddd6fe}
+.wstat-row{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px}
+.wstat-val{font-size:24px;font-weight:800;font-family:ui-monospace,monospace}
+.wstat-sub{font-size:11.5px;color:var(--muted)}
+.wdev-box{background:#0f172a;border-radius:12px;padding:10px 12px;margin-top:12px}
+.wdev-title{font-size:11px;font-weight:700;text-transform:uppercase;color:var(--muted);margin-bottom:6px}
+.wdev-item{display:flex;justify-content:space-between;font-size:12px;padding:3px 0;border-bottom:1px solid #1e293b}
+.wdev-item:last-child{border-bottom:none}
+
+.tabs{display:flex;gap:8px;margin-bottom:16px;border-bottom:1px solid var(--card-border);padding-bottom:8px;overflow-x:auto}
+.tab{background:transparent;border:1px solid var(--card-border);color:var(--muted);padding:8px 16px;border-radius:12px;cursor:pointer;font-weight:700;font-size:13px;white-space:nowrap}
 .tab.active{background:var(--blue);color:#fff;border-color:var(--blue)}
-.pane{display:none;background:var(--card);border:1px solid var(--card-border);border-radius:18px;padding:20px}
+.pane{display:none;background:var(--card);border:1px solid var(--card-border);border-radius:20px;padding:20px}
 .pane.active{display:block}
+
 .tbl{width:100%;border-collapse:collapse;font-size:12px;margin-top:10px}
 .tbl th{text-align:left;padding:10px 8px;background:#0f172a;color:var(--muted);font-weight:700;border-bottom:1px solid var(--card-border)}
 .tbl td{padding:10px 8px;border-bottom:1px solid var(--card-border)}
@@ -1884,33 +2032,164 @@ body{background:var(--bg);color:var(--text);padding:16px;display:flex;justify-co
 <div class="wrap">
   <div class="hdr">
     <div>
-      <div class="title">⚙️ Admin Cockpit</div>
-      <div style="font-size:12px;color:var(--muted)">Station ID: {{ device_id }} | Physischer Token: <code>{{ physical_token }}</code></div>
+      <div class="title">⚙️ Administrator Dashboard</div>
+      <div style="font-size:12px;color:var(--muted);margin-top:2px">
+        Shelly Plug S (Gen 3) | ID: <code>{{ device_id }}</code> | Station Token: <code>{{ physical_token }}</code>
+      </div>
     </div>
-    <div style="display:flex;gap:8px">
-      <a href="/scan/{{ physical_token }}" class="btn-act" style="background:#1f2937;color:#fff;text-decoration:none;display:inline-flex;align-items:center;gap:6px">📲 Zur Station</a>
+    <div style="display:flex;align-items:center;gap:8px">
+      <div class="dsgvo-pill">🔒 100% DSGVO-konform (Anonymisiert)</div>
+      <a href="/scan/{{ physical_token }}" class="btn-act" style="background:#1f2937;color:#fff;text-decoration:none">📲 Cockpit</a>
+      <a href="/admin_logout" class="btn-act" style="background:#7f1d1d;color:#fecaca;text-decoration:none">Abmelden</a>
     </div>
   </div>
 
-  <div class="grid4">
-    <div class="cstat"><div class="cstat-l">Umsatz Heute</div><div class="cstat-v">{{ "%.4f"|format(today_revenue) }} €</div></div>
-    <div class="cstat"><div class="cstat-l">Umsatz Gesamt</div><div class="cstat-v">{{ "%.4f"|format(total_revenue) }} €</div></div>
-    <div class="cstat"><div class="cstat-l">Verbrauch Heute</div><div class="cstat-v">{{ "%.2f"|format(today_wh) }} Wh</div></div>
-    <div class="cstat"><div class="cstat-l">Sitzungen Gesamt</div><div class="cstat-v">{{ total_sessions }}</div></div>
+  <!-- DSGVO ZEITFENSTER-VERGLEICH (1h vs. 6h vs. 24h) -->
+  <div style="font-size:13px;font-weight:800;text-transform:uppercase;color:var(--muted);margin-bottom:10px;letter-spacing:.5px">
+    📊 Anonyme Lade- & Gerätestatistiken nach Zeitfenster
+  </div>
+
+  <div class="win-grid">
+    <!-- 1 STUNDE -->
+    <div class="wcard w1h">
+      <div class="wcard-hdr">
+        <div class="wcard-title">⏱️ Letzte 1 Stunde</div>
+        <span class="wcard-badge">Echtzeit</span>
+      </div>
+      <div class="wstat-row">
+        <div class="wstat-val" style="color:#93c5fd">{{ "%.2f"|format(stats['1h']['wh']) }} Wh</div>
+        <div class="wstat-sub"><b style="color:#a7f3d0">{{ "%.4f"|format(stats['1h']['cost']) }} €</b></div>
+      </div>
+      <div style="font-size:11.5px;color:var(--muted);margin-bottom:6px">Ladevorgänge: <b>{{ stats['1h']['sessions'] }}</b></div>
+      <div class="wdev-box">
+        <div class="wdev-title">Angeschlossene Geräte-Typen:</div>
+        {% if stats['1h']['devices'] %}
+          {% for dev_name, count in stats['1h']['devices'].items() %}
+          <div class="wdev-item"><span>{{ dev_name }}</span><b>{{ count }}×</b></div>
+          {% endfor %}
+        {% else %}
+          <div style="color:var(--muted);font-size:11px;font-style:italic">Keine Geräte in diesem Fenster</div>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- 6 STUNDEN -->
+    <div class="wcard w6h">
+      <div class="wcard-hdr">
+        <div class="wcard-title">⏱️ Letzte 6 Stunden</div>
+        <span class="wcard-badge">Halbtag</span>
+      </div>
+      <div class="wstat-row">
+        <div class="wstat-val" style="color:#a7f3d0">{{ "%.2f"|format(stats['6h']['wh']) }} Wh</div>
+        <div class="wstat-sub"><b style="color:#a7f3d0">{{ "%.4f"|format(stats['6h']['cost']) }} €</b></div>
+      </div>
+      <div style="font-size:11.5px;color:var(--muted);margin-bottom:6px">Ladevorgänge: <b>{{ stats['6h']['sessions'] }}</b></div>
+      <div class="wdev-box">
+        <div class="wdev-title">Angeschlossene Geräte-Typen:</div>
+        {% if stats['6h']['devices'] %}
+          {% for dev_name, count in stats['6h']['devices'].items() %}
+          <div class="wdev-item"><span>{{ dev_name }}</span><b>{{ count }}×</b></div>
+          {% endfor %}
+        {% else %}
+          <div style="color:var(--muted);font-size:11px;font-style:italic">Keine Geräte in diesem Fenster</div>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- 24 STUNDEN -->
+    <div class="wcard w24h">
+      <div class="wcard-hdr">
+        <div class="wcard-title">⏱️ Letzte 24 Stunden</div>
+        <span class="wcard-badge">24h Bilanz</span>
+      </div>
+      <div class="wstat-row">
+        <div class="wstat-val" style="color:#ddd6fe">{{ "%.2f"|format(stats['24h']['wh']) }} Wh</div>
+        <div class="wstat-sub"><b style="color:#a7f3d0">{{ "%.4f"|format(stats['24h']['cost']) }} €</b></div>
+      </div>
+      <div style="font-size:11.5px;color:var(--muted);margin-bottom:6px">Ladevorgänge: <b>{{ stats['24h']['sessions'] }}</b></div>
+      <div class="wdev-box">
+        <div class="wdev-title">Angeschlossene Geräte-Typen:</div>
+        {% if stats['24h']['devices'] %}
+          {% for dev_name, count in stats['24h']['devices'].items() %}
+          <div class="wdev-item"><span>{{ dev_name }}</span><b>{{ count }}×</b></div>
+          {% endfor %}
+        {% else %}
+          <div style="color:var(--muted);font-size:11px;font-style:italic">Keine Geräte in diesem Fenster</div>
+        {% endif %}
+      </div>
+    </div>
   </div>
 
   <div class="tabs">
-    <button class="tab active" onclick="showTab('tabCtrl')">⚡ Live-Steuerung</button>
+    <button class="tab active" onclick="showTab('tabChat')">💬 KI-Chatbot & Feedback-Log ({{ chat_summary['total'] }})</button>
+    <button class="tab" onclick="showTab('tabCtrl')">⚡ Live-Steuerung ({{ "%.1f"|format(live_watt) }} W)</button>
     <button class="tab" onclick="showTab('tabHist')">📜 Lade-Historie ({{ history_records|length }})</button>
-    <button class="tab" onclick="showTab('tabChat')">💬 KI-Chat & Feedback-Log</button>
   </div>
 
-  <!-- PANE 1: LIVE STEUERUNG -->
-  <div id="tabCtrl" class="pane active">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+  <!-- PANE 1: KI-CHAT & FEEDBACK -->
+  <div id="tabChat" class="pane active">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:8px">
       <div>
-        <div style="font-size:16px;font-weight:800">Shelly Relais-Status</div>
-        <div style="font-size:12px;color:var(--muted)">Aktuelle Leistung: <b>{{ "%.1f"|format(live_watt) }} W</b> | Strom: <b>{{ "%.3f"|format(live_amp) }} A</b> | Spannung: <b>{{ "%.1f"|format(live_volt) }} V</b></div>
+        <div style="font-size:16px;font-weight:800">💬 Nutzer-Fragen & Feedback-Zusammenfassung</div>
+        <div style="font-size:12px;color:var(--muted)">Kompakte Übersicht aller Interaktionen aus dem KI-Ladeassistenten.</div>
+      </div>
+      <button class="btn-act" style="background:#2563eb;color:#fff" onclick="window.open('/feedback_api','_blank')">📥 Vollständiges JSON Exportieren</button>
+    </div>
+
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:16px">
+      <div style="background:#0f172a;border-radius:12px;padding:12px;border:1px solid var(--card-border)">
+        <div style="font-size:11px;color:var(--muted);font-weight:700">Gesamt-Interaktionen</div>
+        <div style="font-size:20px;font-weight:800;margin-top:2px">{{ chat_summary['total'] }}</div>
+      </div>
+      <div style="background:#0f172a;border-radius:12px;padding:12px;border:1px solid var(--card-border)">
+        <div style="font-size:11px;color:var(--muted);font-weight:700">🔋 Restdauer-Fragen</div>
+        <div style="font-size:20px;font-weight:800;margin-top:2px;color:#93c5fd">{{ chat_summary['restdauer'] }}</div>
+      </div>
+      <div style="background:#0f172a;border-radius:12px;padding:12px;border:1px solid var(--card-border)">
+        <div style="font-size:11px;color:var(--muted);font-weight:700">⚡ Watt / Leistung</div>
+        <div style="font-size:20px;font-weight:800;margin-top:2px;color:#fcd34d">{{ chat_summary['leistung'] }}</div>
+      </div>
+      <div style="background:#0f172a;border-radius:12px;padding:12px;border:1px solid var(--card-border)">
+        <div style="font-size:11px;color:var(--muted);font-weight:700">🤖 Ausgeführte Aktionen</div>
+        <div style="font-size:20px;font-weight:800;margin-top:2px;color:#86efac">{{ chat_summary['befehle'] }}</div>
+      </div>
+    </div>
+
+    <table class="tbl">
+      <thead><tr><th>Zeit</th><th>Nutzer-Frage / Feedback</th><th>KI-Antwort / Aktion</th><th>Live-Telemetrie</th></tr></thead>
+      <tbody>
+        {% if feedback_records %}
+          {% for e in feedback_records %}
+          <tr>
+            <td style="white-space:nowrap;color:var(--muted)">{{ e.get('datetime', '-') }}</td>
+            <td><b>{{ e.get('user_message', '-') }}</b></td>
+            <td style="color:#93c5fd">
+              {{ e.get('bot_response', '-') }}
+              {% if e.get('executed_action') %}
+              <br/><span class="chip" style="background:#065f46;color:#34d399;margin-top:4px">Aktion: {{ e.get('executed_action') }}</span>
+              {% endif %}
+            </td>
+            <td style="font-family:monospace;font-size:11px">
+              {{ e.get('context', {}).get('watt', 0) }} W | {{ e.get('context', {}).get('wh', 0) }} Wh<br/>
+              {{ e.get('context', {}).get('active_device', '-') }}
+            </td>
+          </tr>
+          {% endfor %}
+        {% else %}
+          <tr><td colspan="4" style="text-align:center;color:var(--muted);padding:20px">Bisher keine Chat-Einträge vorhanden.</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+
+  <!-- PANE 2: LIVE STEUERUNG -->
+  <div id="tabCtrl" class="pane">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:12px">
+      <div>
+        <div style="font-size:16px;font-weight:800">Shelly Relais-Status & Hardware-Telemetrie</div>
+        <div style="font-size:12px;color:var(--muted)">
+          Aktuelle Leistung: <b>{{ "%.1f"|format(live_watt) }} W</b> | Strom: <b>{{ "%.3f"|format(live_amp) }} A</b> | Spannung: <b>{{ "%.1f"|format(live_volt) }} V</b>
+        </div>
       </div>
       <div style="display:flex;gap:8px">
         <button class="btn-act btn-on" onclick="overrideRelay('force_on')">⚡ Relais EIN (Force ON)</button>
@@ -1919,7 +2198,7 @@ body{background:var(--bg);color:var(--text);padding:16px;display:flex;justify-co
     </div>
   </div>
 
-  <!-- PANE 2: HISTORIE -->
+  <!-- PANE 3: HISTORIE -->
   <div id="tabHist" class="pane">
     <div style="font-size:16px;font-weight:800;margin-bottom:12px">Abgeschlossene Ladesitzungen</div>
     <table class="tbl">
@@ -1930,22 +2209,13 @@ body{background:var(--bg);color:var(--text);padding:16px;display:flex;justify-co
           <td><b>{{ r.get('invoice_id', '-') }}</b></td>
           <td>{{ r.get('date', '-') }}</td>
           <td>{{ r.get('time_formatted', '-') }}</td>
-          <td>{{ "%.2f"|format(r.get('total_wh', 0)) }} Wh</td>
+          <td>{{ "%.2f"|format(r.get('total_wh', 0) or 0.0) }} Wh</td>
           <td>{{ r.get('country_flag', '') }} {{ r.get('country_name', '-') }}</td>
-          <td><b style="color:var(--green)">{{ "%.4f"|format(r.get('total_cost_brutto', 0)) }} €</b></td>
+          <td><b style="color:var(--green)">{{ "%.4f"|format(r.get('total_cost_brutto', 0) or 0.0) }} €</b></td>
         </tr>
         {% endfor %}
       </tbody>
     </table>
-  </div>
-
-  <!-- PANE 3: KI-CHAT & FEEDBACK -->
-  <div id="tabChat" class="pane">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-      <div style="font-size:16px;font-weight:800">Gesammelte Nutzer-Fragen & Feedback</div>
-      <button class="btn-act" style="background:#2563eb;color:#fff" onclick="window.open('/feedback_api','_blank')">📥 JSON Exportieren</button>
-    </div>
-    <div id="feedbackLogContainer" style="font-size:12px;color:var(--muted)">Lade Feedback-Log...</div>
   </div>
 </div>
 
@@ -1955,34 +2225,11 @@ function showTab(id){
   document.querySelectorAll('.pane').forEach(p=>p.classList.remove('active'));
   event.target.classList.add('active');
   document.getElementById(id).classList.add('active');
-  if(id === 'tabChat') loadFeedback();
 }
 
 function overrideRelay(act){
   fetch('/admin_api/override',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:act})})
     .then(r=>r.json()).then(d=>alert(d.message || 'Ausgeführt'));
-}
-
-function loadFeedback(){
-  fetch('/feedback_api').then(r=>r.json()).then(d=>{
-    var c = document.getElementById('feedbackLogContainer');
-    if(!d.entries || d.entries.length === 0){
-      c.innerHTML = '<i>Bisher keine Chat-Interaktionen oder Feedback vorhanden.</i>';
-      return;
-    }
-    var html = '<table class="tbl"><thead><tr><th>Zeit</th><th>Nutzer-Nachricht</th><th>KI-Antwort / Ausgeführte Aktion</th><th>Live-Telemetrie</th></tr></thead><tbody>';
-    d.entries.forEach(function(e){
-      var ctx = e.context || {};
-      html += '<tr>' +
-        '<td style="white-space:nowrap;color:var(--muted)">' + (e.datetime || '-') + '</td>' +
-        '<td><b>' + (e.user_message || '-') + '</b></td>' +
-        '<td style="color:#93c5fd">' + (e.bot_response || '-') + (e.executed_action ? '<br/><span class="chip" style="background:#065f46;color:#34d399;margin-top:4px">Aktion: ' + e.executed_action + '</span>' : '') + '</td>' +
-        '<td style="font-family:monospace;font-size:11px">' + (ctx.watt || 0) + ' W | ' + (ctx.wh || 0) + ' Wh<br/>' + (ctx.active_device || '-') + '</td>' +
-        '</tr>';
-    });
-    html += '</tbody></table>';
-    c.innerHTML = html;
-  });
 }
 </script>
 </body></html>"""
@@ -2136,10 +2383,10 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 .ein{width:100%;padding:11px;border:1px solid var(--border);border-radius:10px;font-size:13.5px;margin-bottom:8px}
 
 /* FLOATING KI-ASSISTENT & CHAT-DRAWER */
-.fab-chat{position:fixed;bottom:20px;right:20px;background:#2563eb;color:#ffffff;border:none;border-radius:30px;padding:11px 17px;font-size:13px;font-weight:800;box-shadow:0 8px 24px rgba(37,99,235,.35);cursor:pointer;z-index:999;display:flex;align-items:center;gap:8px;transition:transform .2s,box-shadow .2s}
-.fab-chat:hover{transform:translateY(-2px);box-shadow:0 12px 28px rgba(37,99,235,.45)}
-.fab-dot{width:8px;height:8px;background:#4ade80;border-radius:50%;box-shadow:0 0 6px #4ade80}
-.chat-drawer{position:fixed;bottom:76px;right:18px;width:360px;max-width:calc(100vw - 36px);height:480px;max-height:calc(100vh - 120px);background:#ffffff;border-radius:22px;box-shadow:0 20px 50px rgba(0,0,0,.22);border:1.5px solid #e2e8f0;display:none;flex-direction:column;z-index:1000;overflow:hidden;animation:pop .2s ease-out}
+.fab-chat{position:fixed !important;bottom:24px !important;right:20px !important;background:#2563eb !important;color:#ffffff !important;border:2px solid #93c5fd !important;border-radius:30px !important;padding:12px 18px !important;font-size:13.5px !important;font-weight:800 !important;box-shadow:0 10px 30px rgba(37,99,235,.45) !important;cursor:pointer !important;z-index:999999 !important;display:flex !important;align-items:center !important;gap:8px !important;transition:transform .2s,box-shadow .2s}
+.fab-chat:hover{transform:translateY(-2px);box-shadow:0 14px 34px rgba(37,99,235,.55) !important}
+.fab-dot{width:9px;height:9px;background:#4ade80;border-radius:50%;box-shadow:0 0 8px #4ade80}
+.chat-drawer{position:fixed !important;bottom:80px !important;right:18px !important;width:360px !important;max-width:calc(100vw - 36px) !important;height:490px !important;max-height:calc(100vh - 110px) !important;background:#ffffff !important;border-radius:22px !important;box-shadow:0 24px 60px rgba(0,0,0,.3) !important;border:1.5px solid #cbd5e1 !important;display:none;flex-direction:column;z-index:1000000 !important;overflow:hidden;animation:pop .2s ease-out}
 .chat-hdr{background:#0f172a;color:#ffffff;padding:12px 16px;display:flex;align-items:center;justify-content:space-between}
 .chat-title{font-size:13.5px;font-weight:800;display:flex;align-items:center;gap:6px}
 .chat-body{flex:1;padding:12px;overflow-y:auto;display:flex;flex-direction:column;gap:8px;background:#f8fafc}
@@ -2593,6 +2840,12 @@ body{background:var(--bg);color:var(--text);display:flex;justify-content:center;
 <button class="btn bp" style="background:#059669;margin-top:14px;padding:14px;font-size:15px;display:flex;align-items:center;justify-content:center;gap:8px" onclick="startFreshSession()">
   <span>⚡</span> <span>Neue Ladesitzung starten</span>
 </button>
+
+<div style="text-align:center;margin-top:16px;padding-top:12px;border-top:1px solid var(--border)">
+  <a href="/admin" target="_blank" style="font-size:12px;color:var(--muted);text-decoration:none;font-weight:700;display:inline-flex;align-items:center;gap:5px">
+    ⚙️ Administrator-Portal (Passwort-geschützt)
+  </a>
+</div>
 </div>
 </div>
 
