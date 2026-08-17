@@ -90,7 +90,7 @@ def ensure_worker():
 
 def check_authenticated():
     if request.headers.get("X-Station-Token") == STATION_PHYSICAL_TOKEN: return True
-    return session.get("authenticated_on_site") and session.get("station_token"] == STATION_PHYSICAL_TOKEN
+    return session.get("authenticated_on_site") and session.get("station_token") == STATION_PHYSICAL_TOKEN
 
 def require_physical_auth(f):
     @wraps(f)
@@ -237,16 +237,18 @@ def background_meter_worker():
                         current_pct = u.get("estimated_soc_0", 0.0) + (((u["total_kwh"] * 1000.0) / prof.get("capacity_wh", 20.0)) * 100.0)
                         if current_pct >= 80.0 and not u.get("eighty_percent_triggered", False):
                             u["eighty_percent_triggered"], u["active"] = True, False
-                            save_sub_session(u, uid)
                             async_cloud_control(turn_on=False)
+                            save_sub_session(u, uid)
+                            u["detection_mode"] = True
 
                         if watt > 5.0: u["had_charging_phase"] = True
                         if u.get("had_charging_phase", False) and 0.2 <= watt < 1.5 and (u["total_kwh"] * 1000.0) > 1.0:
                             u["battery_full_counter"] += dt
                             if u["battery_full_counter"] >= 20.0:
                                 u["battery_full_triggered"], u["active"] = True, False
-                                save_sub_session(u, uid)
                                 async_cloud_control(turn_on=False)
+                                save_sub_session(u, uid)
+                                u["detection_mode"] = True
                         else: u["battery_full_counter"] = 0.0
         except: pass
         time.sleep(1.0)
@@ -383,7 +385,6 @@ HTML_PAGE = """
         .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
         .title { font-size: 18px; font-weight: 700; color: var(--text-main); letter-spacing: -0.3px; }
         .rate-badge { background: #f1f5f9; color: var(--text-muted); font-size: 12px; padding: 4px 10px; border-radius: 20px; font-weight: 600; }
-        .security-badge { background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 12px; padding: 5px 10px; font-size: 11px; color: #065f46; font-weight: 600; margin-bottom: 12px; display: inline-flex; align-items: center; gap: 6px; }
         
         .cart-box { background: #f1f5f9; border: 1px dashed #cbd5e1; border-radius: 14px; padding: 10px; margin-bottom: 12px; text-align: left; display: none; }
         .cart-item { display: flex; justify-content: space-between; font-size: 12px; color: var(--text-main); padding: 4px 0; border-bottom: 1px solid #e2e8f0; }
@@ -392,6 +393,7 @@ HTML_PAGE = """
         .ai-banner { background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%); border: 1px solid var(--border-color); border-radius: 18px; padding: 12px 14px; margin-bottom: 12px; text-align: left; }
         .ai-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
         .ai-title { font-size: 11px; font-weight: 700; text-transform: uppercase; color: var(--accent-primary); letter-spacing: 0.5px; }
+        .btn-edit { background: #e2e8f0; color: var(--text-main); border: none; font-size: 11px; font-weight: 600; padding: 4px 9px; border-radius: 8px; cursor: pointer; }
         .ai-body { display: flex; align-items: center; gap: 10px; }
         .ai-icon { font-size: 26px; }
         .ai-detected { font-size: 14px; font-weight: 700; color: var(--text-main); }
@@ -429,6 +431,7 @@ HTML_PAGE = """
 
         .modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(15, 23, 42, 0.75); backdrop-filter: blur(4px); z-index: 999; padding: 20px; align-items: center; justify-content: center; }
         .modal-box { background: white; border-radius: 24px; padding: 24px 20px; text-align: center; max-width: 340px; width: 100%; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.2); }
+        .device-option-btn { background: #f8fafc; border: 1px solid var(--border-color); border-radius: 12px; padding: 11px; text-align: left; display: flex; align-items: center; gap: 10px; margin-bottom: 8px; width: 100%; font-size: 13px; font-weight: 600; cursor: pointer; }
         
         .receipt-card { display: none; text-align: left; }
         .receipt-header { text-align: center; margin-bottom: 18px; }
@@ -441,12 +444,12 @@ HTML_PAGE = """
 </head>
 <body>
     
-    <!-- GERÄTE AUSWAHL BEim EINSTECKEN -->
+    <!-- GERÄTE AUSWAHL BEIM EINSTECKEN -->
     <div id="deviceSelectionModal" class="modal-overlay">
         <div class="modal-box" style="border: 2px solid var(--accent-cyan);">
             <div style="font-size: 48px; margin-bottom: 8px;">🔌⚡</div>
             <h2 style="font-size: 20px; color: var(--accent-cyan); margin-bottom: 6px;">Neues Gerät erkannt!</h2>
-            <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 16px;">Wähle dein Gerät aus:</p>
+            <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 16px;">Was hast du soeben eingesteckt?</p>
             
             <select id="deviceTypeSelect" class="email-input" style="font-weight: bold; background: #f8fafc;">
                 <option value="phone">📱 Smartphone / Tablet</option>
@@ -461,7 +464,7 @@ HTML_PAGE = """
             <input type="text" id="customDeviceName" placeholder="Name (optional, z.B. Mein Laptop)" class="email-input" style="margin-bottom: 16px;">
             
             <button class="btn-start" style="background: var(--accent-cyan); margin-bottom: 8px;" onclick="submitDeviceSelection()">▶️ Ladevorgang starten</button>
-            <button class="btn-stop" onclick="cancelDeviceSelection()">❌ Abbrechen</button>
+            <button class="btn-stop" onclick="cancelDeviceSelection()">❌ Abbrechen & Strom aus</button>
         </div>
     </div>
 
@@ -469,7 +472,7 @@ HTML_PAGE = """
     <div id="unplugActionModal" class="modal-overlay">
         <div class="modal-box" style="border: 2px solid var(--accent-amber);">
             <div style="font-size: 48px; margin-bottom: 8px;">⏸️🔌</div>
-            <h2 style="font-size: 20px; color: var(--accent-amber); margin-bottom: 6px;">Gerät ausgesteckt / Pause?</h2>
+            <h2 style="font-size: 20px; color: var(--accent-amber); margin-bottom: 6px;">Gerät gewechselt?</h2>
             <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 16px;">Was möchtest du tun?</p>
             
             <button class="btn-start" style="background: var(--accent-primary); margin-bottom: 8px;" onclick="actionResume()">🔄 Nur Pause (Gleiches Gerät fortsetzen)</button>
@@ -611,6 +614,7 @@ HTML_PAGE = """
     <script>
         let isTerminated = false;
         let lastReport = null;
+        let startPromptShown = false;
         let stationToken = 'SEC-STATION-2026-X99Q-ALPHA-77';
         
         let userId = localStorage.getItem('hub_user_id');
@@ -655,8 +659,15 @@ HTML_PAGE = """
             let key = document.getElementById('deviceTypeSelect').value;
             let name = document.getElementById('customDeviceName').value;
             document.getElementById('deviceSelectionModal').style.display = 'none';
+            startPromptShown = false;
             await sendAction('/start_device', {device_key: key, custom_name: name});
             fetchSyncData();
+        }
+
+        async function cancelDeviceSelection() {
+            document.getElementById('deviceSelectionModal').style.display = 'none';
+            startPromptShown = false;
+            await sendAction('/stop');
         }
 
         function updateTimerUI(sec) {
@@ -731,8 +742,12 @@ HTML_PAGE = """
 
                 if (data.session_terminated) { await logout(true); return; }
 
-                if (data.show_start_prompt && !data.active) {
+                if (data.show_start_prompt && !startPromptShown && !data.active) {
                     document.getElementById('deviceSelectionModal').style.display = 'flex';
+                    startPromptShown = true;
+                } else if (!data.show_start_prompt && startPromptShown) {
+                    document.getElementById('deviceSelectionModal').style.display = 'none';
+                    startPromptShown = false;
                 }
 
                 if (data.cart_items && data.cart_items.length > 0) {
@@ -788,9 +803,11 @@ HTML_PAGE = """
                 if (data.active) {
                     badge.className = "status-pill status-on";
                     statusText.innerText = "Aktiv / Strom fließt";
+                    document.getElementById('wattSub').innerText = data.watt > 0.1 ? "Fließt stabil" : "Bereit / Standby";
                 } else {
                     badge.className = "status-pill status-off";
-                    statusText.innerText = "Bereit / Pausiert";
+                    statusText.innerText = "Warten auf Gerät";
+                    document.getElementById('wattSub').innerText = "Bitte Gerät einstecken";
                 }
             } catch(e) {}
         }
@@ -805,10 +822,10 @@ def get_user_data():
     session["user_id"] = uid
     if uid not in user_sessions:
         user_sessions[uid] = {
-            "active": False, "terminated": False,
-            "total_kwh": 0.0, "total_seconds": 0.0,
+            "active": False, "terminated": False, "had_power_draw": False,
+            "zero_power_counter": 0.0, "total_kwh": 0.0, "total_seconds": 0.0,
             "current_watt": 0.0, "smoothed_watt": 0.0, "current_ampere": 0.0, "current_voltage": 230.0,
-            "device_key": "phone", "custom_name": "", 
+            "device_key": "phone", "custom_name": "", "recent_samples": [],
             "estimated_soc_0": 0.0, "eighty_percent_triggered": False, "last_report": None,
             "detection_mode": False, "show_start_prompt": False, "last_seen": time.time(), 
             "completed_sub_sessions": []
@@ -855,15 +872,19 @@ def start_device():
     cname = data.get("custom_name", "").strip()
 
     global_state.update({"active_user_id": uid})
+    
     u.update({
         "active": True, 
         "detection_mode": False, 
+        "show_start_prompt": False,
         "device_key": key,
-        "custom_name": cname[:30]
+        "custom_name": cname[:30],
+        "had_power_draw": True,
+        "zero_power_counter": 0.0
     })
     
     if key in DEVICE_PROFILES and DEVICE_PROFILES[key]["is_battery"]:
-        u["estimated_soc_0"] = estimate_current_soc(key, [])
+        u["estimated_soc_0"] = estimate_current_soc(key, u.get("recent_samples", []))
         
     async_cloud_control(turn_on=True)
     return jsonify({"status": "ok"})
@@ -885,7 +906,8 @@ def store_current_device():
     u, uid = get_user_data()
     save_sub_session(u, uid)
     u["active"] = False
-    async_cloud_control(turn_on=False)
+    u["detection_mode"] = True
+    async_cloud_control(turn_on=True) # Relais an für Detection!
     return jsonify({"status": "ok"})
 
 @app.route('/stop', methods=['POST'])
@@ -895,6 +917,7 @@ def stop():
     u, uid = get_user_data()
     u["active"] = False
     u["detection_mode"] = False
+    u["show_start_prompt"] = False
     async_cloud_control(turn_on=False)
     return jsonify({"status": "ok"})
 
@@ -930,7 +953,7 @@ def logout():
 @require_physical_auth
 def new_session():
     u, uid = get_user_data()
-    u.update({"terminated": False, "active": False, "total_kwh": 0.0, "total_seconds": 0.0, "eighty_percent_triggered": False, "completed_sub_sessions": [], "custom_name": ""})
+    u.update({"terminated": False, "active": False, "total_kwh": 0.0, "total_seconds": 0.0, "recent_samples": [], "eighty_percent_triggered": False, "completed_sub_sessions": [], "custom_name": ""})
     return jsonify({"status": "ok"})
 
 @app.route('/download_invoice', methods=['GET'])
